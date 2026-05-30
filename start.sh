@@ -6,12 +6,12 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # Backend
 echo "▶ Starting backend..."
-cd "$ROOT/backend"
+cd "$ROOT"
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv
-  .venv/bin/pip install -r requirements.txt -q
+  .venv/bin/pip install -r backend/requirements.txt -q
 fi
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend &
 BACKEND_PID=$!
 
 # Frontend

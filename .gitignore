@@ -4,6 +4,7 @@
 .env.*.local
 
 # ── Python virtualenv ─────────────────────────────────────────────────────────
+.venv/
 backend/.venv/
 **/__pycache__/
 **/*.py[cod]

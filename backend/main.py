@@ -83,7 +83,6 @@ app.include_router(router)
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
     try:
-        # Send current state on connect
         import json
         states = orchestrator.get_agent_states()
         await ws.send_text(json.dumps({
@@ -95,9 +94,13 @@ async def websocket_endpoint(ws: WebSocket):
             }
         }))
         while True:
-            # Keep connection alive; client can send pings
-            await ws.receive_text()
+            # Accept any frame (text, binary, or ping) to keep the connection alive
+            await ws.receive()
     except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning(f"WebSocket error: {exc}")
+    finally:
         manager.disconnect(ws)
 
 
