@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="frontend/public/takumi-logo.png" alt="Takumi Logo" width="180" />
+</p>
+
 # Takumi — AI Organisation Platform
 
-Run a full AI organisation on your PC. Each agent has a specific role, its own system prompt, and its own LLM — keeping context lean and costs low.
+> **Takumi** (匠) — *artisan* or *craftsman* in Japanese. A Takumi is a master of their craft, combining deep expertise with meticulous attention to detail. This platform embodies that spirit: each AI agent is a specialist, crafted with purpose, working together as a skilled organisation.
+
+Run a full AI organisation on your machine. Each agent has a specific role, its own system prompt, and its own LLM — keeping context lean and costs low.
 
 ---
 
@@ -20,15 +26,14 @@ This creates the Python venv, installs all dependencies, and starts both servers
 **Terminal 1 — Backend**
 
 ```bash
-cd backend
+# Run from the project root
 
 # First run only: create venv and install packages
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r backend/requirements.txt
 
-# Start the server (run from the project root)
-cd ..
-backend/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+# Start the server
+.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 ```
 
 **Terminal 2 — Frontend**

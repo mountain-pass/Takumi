@@ -124,9 +124,7 @@ export default function App() {
 
         {/* Logo + org name */}
         <div className="flex items-center gap-2.5 px-3 mb-5">
-          <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-sm shrink-0">
-            {orgName ? orgName[0].toUpperCase() : 'T'}
-          </div>
+          <img src="/Takumi_no_text.png" alt="Takumi" className="w-20 h-20 object-contain shrink-0" />
           <span className="text-sm font-semibold text-gray-800 truncate">{orgName || 'Takumi'}</span>
         </div>
 
