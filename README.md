@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="frontend/public/takumi-logo.png" alt="Takumi Logo" width="180" />
+  <img src="frontend/public/TAKUMI background.png" alt="Takumi Banner" width="100%" />
+</p>
+
+<p align="center">
+  <img src="frontend/public/takumi-logo.png" alt="Takumi Logo" width="160" />
 </p>
 
 # Takumi — AI Organisation Platform
