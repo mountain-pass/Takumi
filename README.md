@@ -2,70 +2,153 @@
 
 Run a full AI organisation on your PC. Each agent has a specific role, its own system prompt, and its own LLM — keeping context lean and costs low.
 
+---
+
 ## Quick start
 
-```bash
-# 1. Copy and fill in your API keys
-cp .env.example .env
+### Option A — one command (recommended)
 
-# 2. Launch everything
+```bash
 chmod +x start.sh
 ./start.sh
 ```
 
+This creates the Python venv, installs all dependencies, and starts both servers.
+
+### Option B — manual (run each in a separate terminal)
+
+**Terminal 1 — Backend**
+
+```bash
+cd backend
+
+# First run only: create venv and install packages
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Start the server (run from the project root)
+cd ..
+backend/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Terminal 2 — Frontend**
+
+```bash
+cd frontend
+
+# First run only: install node packages
+npm install
+
+# Start the dev server
+npm run dev
+```
+
 Open **http://localhost:5173** in your browser.
 
-## Structure
+> The backend API runs on **port 8000**. The frontend dev server on **port 5173** proxies all `/api` and `/ws` requests to the backend automatically.
+
+---
+
+## First run — setup wizard
+
+On first launch the app shows a 3-step setup wizard:
+
+1. **Organisation** — give your AI company a name
+2. **LLM** — pick a provider, enter credentials, and test the connection
+3. **Team** — add specialist agents (use **✨ Enhance with AI** to generate system prompts)
+
+Configuration is saved to `data/runtime_settings.json` (gitignored). The wizard is skipped on subsequent launches.
+
+---
+
+## Environment variables
+
+Copy `.env.example` to `.env` and fill in the keys you need:
+
+```bash
+cp .env.example .env
+```
+
+| Variable            | Provider         | Notes                                      |
+|---------------------|------------------|--------------------------------------------|
+| `ANTHROPIC_API_KEY` | Anthropic        | `sk-ant-...`                               |
+| `OPENAI_API_KEY`    | OpenAI           | `sk-...`                                   |
+| `GOOGLE_API_KEY`    | Google Gemini    | `AIza...`                                  |
+| `GLM_API_KEY`       | Zhipu GLM        |                                            |
+| `MINIMAX_API_KEY`   | MiniMax          | Also set `MINIMAX_GROUP_ID`                |
+| `OLLAMA_BASE_URL`   | Ollama / Cloud   | Default `http://localhost:11434`           |
+| `OLLAMA_API_KEY`    | Ollama Cloud     | Bearer key from ollama.com/settings/keys   |
+
+Keys can also be entered through the setup wizard — no `.env` file required.
+
+---
+
+## Project structure
 
 ```
 takumi/
-├── backend/                 # Python / FastAPI
-│   ├── main.py              # FastAPI app + WebSocket
-│   ├── orchestrator.py      # 24/7 engine, agent lifecycle
+├── backend/                      # Python / FastAPI
+│   ├── main.py                   # FastAPI app + WebSocket
+│   ├── orchestrator.py           # 24/7 engine, agent lifecycle
+│   ├── runtime_settings.py       # Mutable org/LLM config (persisted to data/)
+│   ├── config.py                 # Env-var settings (pydantic-settings)
+│   ├── models.py                 # Pydantic data models
+│   ├── message_bus.py            # Async inter-agent message routing
+│   ├── persistence.py            # JSON persistence
 │   ├── agents/
-│   │   ├── base_agent.py    # All specialist agents extend this
-│   │   └── ceo_agent.py     # CEO — delegates tasks to specialists
-│   ├── llm_adapters/        # Anthropic · OpenAI · Ollama · Gemini · GLM · MiniMax
-│   ├── message_bus.py       # Async inter-agent message routing
-│   ├── models.py            # Pydantic data models
-│   └── persistence.py       # JSON persistence (data/)
-└── frontend/                # React / Vite / Tailwind
+│   │   ├── base_agent.py         # Base class all agents extend
+│   │   └── ceo_agent.py          # CEO — delegates tasks to specialists
+│   ├── llm_adapters/             # One adapter per provider
+│   │   ├── anthropic_adapter.py
+│   │   ├── openai_adapter.py
+│   │   ├── ollama_adapter.py     # Ollama local + Cloud
+│   │   ├── custom_adapter.py     # Any OpenAI-compatible endpoint
+│   │   ├── gemini_adapter.py
+│   │   ├── glm_adapter.py
+│   │   ├── minimax_adapter.py
+│   │   └── factory.py
+│   └── api/
+│       └── routes.py             # REST endpoints (/api/...)
+└── frontend/                     # React / Vite / Tailwind
     └── src/
-        ├── App.jsx
-        ├── stores/orgStore.js   # Zustand state (WebSocket + REST)
+        ├── App.jsx               # Layout + sidebar navigation
+        ├── stores/orgStore.js    # Zustand state (WebSocket + REST)
         └── components/
-            ├── OfficeView.jsx       # Marvis-style agent desks
-            ├── AgentDesk.jsx        # Single agent card + avatar
-            ├── MessageFeed.jsx      # Live inter-agent conversation
-            ├── TaskPanel.jsx        # Submit tasks + status list
-            ├── AgentDetailPanel.jsx # Slide-in agent inspector
-            └── AgentModal.jsx       # Add agent form
+            ├── SetupWizard.jsx       # First-run onboarding wizard
+            ├── ChatView.jsx          # Main chat interface
+            ├── CronJobView.jsx       # Scheduled tasks
+            ├── SkillMarketplaceView.jsx
+            ├── WorkflowView.jsx
+            ├── OfficeView.jsx        # Live agent desk view
+            ├── APISettingsView.jsx   # Centralised API key store
+            ├── ChannelView.jsx       # Telegram / WhatsApp / etc.
+            ├── OrganisationView.jsx  # Agent roles & reporting lines
+            ├── AgentDesk.jsx
+            ├── AgentDetailPanel.jsx
+            └── AgentModal.jsx
 ```
 
-## Adding an agent
-
-Click **+** in the left nav, fill in:
-- **Name** — e.g. "Data Analyst"
-- **Role** — one-line job title
-- **System Prompt** — what this agent specialises in and how it should behave
-- **LLM Provider + Model** — pick the cheapest model that can do the job
-- **Max context messages** — keep this low for simple agents to save tokens
+---
 
 ## How it works
 
-1. You submit a task → goes to the **CEO** agent
+1. You send a message → goes to the **CEO** agent
 2. CEO analyses it and delegates sub-tasks to specialist agents via the **Message Bus**
-3. Specialist agents work independently with their own bounded context
+3. Agents work independently, each with their own bounded context and LLM
 4. Results flow back to the CEO who synthesises a final answer
 5. The frontend receives all state changes in real-time via WebSocket
 
+---
+
 ## Supported LLM providers
 
-| Provider   | Key env var         | Example models                          |
-|------------|---------------------|-----------------------------------------|
-| Anthropic  | `ANTHROPIC_API_KEY` | claude-haiku-4-5, claude-sonnet-4-6     |
-| OpenAI     | `OPENAI_API_KEY`    | gpt-4o-mini, gpt-4o                     |
-| Ollama     | *(no key)*          | llama3, mistral, phi3                   |
-| Gemini     | `GOOGLE_API_KEY`    | gemini-1.5-flash, gemini-1.5-pro        |
-| GLM        | `GLM_API_KEY`       | glm-4-flash, glm-4                      |
-| MiniMax    | `MINIMAX_API_KEY`   | abab6.5s-chat                           |
+| Provider        | Notes                                              |
+|-----------------|----------------------------------------------------|
+| Anthropic       | Claude Haiku, Sonnet, Opus                         |
+| OpenAI          | GPT-4o, GPT-4o-mini, etc.                          |
+| Ollama          | Local models (llama3, mistral, gemma, …)           |
+| Ollama Cloud    | Hosted models via ollama.com — requires API key    |
+| Google Gemini   | gemini-1.5-flash, gemini-1.5-pro                   |
+| GLM (Zhipu)     | glm-4-flash, glm-4                                 |
+| MiniMax         | abab6.5s-chat                                      |
+| Custom / Local  | Any OpenAI-compatible endpoint (LMStudio, vLLM, …) |
