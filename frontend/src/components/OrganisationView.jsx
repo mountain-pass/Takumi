@@ -3,7 +3,7 @@
  * Nodes are freely draggable. Click-drag from a right port to connect agents.
  * Click a connection line to edit its label or delete it.
  */
-import React, { useState, useRef, useCallback } from 'react'
+import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { Plus, X, Trash2, Check, Network, Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import AgentModal from './AgentModal'
@@ -310,6 +310,11 @@ export default function OrganisationView() {
   const agents      = useOrgStore(s => s.agents)
   const removeAgent = useOrgStore(s => s.removeAgent)
   const updateAgent = useOrgStore(s => s.updateAgent)
+  const fetchConnections    = useOrgStore(s => s.fetchConnections)
+  const createConnectionAPI = useOrgStore(s => s.createConnection)
+  const updateConnectionAPI = useOrgStore(s => s.updateConnection)
+  const deleteConnectionAPI = useOrgStore(s => s.deleteConnection)
+  const saveCanvasPositions = useOrgStore(s => s.saveCanvasPositions)
 
   const canvasRef = useRef(null)
 
@@ -317,15 +322,46 @@ export default function OrganisationView() {
   const [positions, setPositions] = useState({})
 
   const [connections, setConnections] = useState([])
-  const [selected, setSelected]       = useState(null)       // selected agent
-  const [selectedConn, setSelectedConn] = useState(null)     // selected connection {fromId, toId, x, y}
+  const [selected, setSelected]       = useState(null)
+  const [selectedConn, setSelectedConn] = useState(null)
   const [showAddAgent, setShowAddAgent] = useState(false)
-  const [labelModal, setLabelModal]   = useState(null)       // {fromId, toId, initial?}
-  const [editingConn, setEditingConn] = useState(null)       // connection being edited
+  const [labelModal, setLabelModal]   = useState(null)
 
   const nodeDrag = useRef(null)
   const connDrag = useRef(null)
   const [connLine, setConnLine] = useState(null)
+  const saveTimer = useRef(null)
+
+  // Load connections and canvas positions from backend on mount
+  useEffect(() => {
+    fetchConnections().then(conns => {
+      setConnections(conns.map(c => ({ fromId: c.from_id, toId: c.to_id, label: c.label })))
+    }).catch(() => {})
+
+    // Load canvas positions from agents (stored as canvas_x/canvas_y)
+    fetch('/api/agents').then(r => r.json()).then(agentStates => {
+      const loaded = {}
+      for (const a of agentStates) {
+        const cx = a.config?.canvas_x
+        const cy = a.config?.canvas_y
+        if (cx != null && cy != null && (cx !== 0 || cy !== 0)) {
+          loaded[a.config.id] = { x: cx, y: cy }
+          posRef.current[a.config.id] = { x: cx, y: cy }
+        }
+      }
+      if (Object.keys(loaded).length > 0) {
+        setPositions(prev => ({ ...prev, ...loaded }))
+      }
+    }).catch(() => {})
+  }, [])
+
+  // Debounced save of canvas positions after drag
+  function scheduleSavePositions() {
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => {
+      saveCanvasPositions(posRef.current).catch(() => {})
+    }, 800)
+  }
 
   function getPosFor(agent, i) {
     if (posRef.current[agent.config.id]) return posRef.current[agent.config.id]
@@ -355,7 +391,10 @@ export default function OrganisationView() {
   }, [])
 
   const handleMouseUp = useCallback(() => {
-    nodeDrag.current = null
+    if (nodeDrag.current) {
+      nodeDrag.current = null
+      scheduleSavePositions()
+    }
     if (connDrag.current) {
       connDrag.current = null
       setConnLine(null)
@@ -397,18 +436,18 @@ export default function OrganisationView() {
     setLabelModal({ fromId, toId, initial: null })
   }
 
-  function confirmConnection(label) {
+  async function confirmConnection(label) {
     if (!labelModal) return
     const { fromId, toId, initial } = labelModal
 
     if (initial != null) {
-      // Editing existing connection
       setConnections(prev => prev.map(c =>
         c.fromId === fromId && c.toId === toId ? { ...c, label } : c
       ))
+      updateConnectionAPI(fromId, toId, label).catch(() => {})
     } else {
-      // New connection
       setConnections(prev => [...prev, { fromId, toId, label }])
+      createConnectionAPI(fromId, toId, label).catch(() => {})
     }
     setLabelModal(null)
     setSelectedConn(null)
@@ -429,6 +468,7 @@ export default function OrganisationView() {
   function handleDeleteConn() {
     if (!selectedConn) return
     setConnections(prev => prev.filter(c => !(c.fromId === selectedConn.fromId && c.toId === selectedConn.toId)))
+    deleteConnectionAPI(selectedConn.fromId, selectedConn.toId).catch(() => {})
     setSelectedConn(null)
   }
 

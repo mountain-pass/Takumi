@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from ..orchestrator import orchestrator
 from ..models import AgentConfig, LLMProvider
 from .. import runtime_settings
+from .. import database
 
 router = APIRouter(prefix="/api")
 
@@ -265,4 +266,77 @@ async def enhance_prompt(req: PromptEnhanceRequest):
 @router.post("/setup/complete")
 async def complete_setup():
     runtime_settings.update({"configured": True})
+    await database.set_setting("configured", "True")
     return {"ok": True}
+
+
+# ── Agent connections ─────────────────────────────────────────────────────────
+
+class ConnectionRequest(BaseModel):
+    from_id: str
+    to_id: str
+    label: str = ""
+
+
+class UpdateConnectionRequest(BaseModel):
+    label: str = ""
+
+
+@router.get("/connections")
+async def list_connections():
+    return await database.get_all_connections()
+
+
+@router.post("/connections", status_code=201)
+async def create_connection(req: ConnectionRequest):
+    conn_id = await database.save_connection(req.from_id, req.to_id, req.label)
+    return {"id": conn_id, "from_id": req.from_id, "to_id": req.to_id, "label": req.label}
+
+
+@router.put("/connections/{from_id}/{to_id}")
+async def update_connection(from_id: str, to_id: str, req: UpdateConnectionRequest):
+    await database.update_connection_label(from_id, to_id, req.label)
+    return {"ok": True}
+
+
+@router.delete("/connections/{from_id}/{to_id}")
+async def remove_connection(from_id: str, to_id: str):
+    await database.delete_connection(from_id, to_id)
+    return {"ok": True}
+
+
+# ── Canvas positions ──────────────────────────────────────────────────────────
+
+class CanvasPositionsRequest(BaseModel):
+    positions: dict[str, dict]
+
+
+@router.post("/canvas/positions")
+async def save_positions(req: CanvasPositionsRequest):
+    await database.save_all_canvas_positions(req.positions)
+    return {"ok": True}
+
+
+# ── Conversations ─────────────────────────────────────────────────────────────
+
+@router.get("/conversations")
+async def list_conversations(limit: int = 50):
+    return await database.get_conversations(limit)
+
+
+@router.get("/conversations/{conv_id}/messages")
+async def get_conversation_messages(conv_id: str, limit: int = 200):
+    return await database.get_messages(conversation_id=conv_id, limit=limit)
+
+
+# ── Message history (agent-to-agent) ──────────────────────────────────────────
+
+@router.get("/messages/history")
+async def get_message_history(
+    from_agent: str | None = None,
+    to_agent: str | None = None,
+    limit: int = 100,
+):
+    if from_agent and to_agent:
+        return await database.get_agent_to_agent_messages(from_agent, to_agent, limit)
+    return await database.get_messages(from_agent_id=from_agent, to_agent_id=to_agent, limit=limit)

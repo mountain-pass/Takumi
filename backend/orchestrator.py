@@ -17,6 +17,7 @@ from .agents.ceo_agent import CEOAgent, make_ceo_config
 from .message_bus import MessageBus, message_bus
 from .config import Settings, get_settings
 from .persistence import save_org, load_org
+from . import database
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class Orchestrator:
     async def add_agent(self, config: AgentConfig) -> BaseAgent:
         agent = await self._spawn_agent(config)
         self._persist()
+        await database.save_agent(config.model_dump(mode="json"))
         await self._broadcast(WSEvent(
             type=WSEventType.AGENT_ADDED,
             payload=config.model_dump(mode="json"),
@@ -74,6 +76,7 @@ class Orchestrator:
             await agent.stop()
             del self._agents[agent_id]
             self._persist()
+            await database.delete_agent(agent_id)
             await self._broadcast(WSEvent(
                 type=WSEventType.AGENT_REMOVED,
                 payload={"agent_id": agent_id},
@@ -88,6 +91,7 @@ class Orchestrator:
         del self._agents[agent_id]
         await self._spawn_agent(new_config)
         self._persist()
+        await database.save_agent(new_config.model_dump(mode="json"))
         return new_config
 
     def get_agents(self) -> list[BaseAgent]:

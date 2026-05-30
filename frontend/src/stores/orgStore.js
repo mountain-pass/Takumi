@@ -165,4 +165,51 @@ export const useOrgStore = create((set, get) => ({
 
   selectAgent(id) { set({ selectedAgentId: id }) },
   clearSelected() { set({ selectedAgentId: null }) },
+
+  // ── Connections ──────────────────────────────────────────────────────────
+  async fetchConnections() {
+    const res = await fetch(`${API}/connections`)
+    return res.json()
+  },
+
+  async createConnection(from_id, to_id, label = '') {
+    const res = await fetch(`${API}/connections`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_id, to_id, label }),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
+  },
+
+  async updateConnection(from_id, to_id, label) {
+    await fetch(`${API}/connections/${from_id}/${to_id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    })
+  },
+
+  async deleteConnection(from_id, to_id) {
+    await fetch(`${API}/connections/${from_id}/${to_id}`, { method: 'DELETE' })
+  },
+
+  // ── Canvas positions ────────────────────────────────────────────────────
+  async saveCanvasPositions(positions) {
+    await fetch(`${API}/canvas/positions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ positions }),
+    })
+  },
+
+  // ── Message history ─────────────────────────────────────────────────────
+  async fetchMessageHistory(fromAgent, toAgent, limit = 100) {
+    const params = new URLSearchParams()
+    if (fromAgent) params.set('from_agent', fromAgent)
+    if (toAgent) params.set('to_agent', toAgent)
+    params.set('limit', limit)
+    const res = await fetch(`${API}/messages/history?${params}`)
+    return res.json()
+  },
 }))

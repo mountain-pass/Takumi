@@ -15,6 +15,9 @@ build/
 
 # ── Runtime data (org config, LLM keys, message history) ─────────────────────
 data/
+*.db
+*.db-wal
+*.db-shm
 
 # ── Node / frontend ───────────────────────────────────────────────────────────
 frontend/node_modules/

@@ -55,6 +55,8 @@ class AgentConfig(BaseModel):
     is_ceo: bool = False
     avatar_color: str = "#4F46E5"   # for UI
     max_context_messages: int = 20  # keeps context lean
+    canvas_x: float = 0
+    canvas_y: float = 0
 
 
 class AgentState(BaseModel):

@@ -14,6 +14,7 @@ from .config import get_settings
 from .orchestrator import orchestrator
 from .api.routes import router
 from . import runtime_settings
+from . import database
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,11 +52,14 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     settings = get_settings()
     runtime_settings.init(settings.data_dir, env_settings=settings)
+    await database.init(settings.data_dir)
+    await database.migrate_from_json(settings.data_dir)
     orchestrator.set_ws_broadcast(manager.broadcast)
     await orchestrator.start()
     logger.info(f"Takumi backend running on {settings.host}:{settings.port}")
     yield
     await orchestrator.stop()
+    await database.close()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
