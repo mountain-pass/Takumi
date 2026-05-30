@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(chmod +x start.sh)",
+      "Bash(bash start.sh)",
+      "Bash(.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(echo \"Backend PID: $!\")",
+      "Bash(sleep 5 && cat /tmp/takumi_backend.log)",
+      "Bash(.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(npm run *)",
+      "Bash(echo \"Frontend PID: $!\")",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(xargs kill -9)",
+      "Bash(curl -s http://localhost:8000/api/agents)",
+      "Bash(curl -s http://localhost:5173/api/agents)",
+      "Bash(curl -s --max-time 3 http://localhost:8000/api/agents)",
+      "Bash(curl -s --max-time 3 http://localhost:5173)",
+      "Bash(backend/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload > /tmp/takumi_backend.log 2>&1 & *)",
+      "Bash(curl -s http://localhost:8000/api/org)",
+      "Bash(backend/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(curl -s https://ollama.com/api/chat -H 'Authorization: Bearer a55eef327c184ccaa5102f8e5b8a3f7c.ZL8INjFDSd9SIC3QOfDJnaIx' -H 'Content-Type: application/json' -d '{\"model\": \"llama3.2\", \"messages\": [{\"role\": \"user\", \"content\": \"say ready\"}], \"stream\": false}' --max-time 15)",
+      "Bash(curl -s https://ollama.com/api/tags -H 'Authorization: Bearer a55eef327c184ccaa5102f8e5b8a3f7c.ZL8INjFDSd9SIC3QOfDJnaIx')",
+      "Bash(curl -s https://ollama.com/api/chat -H 'Authorization: Bearer a55eef327c184ccaa5102f8e5b8a3f7c.ZL8INjFDSd9SIC3QOfDJnaIx' -H 'Content-Type: application/json' -d '{\"model\": \"gemma3:4b\", \"messages\": [{\"role\": \"user\", \"content\": \"say ready\"}], \"stream\": false}' --max-time 30)",
+      "Bash(curl -s http://localhost:8000/api/ollama/models)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'{len\\(d[\\\\\"models\\\\\"]\\)} models:', ', '.join\\(d['models'][:5]\\)\\)\")"
+    ]
+  }
+}

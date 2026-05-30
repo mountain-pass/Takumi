@@ -1,0 +1,9 @@
+{
+  "org_name": "Shanky",
+  "org_description": "",
+  "configured": false,
+  "llm_provider": "ollama",
+  "llm_api_key": "a55eef327c184ccaa5102f8e5b8a3f7c.ZL8INjFDSd9SIC3QOfDJnaIx",
+  "llm_base_url": "https://ollama.com",
+  "llm_model": "glm-5.1"
+}
