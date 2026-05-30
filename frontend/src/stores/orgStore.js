@@ -142,6 +142,16 @@ export const useOrgStore = create((set, get) => ({
     await fetch(`${API}/agents/${id}`, { method: 'DELETE' })
   },
 
+  async updateAgent(id, data) {
+    const res = await fetch(`${API}/agents/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    await get().fetchAgents()
+  },
+
   async submitTask(title, description) {
     const res = await fetch(`${API}/tasks`, {
       method: 'POST',

@@ -66,6 +66,7 @@ async def delete_agent(agent_id: str):
     return {"ok": True}
 
 
+@router.put("/agents/{agent_id}")
 @router.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, req: UpdateAgentRequest):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}

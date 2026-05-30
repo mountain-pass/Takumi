@@ -13,12 +13,12 @@ import {
   Network,
   Wifi,
   WifiOff,
-  Plus,
+
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
 import AgentDetailPanel from './components/AgentDetailPanel'
-import AgentModal from './components/AgentModal'
+import TopBar from './components/TopBar'
 
 // Views
 import ChatView from './components/ChatView'
@@ -34,7 +34,7 @@ import OrganisationView from './components/OrganisationView'
 
 const PRIMARY_NAV = [
   { id: 'chat',        icon: MessageSquare, label: 'Chat' },
-  { id: 'cron',        icon: CalendarClock, label: 'Cron Jobs' },
+  { id: 'cron',        icon: CalendarClock, label: 'Scheduled Jobs' },
   { id: 'skills',      icon: ShoppingBag,   label: 'Skill Marketplace' },
   { id: 'workflows',   icon: GitBranch,     label: 'Workflows' },
 ]
@@ -99,7 +99,6 @@ export default function App() {
   const selectedAgentId = useOrgStore(s => s.selectedAgentId)
 
   const [tab, setTab] = useState('chat')
-  const [showAddAgent, setShowAddAgent] = useState(false)
 
   useEffect(() => {
     fetchOrg()
@@ -156,16 +155,8 @@ export default function App() {
         {/* Spacer */}
         <div className="flex-1" />
 
-        {/* Add agent + connection status */}
+        {/* Connection status */}
         <div className="px-2 space-y-2">
-          <button
-            onClick={() => setShowAddAgent(true)}
-            className="w-full flex items-center gap-2 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium transition-colors"
-          >
-            <Plus size={15} className="shrink-0" />
-            Add Agent
-          </button>
-
           <div className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium
             ${connected ? 'text-green-600 bg-green-50' : 'text-red-500 bg-red-50'}`}>
             {connected
@@ -177,15 +168,16 @@ export default function App() {
       </aside>
 
       {/* ── Main content ── */}
-      <main className={`flex-1 overflow-hidden transition-all ${selectedAgentId ? 'mr-80' : ''}`}>
-        {VIEW_MAP[tab]}
-      </main>
+      <div className={`flex-1 flex flex-col overflow-hidden transition-all ${selectedAgentId ? 'mr-80' : ''}`}>
+        <TopBar />
+        <main className="flex-1 overflow-hidden">
+          {VIEW_MAP[tab]}
+        </main>
+      </div>
 
       {/* Agent detail panel (Office only) */}
       {selectedAgentId && <AgentDetailPanel />}
 
-      {/* Add agent modal */}
-      {showAddAgent && <AgentModal onClose={() => setShowAddAgent(false)} />}
     </div>
   )
 }
