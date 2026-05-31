@@ -4,13 +4,13 @@
 import React, { useState } from 'react'
 import { Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
-import { useProviders, useProviderModels } from '../hooks/useApi'
+import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
 import AIPromptWizard from './AIPromptWizard'
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 
 export default function AgentModal({ onClose }) {
-  const createAgent = useOrgStore(s => s.createAgent)
+  const createAgentMut = useCreateAgent()
   const navigateTo = useOrgStore(s => s.navigateTo)
   const { data: providers = [] } = useProviders()
   const llmProviders = providers.filter(p => p.type === 'llm')
@@ -41,7 +41,7 @@ export default function AgentModal({ onClose }) {
     setSaving(true)
     setError('')
     try {
-      await createAgent(form)
+      await createAgentMut.mutateAsync(form)
       onClose()
     } catch (e) {
       setError(e.message)
@@ -72,24 +72,31 @@ export default function AgentModal({ onClose }) {
             <input className="input" value={form.description} onChange={e => set('description', e.target.value)} placeholder="What this agent specialises in" />
           </label>
           <div className="space-y-1 col-span-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-gray-500">System Prompt *</span>
-              <AIPromptWizard
-                name={form.name}
-                role={form.role}
-                description={form.description}
-                currentPrompt={form.system_prompt}
-                onAccept={prompt => set('system_prompt', prompt)}
-                onError={setError}
-              />
-            </div>
-            <textarea
-              className="input resize-y min-h-[100px]"
-              rows={4}
-              value={form.system_prompt}
-              onChange={e => set('system_prompt', e.target.value)}
-              placeholder="You are a specialist in... Your job is to..."
-            />
+            <AIPromptWizard
+              name={form.name}
+              role={form.role}
+              description={form.description}
+              currentPrompt={form.system_prompt}
+              onAccept={prompt => set('system_prompt', prompt)}
+              onError={setError}
+            >
+              {({ trigger, actions }) => (
+                <>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs font-medium text-gray-500">System Prompt *</span>
+                    {trigger}
+                  </div>
+                  <textarea
+                    className="input resize-y min-h-[100px]"
+                    rows={4}
+                    value={form.system_prompt}
+                    onChange={e => set('system_prompt', e.target.value)}
+                    placeholder="You are a specialist in... Your job is to..."
+                  />
+                  {actions}
+                </>
+              )}
+            </AIPromptWizard>
           </div>
 
           {/* Provider from API providers */}

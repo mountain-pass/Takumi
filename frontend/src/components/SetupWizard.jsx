@@ -5,8 +5,9 @@
  * Step 3: Build initial team
  */
 import React, { useState, useEffect } from 'react'
-import { Building2, Key, Users, ChevronRight, ChevronLeft, Sparkles, Plus, Trash2, CheckCircle, Loader } from 'lucide-react'
+import { Building2, Key, Users, ChevronRight, ChevronLeft, Plus, Trash2, CheckCircle, Loader } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import AIPromptWizard from './AIPromptWizard'
 
 const PROVIDERS = [
   { id: 'anthropic',    label: 'Anthropic',        needsKey: true,  needsUrl: false, placeholder: 'sk-ant-...', defaultModel: 'claude-haiku-4-5-20251001' },
@@ -188,6 +189,19 @@ function StepLLM({ onNext, onBack }) {
   async function next() {
     setSaving(true)
     await saveLLMSettings({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
+    try {
+      await fetch('/api/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Default',
+          type: 'llm',
+          provider: providerId,
+          api_key: apiKey,
+          base_url: baseUrl,
+        }),
+      })
+    } catch {}
     setSaving(false)
     onNext(providerId, model)
   }
@@ -220,56 +234,42 @@ function StepLLM({ onNext, onBack }) {
             <span className="text-sm font-medium text-gray-700">
               API Key {provider.optionalKey && <span className="text-gray-400 font-normal">(optional)</span>}
             </span>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
-                placeholder={provider.placeholder || 'Enter API key'}
-                value={apiKey}
-                onChange={e => { setApiKey(e.target.value); setTestResult(null); setAvailableModels([]) }}
-              />
-              <button
-                type="button"
-                onClick={handleFetchModels}
-                disabled={fetchingModels}
-                title="Fetch available models"
-                className="px-3 py-2 border border-gray-300 rounded-xl text-sm text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5"
-              >
-                {fetchingModels ? <Loader size={13} className="animate-spin" /> : null}
-                {fetchingModels ? 'Loading…' : 'Load Models'}
-              </button>
-            </div>
+            <input
+              type="password"
+              className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
+              placeholder={provider.placeholder || 'Enter API key'}
+              value={apiKey}
+              onChange={e => { setApiKey(e.target.value); setTestResult(null); setAvailableModels([]) }}
+            />
           </label>
         )}
 
         {provider.needsUrl && (
           <label className="block space-y-1.5">
             <span className="text-sm font-medium text-gray-700">Base URL</span>
-            <div className="flex gap-2">
-              <input
-                className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
-                placeholder="http://localhost:11434"
-                value={baseUrl}
-                onChange={e => { setBaseUrl(e.target.value); setTestResult(null); setAvailableModels([]) }}
-              />
-              {!provider.needsKey && (
-                <button
-                  type="button"
-                  onClick={handleFetchModels}
-                  disabled={fetchingModels}
-                  className="px-3 py-2 border border-gray-300 rounded-xl text-sm text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5"
-                >
-                  {fetchingModels ? <Loader size={13} className="animate-spin" /> : null}
-                  {fetchingModels ? 'Loading…' : 'Load Models'}
-                </button>
-              )}
-            </div>
+            <input
+              className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
+              placeholder="http://localhost:11434"
+              value={baseUrl}
+              onChange={e => { setBaseUrl(e.target.value); setTestResult(null); setAvailableModels([]) }}
+            />
           </label>
         )}
 
         {/* Model selector */}
-        <label className="block space-y-1.5">
-          <span className="text-sm font-medium text-gray-700">Default model</span>
+        <div className="block space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-gray-700">Default model</span>
+            <button
+              type="button"
+              onClick={handleFetchModels}
+              disabled={fetchingModels}
+              className="text-xs text-indigo-600 hover:text-indigo-800 disabled:opacity-40 flex items-center gap-1"
+            >
+              {fetchingModels ? <Loader size={12} className="animate-spin" /> : null}
+              {fetchingModels ? 'Loading…' : 'Load Models'}
+            </button>
+          </div>
           {availableModels.length > 0 ? (
             <select
               className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono bg-white"
@@ -286,7 +286,7 @@ function StepLLM({ onNext, onBack }) {
               placeholder={fetchingModels ? 'Loading models…' : 'e.g. claude-haiku-4-5-20251001'}
             />
           )}
-        </label>
+        </div>
       </div>
 
       {/* Test connection */}
@@ -326,27 +326,12 @@ function StepLLM({ onNext, onBack }) {
 const BLANK_AGENT = { name: '', role: '', description: '', system_prompt: '', llm_provider: 'ollama', llm_model: 'llama3', avatar_color: '#4F46E5' }
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 
-function AgentForm({ onAdd, llmProvider, llmModel, enhancePrompt }) {
+function AgentForm({ onAdd, llmProvider, llmModel }) {
   const [form, setForm] = useState({ ...BLANK_AGENT, llm_provider: llmProvider, llm_model: llmModel })
-  const [enhancing, setEnhancing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
   const upd = (k, v) => setForm(f => ({ ...f, [k]: v }))
-
-  async function enhance() {
-    if (!form.role) { setError('Enter a role first.'); return }
-    setEnhancing(true)
-    setError('')
-    try {
-      const res = await enhancePrompt({ agent_name: form.name, agent_role: form.role, agent_description: form.description, current_prompt: form.system_prompt })
-      upd('system_prompt', res.prompt)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setEnhancing(false)
-    }
-  }
 
   async function add() {
     if (!form.name || !form.role || !form.system_prompt) { setError('Name, role, and system prompt are required.'); return }
@@ -377,27 +362,33 @@ function AgentForm({ onAdd, llmProvider, llmModel, enhancePrompt }) {
           <span className="text-xs font-medium text-gray-500">Description</span>
           <input className="input" value={form.description} onChange={e => upd('description', e.target.value)} placeholder="What this agent specialises in" />
         </label>
-        <label className="block space-y-1 col-span-2">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-gray-500">System Prompt *</span>
-            <button
-              type="button"
-              onClick={enhance}
-              disabled={enhancing}
-              className="flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-800 font-medium disabled:opacity-50"
-            >
-              {enhancing ? <Loader size={11} className="animate-spin" /> : <Sparkles size={11} />}
-              {enhancing ? 'Enhancing…' : 'Enhance with AI'}
-            </button>
-          </div>
-          <textarea
-            className="input resize-none"
-            rows={4}
-            value={form.system_prompt}
-            onChange={e => upd('system_prompt', e.target.value)}
-            placeholder="You are a specialist in… Your job is to…"
-          />
-        </label>
+        <div className="block space-y-1 col-span-2">
+          <AIPromptWizard
+            name={form.name}
+            role={form.role}
+            description={form.description}
+            currentPrompt={form.system_prompt}
+            onAccept={prompt => upd('system_prompt', prompt)}
+            onError={setError}
+          >
+            {({ trigger, actions }) => (
+              <>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-medium text-gray-500">System Prompt *</span>
+                  {trigger}
+                </div>
+                <textarea
+                  className="input resize-y min-h-[80px]"
+                  rows={4}
+                  value={form.system_prompt}
+                  onChange={e => upd('system_prompt', e.target.value)}
+                  placeholder="You are a specialist in… Your job is to…"
+                />
+                {actions}
+              </>
+            )}
+          </AIPromptWizard>
+        </div>
         <label className="block space-y-1">
           <span className="text-xs font-medium text-gray-500">Model</span>
           <input className="input font-mono text-xs" value={form.llm_model} onChange={e => upd('llm_model', e.target.value)} />
@@ -424,11 +415,21 @@ function AgentForm({ onAdd, llmProvider, llmModel, enhancePrompt }) {
 
 function StepTeam({ onNext, onBack, llmProvider = 'ollama', llmModel = 'gemma3:4b' }) {
   const createAgent = useOrgStore(s => s.createAgent)
-  const enhancePrompt = useOrgStore(s => s.enhancePrompt)
   const completeSetup = useOrgStore(s => s.completeSetup)
   const [agents, setAgents] = useState([])
   const [showForm, setShowForm] = useState(true)
   const [launching, setLaunching] = useState(false)
+  const [ceoReady, setCeoReady] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/agents/bootstrap-ceo', { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        setCeoReady(true)
+        setAgents([{ name: data.config?.name || 'CEO', role: data.config?.role || 'Chief Executive Officer', avatar_color: data.config?.avatar_color || '#DC2626' }])
+      })
+      .catch(() => setCeoReady(true))
+  }, [])
 
   async function addAgent(form) {
     await createAgent(form)
@@ -470,7 +471,7 @@ function StepTeam({ onNext, onBack, llmProvider = 'ollama', llmModel = 'gemma3:4
       )}
 
       {showForm
-        ? <AgentForm onAdd={addAgent} llmProvider={llmProvider} llmModel={llmModel} enhancePrompt={enhancePrompt} />
+        ? <AgentForm onAdd={addAgent} llmProvider={llmProvider} llmModel={llmModel} />
         : (
           <button onClick={() => setShowForm(true)}
             className="w-full flex items-center justify-center gap-2 border-2 border-dashed border-gray-300 hover:border-indigo-400 hover:text-indigo-600 text-gray-500 rounded-xl py-3 text-sm font-medium transition-colors">

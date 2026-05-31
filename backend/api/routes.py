@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from ..orchestrator import orchestrator
 from ..models import AgentConfig, LLMProvider
+from ..agents.ceo_agent import make_ceo_config
 from .. import runtime_settings
 from .. import database
 
@@ -54,6 +55,19 @@ async def list_agents():
 async def create_agent(req: CreateAgentRequest):
     config = AgentConfig(**req.model_dump())
     agent = await orchestrator.add_agent(config)
+    return agent.state.model_dump(mode="json")
+
+
+@router.post("/agents/bootstrap-ceo", status_code=201)
+async def bootstrap_ceo():
+    existing = [a for a in orchestrator.get_agents() if a.config.is_ceo]
+    if existing:
+        return existing[0].state.model_dump(mode="json")
+    rt = runtime_settings.get()
+    ceo = make_ceo_config()
+    ceo.llm_provider = LLMProvider(rt.get("llm_provider", "anthropic"))
+    ceo.llm_model = rt.get("llm_model", "claude-sonnet-4-6")
+    agent = await orchestrator.add_agent(ceo)
     return agent.state.model_dump(mode="json")
 
 
@@ -313,16 +327,21 @@ async def enhance_prompt(req: PromptEnhanceRequest):
         model = rt.get("llm_model") or _default_model(provider_str)
 
         meta = (
-            "You are an expert at writing system prompts for AI agents. "
-            "Write a clear, specific, and effective system prompt for the agent described below. "
-            "The prompt should define the agent's personality, expertise, responsibilities, and how it should behave. "
-            "Return ONLY the system prompt text, nothing else."
+            "You are an expert at crafting system prompts for AI agents in a multi-agent organisation. "
+            "Given the agent's name, role, and description, write a comprehensive system prompt that covers:\n"
+            "1. **Identity & Expertise** — who the agent is, their domain knowledge, and professional background\n"
+            "2. **Core Responsibilities** — specific tasks and duties this agent handles\n"
+            "3. **Behavioural Guidelines** — communication style, tone, and how they interact with other agents and users\n"
+            "4. **Decision-Making Principles** — how they prioritise, what they escalate, and when they ask for help\n"
+            "5. **Output Standards** — quality expectations, formats, and deliverables they produce\n\n"
+            "Write the prompt in second person (\"You are...\"). Be specific and actionable, not generic. "
+            "Tailor every detail to the role described. Return ONLY the system prompt text, no preamble or explanation."
         )
         user_msg = (
             f"Agent name: {req.agent_name}\n"
             f"Role: {req.agent_role}\n"
             f"Description: {req.agent_description}\n"
-            + (f"Current prompt (improve this): {req.current_prompt}" if req.current_prompt else "")
+            + (f"\nCurrent prompt (improve and expand on this):\n{req.current_prompt}" if req.current_prompt else "")
         )
 
         resp = await adapter.complete(
@@ -338,6 +357,19 @@ async def enhance_prompt(req: PromptEnhanceRequest):
 
 
 # ── Setup completion ──────────────────────────────────────────────────────────
+
+@router.post("/org/reset")
+async def reset_org():
+    """Wipe all data and return to onboarding."""
+    db = database._conn()
+    for table in ("messages", "conversations", "agent_connections", "agents",
+                  "api_providers", "api_keys", "org_settings"):
+        await db.execute(f"DELETE FROM {table}")
+    await db.commit()
+    runtime_settings.reset()
+    orchestrator.reset()
+    return {"ok": True}
+
 
 @router.post("/setup/complete")
 async def complete_setup():
