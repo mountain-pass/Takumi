@@ -358,17 +358,20 @@ export default function OrganisationView() {
   }, [])
 
   // Sync canvas positions from agents store whenever agents change
+  const dbLoaded = useRef(false)
   useEffect(() => {
+    if (dbLoaded.current) return
     const loaded = {}
     for (const a of agents) {
       const cx = a.config?.canvas_x
       const cy = a.config?.canvas_y
-      if (cx != null && cy != null && (cx !== 0 || cy !== 0) && !posRef.current[a.config.id]) {
+      if (cx != null && cy != null && (cx !== 0 || cy !== 0)) {
         loaded[a.config.id] = { x: cx, y: cy }
         posRef.current[a.config.id] = { x: cx, y: cy }
       }
     }
     if (Object.keys(loaded).length > 0) {
+      dbLoaded.current = true
       setPositions(prev => ({ ...prev, ...loaded }))
     }
   }, [agents])
