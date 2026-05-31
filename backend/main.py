@@ -71,6 +71,14 @@ async def lifespan(app: FastAPI):
             runtime_settings.update(patch)
     orchestrator.set_ws_broadcast(manager.broadcast)
     await orchestrator.start()
+    # Restore canvas positions from DB into agent configs
+    db_agents = await database.get_all_agents()
+    pos_map = {a["id"]: (a.get("canvas_x", 0), a.get("canvas_y", 0)) for a in db_agents}
+    for agent in orchestrator.get_agents():
+        cx, cy = pos_map.get(agent.config.id, (0, 0))
+        if cx or cy:
+            agent.config.canvas_x = cx
+            agent.config.canvas_y = cy
     logger.info(f"Takumi backend running on {settings.host}:{settings.port}")
     yield
     await orchestrator.stop()

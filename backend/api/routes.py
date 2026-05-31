@@ -331,6 +331,11 @@ class CanvasPositionsRequest(BaseModel):
 @router.post("/canvas/positions")
 async def save_positions(req: CanvasPositionsRequest):
     await database.save_all_canvas_positions(req.positions)
+    for agent in orchestrator.get_agents():
+        pos = req.positions.get(agent.config.id)
+        if pos:
+            agent.config.canvas_x = pos.get("x", 0)
+            agent.config.canvas_y = pos.get("y", 0)
     return {"ok": True}
 
 

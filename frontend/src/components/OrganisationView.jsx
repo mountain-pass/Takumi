@@ -350,28 +350,28 @@ export default function OrganisationView() {
   const [connLine, setConnLine] = useState(null)
   const saveTimer = useRef(null)
 
-  // Load connections and canvas positions from backend on mount
+  // Load connections on mount
   useEffect(() => {
     fetchConnections().then(conns => {
       setConnections(conns.map(c => ({ fromId: c.from_id, toId: c.to_id, label: c.label })))
     }).catch(() => {})
-
-    // Load canvas positions from agents (stored as canvas_x/canvas_y)
-    fetch('/api/agents').then(r => r.json()).then(agentStates => {
-      const loaded = {}
-      for (const a of agentStates) {
-        const cx = a.config?.canvas_x
-        const cy = a.config?.canvas_y
-        if (cx != null && cy != null && (cx !== 0 || cy !== 0)) {
-          loaded[a.config.id] = { x: cx, y: cy }
-          posRef.current[a.config.id] = { x: cx, y: cy }
-        }
-      }
-      if (Object.keys(loaded).length > 0) {
-        setPositions(prev => ({ ...prev, ...loaded }))
-      }
-    }).catch(() => {})
   }, [])
+
+  // Sync canvas positions from agents store whenever agents change
+  useEffect(() => {
+    const loaded = {}
+    for (const a of agents) {
+      const cx = a.config?.canvas_x
+      const cy = a.config?.canvas_y
+      if (cx != null && cy != null && (cx !== 0 || cy !== 0) && !posRef.current[a.config.id]) {
+        loaded[a.config.id] = { x: cx, y: cy }
+        posRef.current[a.config.id] = { x: cx, y: cy }
+      }
+    }
+    if (Object.keys(loaded).length > 0) {
+      setPositions(prev => ({ ...prev, ...loaded }))
+    }
+  }, [agents])
 
   // Debounced save of canvas positions after drag
   function scheduleSavePositions() {
