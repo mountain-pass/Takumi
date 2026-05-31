@@ -3,7 +3,7 @@
  */
 import React, { useState, useEffect } from 'react'
 import { Settings, CheckCircle, Loader2, Save } from 'lucide-react'
-import { useOrgStore } from '../stores/orgStore'
+import { useOrg, useOllamaModels, useSaveOrg, useSaveLLMSettings, useTestLLM } from '../hooks/useApi'
 
 const PROVIDERS = [
   { id: 'anthropic', label: 'Anthropic', needsUrl: false, defaultModel: 'claude-haiku-4-5-20251001' },
@@ -16,9 +16,10 @@ const PROVIDERS = [
 ]
 
 export default function SystemSettingsView() {
-  const saveLLMSettings = useOrgStore(s => s.saveLLMSettings)
-  const saveOrg = useOrgStore(s => s.saveOrg)
-  const testLLM = useOrgStore(s => s.testLLM)
+  const { data: orgData, isLoading: loading } = useOrg()
+  const saveOrgMut = useSaveOrg()
+  const saveLLMMut = useSaveLLMSettings()
+  const testLLMMut = useTestLLM()
 
   const [orgName, setOrgName] = useState('')
   const [orgDesc, setOrgDesc] = useState('')
@@ -26,35 +27,28 @@ export default function SystemSettingsView() {
   const [apiKey, setApiKey] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [model, setModel] = useState('')
-  const [availableModels, setAvailableModels] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
-  const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState(null)
   const [testMsg, setTestMsg] = useState('')
 
+  // Populate form from cached org data
+  const populated = React.useRef(false)
   useEffect(() => {
-    fetch('/api/org').then(r => r.json()).then(d => {
-      setOrgName(d.org_name || '')
-      setOrgDesc(d.org_description || '')
-      setProviderId(d.llm_provider || 'anthropic')
-      setApiKey(d.llm_api_key || '')
-      setBaseUrl(d.llm_base_url || '')
-      setModel(d.llm_model || '')
-      setLoading(false)
-      if (d.llm_provider === 'ollama') fetchOllamaModels(d.llm_base_url, d.llm_api_key)
-    }).catch(() => setLoading(false))
-  }, [])
+    if (!orgData || populated.current) return
+    populated.current = true
+    setOrgName(orgData.org_name || '')
+    setOrgDesc(orgData.org_description || '')
+    setProviderId(orgData.llm_provider || 'anthropic')
+    setApiKey(orgData.llm_api_key || '')
+    setBaseUrl(orgData.llm_base_url || '')
+    setModel(orgData.llm_model || '')
+  }, [orgData])
 
-  function fetchOllamaModels(url, key) {
-    const params = new URLSearchParams()
-    if (url || baseUrl) params.set('base_url', url || baseUrl)
-    if (key || apiKey) params.set('api_key', key || apiKey)
-    fetch(`/api/ollama/models?${params}`).then(r => r.json()).then(d => {
-      if (d.models?.length) setAvailableModels(d.models)
-    }).catch(() => {})
-  }
+  const { data: ollamaData } = useOllamaModels(
+    providerId === 'ollama' ? baseUrl : null,
+    providerId === 'ollama' ? apiKey : null,
+  )
+  const availableModels = ollamaData?.models || []
 
   const provider = PROVIDERS.find(p => p.id === providerId) || PROVIDERS[0]
 
@@ -64,42 +58,37 @@ export default function SystemSettingsView() {
     setModel(p.defaultModel)
     if (p.defaultUrl) setBaseUrl(p.defaultUrl)
     else setBaseUrl('')
-    setAvailableModels([])
     setTestResult(null)
     setSaved(false)
-    if (id === 'ollama') fetchOllamaModels(p.defaultUrl, apiKey)
   }
 
   async function handleTest() {
-    setTesting(true)
     setTestResult(null)
     try {
-      const res = await testLLM({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
+      const res = await testLLMMut.mutateAsync({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
       setTestResult('ok')
       setTestMsg(res.response || 'Connected!')
     } catch (e) {
       setTestResult('error')
       setTestMsg(e.message)
-    } finally {
-      setTesting(false)
     }
   }
 
   async function handleSave() {
-    setSaving(true)
     setSaved(false)
     try {
-      await saveOrg(orgName, orgDesc)
-      await saveLLMSettings({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
+      await saveOrgMut.mutateAsync({ org_name: orgName, org_description: orgDesc })
+      await saveLLMMut.mutateAsync({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (e) {
       setTestResult('error')
       setTestMsg(e.message)
-    } finally {
-      setSaving(false)
     }
   }
+
+  const saving = saveOrgMut.isPending || saveLLMMut.isPending
+  const testing = testLLMMut.isPending
 
   if (loading) {
     return (

@@ -45,6 +45,12 @@ def get_adapter(provider: LLMProvider, settings, runtime: dict | None = None) ->
         from .minimax_adapter import MiniMaxAdapter
         return MiniMaxAdapter(api_key=_key("llm_api_key", settings.minimax_api_key), group_id=settings.minimax_group_id)
 
+    elif provider == LLMProvider.OPENROUTER:
+        from .custom_adapter import CustomAdapter
+        base_url = _url("llm_base_url", "", "https://openrouter.ai/api/v1")
+        api_key = _key("llm_api_key", "")
+        return CustomAdapter(base_url=base_url, api_key=api_key)
+
     elif provider == LLMProvider.CUSTOM:
         from .custom_adapter import CustomAdapter
         base_url = rt.get("llm_base_url", "")

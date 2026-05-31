@@ -2,38 +2,36 @@
  * AgentModal — create a new agent or view agent details.
  */
 import React, { useState } from 'react'
+import { Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import { useProviders, useProviderModels } from '../hooks/useApi'
 import AIPromptWizard from './AIPromptWizard'
-
-const PROVIDERS = ['anthropic', 'openai', 'ollama', 'gemini', 'glm', 'minimax']
-
-const DEFAULT_MODELS = {
-  anthropic: 'claude-haiku-4-5-20251001',
-  openai: 'gpt-4o-mini',
-  ollama: 'llama3',
-  gemini: 'gemini-1.5-flash',
-  glm: 'glm-4-flash',
-  minimax: 'abab6.5s-chat',
-}
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 
 export default function AgentModal({ onClose }) {
   const createAgent = useOrgStore(s => s.createAgent)
+  const navigateTo = useOrgStore(s => s.navigateTo)
+  const { data: providers = [] } = useProviders()
+  const llmProviders = providers.filter(p => p.type === 'llm')
+
   const [form, setForm] = useState({
     name: '',
     role: '',
     description: '',
     system_prompt: '',
-    llm_provider: 'anthropic',
-    llm_model: 'claude-haiku-4-5-20251001',
+    api_provider_id: '',
+    llm_model: '',
     avatar_color: '#4F46E5',
-    max_context_messages: 20,
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+
+  const selectedProvider = llmProviders.find(p => p.id === form.api_provider_id)
+  const { data: modelsData } = useProviderModels(selectedProvider?.id)
+  const models = modelsData?.models || []
 
   async function handleSave() {
     if (!form.name || !form.role || !form.system_prompt) {
@@ -86,7 +84,7 @@ export default function AgentModal({ onClose }) {
               />
             </div>
             <textarea
-              className="input resize-none"
+              className="input resize-y min-h-[100px]"
               rows={4}
               value={form.system_prompt}
               onChange={e => set('system_prompt', e.target.value)}
@@ -94,23 +92,50 @@ export default function AgentModal({ onClose }) {
             />
           </div>
 
+          {/* Provider from API providers */}
           <label className="space-y-1">
             <span className="text-xs font-medium text-gray-500">LLM Provider</span>
-            <select className="input" value={form.llm_provider} onChange={e => { set('llm_provider', e.target.value); set('llm_model', DEFAULT_MODELS[e.target.value]) }}>
-              {PROVIDERS.map(p => <option key={p} value={p}>{p}</option>)}
-            </select>
+            {llmProviders.length > 0 ? (
+              <select
+                className="input"
+                value={form.api_provider_id}
+                onChange={e => { set('api_provider_id', e.target.value); set('llm_model', '') }}
+              >
+                <option value="">Select provider…</option>
+                {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-400 flex-1">No providers configured</span>
+                <button
+                  type="button"
+                  onClick={() => { onClose(); navigateTo('api') }}
+                  className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 rounded-lg border border-indigo-200"
+                >
+                  <Pencil size={11} /> Add
+                </button>
+              </div>
+            )}
           </label>
+
+          {/* Model from provider's model list */}
           <label className="space-y-1">
             <span className="text-xs font-medium text-gray-500">Model</span>
-            <input className="input" value={form.llm_model} onChange={e => set('llm_model', e.target.value)} />
+            {models.length > 0 ? (
+              <select
+                className="input"
+                value={form.llm_model}
+                onChange={e => set('llm_model', e.target.value)}
+              >
+                <option value="">Select model…</option>
+                {models.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            ) : (
+              <input className="input" value={form.llm_model} onChange={e => set('llm_model', e.target.value)} placeholder="Enter model name" />
+            )}
           </label>
 
-          <label className="space-y-1">
-            <span className="text-xs font-medium text-gray-500">Max context messages</span>
-            <input className="input" type="number" min={5} max={100} value={form.max_context_messages} onChange={e => set('max_context_messages', parseInt(e.target.value))} />
-          </label>
-
-          <label className="space-y-1">
+          <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Colour</span>
             <div className="flex gap-2 flex-wrap pt-1">
               {COLORS.map(c => (
@@ -142,7 +167,7 @@ export default function AgentModal({ onClose }) {
         {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
       </div>
 
-      <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; } .input:focus { ring: 2px solid #6366f1; border-color: #6366f1; }`}</style>
+      <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; background: white; } .input:focus { border-color: #6366f1; }`}</style>
     </div>
   )
 }

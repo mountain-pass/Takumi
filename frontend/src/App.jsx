@@ -100,6 +100,8 @@ export default function App() {
   const setupDone = useOrgStore(s => s.setupDone)
   const orgName = useOrgStore(s => s.orgName)
   const selectedAgentId = useOrgStore(s => s.selectedAgentId)
+  const pendingNav = useOrgStore(s => s.pendingNav)
+  const clearNav = useOrgStore(s => s.clearNav)
 
   const [tab, setTab] = useState('chat')
 
@@ -107,6 +109,13 @@ export default function App() {
     fetchOrg()
     connect()
   }, [])
+
+  useEffect(() => {
+    if (pendingNav) {
+      setTab(pendingNav)
+      clearNav()
+    }
+  }, [pendingNav])
 
   if (setupDone === null) {
     return (
