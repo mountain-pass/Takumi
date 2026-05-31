@@ -4,8 +4,15 @@
  * Click a connection line to edit its label or delete it.
  */
 import React, { useState, useRef, useCallback, useEffect } from 'react'
-import { Plus, X, Trash2, Check, Network, Pencil } from 'lucide-react'
+import { Plus, X, Trash2, Check, Network, Pencil, KeyRound } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import {
+  useAgents, useConnections,
+  useUpdateAgent, useRemoveAgent,
+  useCreateConnection, useUpdateConnection, useDeleteConnection,
+  useSaveCanvasPositions,
+  useProviders, useProviderModels,
+} from '../hooks/useApi'
 import AgentModal from './AgentModal'
 import AIPromptWizard from './AIPromptWizard'
 
@@ -141,6 +148,62 @@ function ConnPopover({ x, y, label, onEdit, onDelete, onClose }) {
 
 // ── Edit panel ────────────────────────────────────────────────────────────────
 
+function ProviderModelPicker({ form, set }) {
+  const navigateTo = useOrgStore(s => s.navigateTo)
+  const { data: providers = [] } = useProviders()
+  const llmProviders = providers.filter(p => p.type === 'llm')
+
+  const selectedProvider = llmProviders.find(p => p.id === form.api_provider_id)
+  const { data: modelsData } = useProviderModels(selectedProvider?.id)
+  const models = modelsData?.models || []
+
+  if (llmProviders.length === 0) {
+    return (
+      <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl">
+        <span className="text-xs text-amber-700 flex-1">No LLM providers configured.</span>
+        <button
+          type="button"
+          onClick={() => navigateTo('api')}
+          className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 rounded-lg border border-indigo-200">
+          <Pencil size={11} /> Add Provider
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <label className="space-y-1">
+        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider</span>
+        <select
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 bg-white"
+          value={form.api_provider_id || ''}
+          onChange={e => { set('api_provider_id', e.target.value); set('llm_model', '') }}>
+          <option value="">Select provider…</option>
+          {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </label>
+      <label className="space-y-1">
+        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Model</span>
+        {models.length > 0 ? (
+          <select
+            className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 bg-white"
+            value={form.llm_model || ''}
+            onChange={e => set('llm_model', e.target.value)}>
+            <option value="">Select model…</option>
+            {models.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        ) : (
+          <input
+            className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400"
+            placeholder="Enter model name"
+            value={form.llm_model || ''} onChange={e => set('llm_model', e.target.value)} />
+        )}
+      </label>
+    </div>
+  )
+}
+
 function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
@@ -189,23 +252,12 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
               onError={setError}
             />
           </div>
-          <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-none"
+          <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y min-h-[120px]"
             rows={5} value={form.system_prompt || ''} onChange={e => set('system_prompt', e.target.value)} />
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <label className="space-y-1">
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider</span>
-            <select className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400"
-              value={form.llm_provider}
-              onChange={e => { set('llm_provider', e.target.value); set('llm_model', DEFAULT_MODELS[e.target.value] || '') }}>
-              {PROVIDERS.map(p => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </label>
-          <label className="space-y-1">
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Model</span>
-            <input className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400"
-              value={form.llm_model || ''} onChange={e => set('llm_model', e.target.value)} />
-          </label>
+        <div className="space-y-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider & Model</span>
+          <ProviderModelPicker form={form} set={set} />
         </div>
         <label className="block space-y-1">
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Avatar colour</span>
@@ -243,7 +295,7 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
 
 // ── Agent node ────────────────────────────────────────────────────────────────
 
-function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onPortMouseDown, onInPortMouseUp, onClick }) {
+function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onPortMouseDown, onInPortMouseUp, onClick, onDoubleClick }) {
   const { config } = agent
 
   return (
@@ -260,6 +312,10 @@ function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onP
       onClick={e => {
         e.stopPropagation()
         onClick(agent)
+      }}
+      onDoubleClick={e => {
+        e.stopPropagation()
+        onDoubleClick(agent)
       }}
     >
       {config.is_ceo && (
@@ -325,14 +381,22 @@ function getDefaultPos(agent, index) {
 }
 
 export default function OrganisationView() {
-  const agents      = useOrgStore(s => s.agents)
-  const removeAgent = useOrgStore(s => s.removeAgent)
-  const updateAgent = useOrgStore(s => s.updateAgent)
-  const fetchConnections    = useOrgStore(s => s.fetchConnections)
-  const createConnectionAPI = useOrgStore(s => s.createConnection)
-  const updateConnectionAPI = useOrgStore(s => s.updateConnection)
-  const deleteConnectionAPI = useOrgStore(s => s.deleteConnection)
-  const saveCanvasPositions = useOrgStore(s => s.saveCanvasPositions)
+  // TanStack queries — cached, auto-refetched, invalidated on mutations
+  const { data: agentsData = [] } = useAgents()
+  const { data: connectionsData = [] } = useConnections()
+
+  // Also keep WS-driven agents for real-time status updates
+  const wsAgents = useOrgStore(s => s.agents)
+  // Prefer TanStack data for positions (authoritative from DB), merge WS status
+  const agents = agentsData.length > 0 ? agentsData : wsAgents
+
+  // Mutations with automatic cache invalidation
+  const updateAgentMut = useUpdateAgent()
+  const removeAgentMut = useRemoveAgent()
+  const createConnMut  = useCreateConnection()
+  const updateConnMut  = useUpdateConnection()
+  const deleteConnMut  = useDeleteConnection()
+  const savePosMut     = useSaveCanvasPositions()
 
   const canvasRef = useRef(null)
 
@@ -341,6 +405,7 @@ export default function OrganisationView() {
 
   const [connections, setConnections] = useState([])
   const [selected, setSelected]       = useState(null)
+  const [panelOpen, setPanelOpen]     = useState(false)
   const [selectedConn, setSelectedConn] = useState(null)
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [labelModal, setLabelModal]   = useState(null)
@@ -350,34 +415,37 @@ export default function OrganisationView() {
   const [connLine, setConnLine] = useState(null)
   const saveTimer = useRef(null)
 
-  // Load connections on mount
+  // Sync connections from TanStack query data
   useEffect(() => {
-    fetchConnections().then(conns => {
-      setConnections(conns.map(c => ({ fromId: c.from_id, toId: c.to_id, label: c.label })))
-    }).catch(() => {})
-  }, [])
+    if (connectionsData.length > 0 || connections.length === 0) {
+      setConnections(connectionsData.map(c => ({ fromId: c.from_id, toId: c.to_id, label: c.label })))
+    }
+  }, [connectionsData])
 
-  // Sync canvas positions from agents store whenever agents change
+  // Sync canvas positions from TanStack agents data
+  const dbLoaded = useRef(false)
   useEffect(() => {
+    if (dbLoaded.current || agentsData.length === 0) return
     const loaded = {}
-    for (const a of agents) {
+    for (const a of agentsData) {
       const cx = a.config?.canvas_x
       const cy = a.config?.canvas_y
-      if (cx != null && cy != null && (cx !== 0 || cy !== 0) && !posRef.current[a.config.id]) {
+      if (cx != null && cy != null && (cx !== 0 || cy !== 0)) {
         loaded[a.config.id] = { x: cx, y: cy }
         posRef.current[a.config.id] = { x: cx, y: cy }
       }
     }
     if (Object.keys(loaded).length > 0) {
+      dbLoaded.current = true
       setPositions(prev => ({ ...prev, ...loaded }))
     }
-  }, [agents])
+  }, [agentsData])
 
   // Debounced save of canvas positions after drag
   function scheduleSavePositions() {
     if (saveTimer.current) clearTimeout(saveTimer.current)
     saveTimer.current = setTimeout(() => {
-      saveCanvasPositions(posRef.current).catch(() => {})
+      savePosMut.mutate(posRef.current)
     }, 800)
   }
 
@@ -462,10 +530,10 @@ export default function OrganisationView() {
       setConnections(prev => prev.map(c =>
         c.fromId === fromId && c.toId === toId ? { ...c, label } : c
       ))
-      updateConnectionAPI(fromId, toId, label).catch(() => {})
+      updateConnMut.mutate({ from_id: fromId, to_id: toId, label })
     } else {
       setConnections(prev => [...prev, { fromId, toId, label }])
-      createConnectionAPI(fromId, toId, label).catch(() => {})
+      createConnMut.mutate({ from_id: fromId, to_id: toId, label })
     }
     setLabelModal(null)
     setSelectedConn(null)
@@ -474,6 +542,7 @@ export default function OrganisationView() {
   function handleConnClick(conn, labelX, labelY) {
     setSelectedConn({ ...conn, x: labelX, y: labelY })
     setSelected(null)
+    setPanelOpen(false)
   }
 
   function handleEditConn() {
@@ -486,13 +555,13 @@ export default function OrganisationView() {
   function handleDeleteConn() {
     if (!selectedConn) return
     setConnections(prev => prev.filter(c => !(c.fromId === selectedConn.fromId && c.toId === selectedConn.toId)))
-    deleteConnectionAPI(selectedConn.fromId, selectedConn.toId).catch(() => {})
+    deleteConnMut.mutate({ from_id: selectedConn.fromId, to_id: selectedConn.toId })
     setSelectedConn(null)
   }
 
   async function handleRemove(agent) {
     if (!confirm(`Remove ${agent.config.name}?`)) return
-    await removeAgent(agent.config.id)
+    removeAgentMut.mutate(agent.config.id)
     delete posRef.current[agent.config.id]
     setPositions(prev => { const n = { ...prev }; delete n[agent.config.id]; return n })
     setConnections(prev => prev.filter(c => c.fromId !== agent.config.id && c.toId !== agent.config.id))
@@ -500,7 +569,7 @@ export default function OrganisationView() {
   }
 
   async function handleSave(form) {
-    await updateAgent(selected.config.id, form)
+    await updateAgentMut.mutateAsync({ id: selected.config.id, data: form })
   }
 
   const selectedAgent = selected ? agents.find(a => a.config.id === selected.config.id) : null
@@ -519,6 +588,7 @@ export default function OrganisationView() {
   function handleCanvasClick() {
     setSelected(null)
     setSelectedConn(null)
+    setPanelOpen(false)
   }
 
   return (
@@ -631,7 +701,13 @@ export default function OrganisationView() {
                 onInPortMouseUp={handleInPortMouseUp}
                 onClick={a => {
                   setSelectedConn(null)
-                  setSelected(prev => prev?.config?.id === a.config.id ? null : a)
+                  setSelected(prev => prev?.config?.id === a.config.id ? prev : a)
+                  setPanelOpen(false)
+                }}
+                onDoubleClick={a => {
+                  setSelectedConn(null)
+                  setSelected(a)
+                  setPanelOpen(true)
                 }}
               />
             )
@@ -670,10 +746,10 @@ export default function OrganisationView() {
       </div>
 
       {/* Edit panel */}
-      {selectedAgent && (
+      {selectedAgent && panelOpen && (
         <EditPanel
           agent={selectedAgent}
-          onClose={() => setSelected(null)}
+          onClose={() => { setSelected(null); setPanelOpen(false) }}
           onSave={handleSave}
           onRemove={handleRemove}
         />

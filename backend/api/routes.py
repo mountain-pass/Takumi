@@ -35,6 +35,7 @@ class UpdateAgentRequest(BaseModel):
     llm_model: str | None = None
     skills: list[str] | None = None
     avatar_color: str | None = None
+    api_provider_id: str | None = None
 
 
 class SubmitTaskRequest(BaseModel):
@@ -71,6 +72,9 @@ async def delete_agent(agent_id: str):
 @router.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, req: UpdateAgentRequest):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    # api_provider_id can legitimately be set to empty string to clear it
+    if "api_provider_id" in req.model_fields_set:
+        updates["api_provider_id"] = req.api_provider_id
     config = await orchestrator.update_agent(agent_id, updates)
     if not config:
         raise HTTPException(404, "Agent not found")
@@ -195,6 +199,60 @@ class LLMTestRequest(BaseModel):
     llm_model: str = ""
 
 
+@router.post("/llm/models")
+async def fetch_llm_models(req: LLMTestRequest):
+    """Return available models for a provider given credentials — no saved provider needed."""
+    import httpx
+    provider = req.llm_provider
+    api_key = req.llm_api_key or ""
+    base_url = (req.llm_base_url or "").rstrip("/")
+
+    static = {
+        "anthropic": ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "gemini":    ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+    }
+    if provider in static:
+        return {"models": static[provider]}
+
+    if provider in ("openai", "openrouter", "custom"):
+        default_base = {
+            "openai": "https://api.openai.com/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }
+        url = (base_url or default_base.get(provider, "")) + "/models"
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                all_models = [m["id"] for m in data.get("data", [])]
+                if provider == "openai":
+                    filtered = sorted([m for m in all_models if any(k in m for k in ("gpt", "o1", "o3", "o4"))])
+                    return {"models": filtered or all_models[:30]}
+                return {"models": sorted(all_models[:50])}
+        except Exception:
+            if provider == "openai":
+                return {"models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]}
+            return {"models": []}
+
+    if provider == "ollama":
+        is_cloud = "ollama.com" in base_url
+        url = "https://ollama.com/v1/models" if is_cloud else f"{base_url}/api/tags"
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                models = [m["id"] for m in data.get("data", data.get("models", []))] if is_cloud else [m["name"] for m in data.get("models", [])]
+                return {"models": models}
+        except Exception:
+            return {"models": []}
+
+    return {"models": []}
+
+
 @router.post("/llm/test")
 async def test_llm(req: LLMTestRequest):
     from ..llm_adapters.factory import get_adapter
@@ -224,6 +282,7 @@ def _default_model(provider: str) -> str:
         "gemini": "gemini-1.5-flash",
         "glm": "glm-4-flash",
         "minimax": "abab6.5s-chat",
+        "openrouter": "openai/gpt-4o-mini",
         "custom": "default",
     }
     return defaults.get(provider, "default")
@@ -349,6 +408,166 @@ async def list_conversations(limit: int = 50):
 @router.get("/conversations/{conv_id}/messages")
 async def get_conversation_messages(conv_id: str, limit: int = 200):
     return await database.get_messages(conversation_id=conv_id, limit=limit)
+
+
+# ── API Providers ────────────────────────────────────────────────────────────
+
+class ApiProviderCreate(BaseModel):
+    name: str
+    type: str = "llm"
+    provider: str = ""
+    api_key: str = ""
+    base_url: str = ""
+
+
+class ApiProviderUpdate(BaseModel):
+    name: str | None = None
+    provider: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+
+
+@router.get("/providers")
+async def list_providers():
+    providers = await database.get_all_api_providers()
+    # Mask api_key in list response
+    for p in providers:
+        if p.get("api_key"):
+            p["api_key_set"] = True
+            p["api_key"] = ""
+        else:
+            p["api_key_set"] = False
+    return providers
+
+
+@router.post("/providers", status_code=201)
+async def create_provider(req: ApiProviderCreate):
+    import uuid
+    provider_id = str(uuid.uuid4())
+    record = await database.create_api_provider({
+        "id": provider_id,
+        "name": req.name,
+        "type": req.type,
+        "provider": req.provider,
+        "api_key": req.api_key,
+        "base_url": req.base_url,
+    })
+    record["api_key_set"] = bool(req.api_key)
+    record["api_key"] = ""
+    return record
+
+
+@router.put("/providers/{provider_id}")
+async def update_provider(provider_id: str, req: ApiProviderUpdate):
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    record = await database.update_api_provider(provider_id, updates)
+    if not record:
+        raise HTTPException(404, "Provider not found")
+    record["api_key_set"] = bool(record.get("api_key"))
+    record["api_key"] = ""
+    return record
+
+
+@router.delete("/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    await database.delete_api_provider(provider_id)
+    return {"ok": True}
+
+
+@router.get("/providers/{provider_id}/models")
+async def list_provider_models(provider_id: str):
+    """Fetch available models for a specific api_provider record."""
+    import httpx
+    rows = await database.get_all_api_providers()
+    rec = next((r for r in rows if r["id"] == provider_id), None)
+    if not rec:
+        raise HTTPException(404, "Provider not found")
+
+    provider = rec["provider"]
+    api_key = rec["api_key"]
+    base_url = rec["base_url"].rstrip("/") if rec["base_url"] else ""
+
+    # Static catalogues for providers that don't expose a model-list endpoint
+    static = {
+        "anthropic": ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "gemini": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+        "glm": ["glm-4", "glm-4-flash", "glm-4-air", "glm-4-airx"],
+        "minimax": ["abab6.5s-chat", "abab5.5-chat"],
+    }
+    if provider in static:
+        return {"models": static[provider]}
+
+    # OpenAI-compatible: GET /v1/models
+    if provider in ("openai", "openrouter", "custom"):
+        default_base = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1"}
+        url = (base_url or default_base.get(provider, "")) + "/models"
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                all_models = [m["id"] for m in data.get("data", [])]
+                if provider == "openai":
+                    filtered = sorted([m for m in all_models if any(k in m for k in ("gpt", "o1", "o3", "o4"))])
+                    return {"models": filtered or all_models[:30]}
+                return {"models": sorted(all_models[:50])}
+        except Exception:
+            if provider == "openai":
+                return {"models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]}
+            return {"models": []}
+
+    # Ollama
+    if provider == "ollama":
+        is_cloud = "ollama.com" in base_url
+        url = "https://ollama.com/v1/models" if is_cloud else f"{base_url}/api/tags"
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                if is_cloud:
+                    models = [m["id"] for m in data.get("data", data.get("models", []))]
+                else:
+                    models = [m["name"] for m in data.get("models", [])]
+                return {"models": models}
+        except Exception:
+            return {"models": []}
+
+    return {"models": []}
+
+
+@router.post("/providers/{provider_id}/test")
+async def test_provider(provider_id: str):
+    """Test connectivity for a saved api_provider."""
+    rows = await database.get_all_api_providers()
+    rec = next((r for r in rows if r["id"] == provider_id), None)
+    if not rec:
+        raise HTTPException(404, "Provider not found")
+
+    from ..llm_adapters.factory import get_adapter
+    from ..config import get_settings
+
+    rt = {
+        "llm_provider": rec["provider"],
+        "llm_api_key": rec["api_key"],
+        "llm_base_url": rec["base_url"],
+        "llm_model": "",
+    }
+    try:
+        provider = LLMProvider(rec["provider"])
+        adapter = get_adapter(provider, get_settings(), rt)
+        model = _default_model(rec["provider"])
+        resp = await adapter.complete(
+            system_prompt="You are a helpful assistant.",
+            messages=[{"role": "user", "content": "Reply with only the word: ready"}],
+            model=model,
+            max_tokens=10,
+        )
+        return {"ok": True, "response": resp.content.strip()}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
 # ── Message history (agent-to-agent) ──────────────────────────────────────────

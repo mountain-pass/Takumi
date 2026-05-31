@@ -24,6 +24,7 @@ class LLMProvider(str, Enum):
     GEMINI = "gemini"
     GLM = "glm"
     MINIMAX = "minimax"
+    OPENROUTER = "openrouter"
     CUSTOM = "custom"
 
 
@@ -57,6 +58,7 @@ class AgentConfig(BaseModel):
     max_context_messages: int = 20  # keeps context lean
     canvas_x: float = 0
     canvas_y: float = 0
+    api_provider_id: Optional[str] = None
 
 
 class AgentState(BaseModel):

@@ -14,6 +14,11 @@ export const useOrgStore = create((set, get) => ({
   selectedAgentId: null,
   ws: null,
 
+  // ── Navigation ─────────────────────────────────────────────────────────────
+  pendingNav: null,
+  navigateTo(view) { set({ pendingNav: view }) },
+  clearNav() { set({ pendingNav: null }) },
+
   // ── Org / setup ────────────────────────────────────────────────────────────
   orgName: '',
   orgDescription: '',

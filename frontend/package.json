@@ -8,6 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.100.14",
     "framer-motion": "^11.2.10",
     "lucide-react": "^0.383.0",
     "react": "^18.3.1",

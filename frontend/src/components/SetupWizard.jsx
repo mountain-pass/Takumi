@@ -9,13 +9,12 @@ import { Building2, Key, Users, ChevronRight, ChevronLeft, Sparkles, Plus, Trash
 import { useOrgStore } from '../stores/orgStore'
 
 const PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic', needsKey: true, needsUrl: false, placeholder: 'sk-ant-...', defaultModel: 'claude-haiku-4-5-20251001' },
-  { id: 'openai',    label: 'OpenAI',    needsKey: true, needsUrl: false, placeholder: 'sk-...',     defaultModel: 'gpt-4o-mini' },
-  { id: 'ollama',    label: 'Ollama',    needsKey: true, needsUrl: true, placeholder: '',             defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com', optionalKey: true },
-  { id: 'gemini',    label: 'Google Gemini', needsKey: true, needsUrl: false, placeholder: 'AIza...', defaultModel: 'gemini-1.5-flash' },
-  { id: 'glm',       label: 'GLM (Zhipu)', needsKey: true, needsUrl: false, placeholder: '',         defaultModel: 'glm-4-flash' },
-  { id: 'minimax',   label: 'MiniMax',   needsKey: true, needsUrl: false, placeholder: '',           defaultModel: 'abab6.5s-chat' },
-  { id: 'custom',    label: 'Custom / Local (OpenAI-compatible)', needsKey: true, needsUrl: true, placeholder: '', defaultModel: 'default', defaultUrl: 'http://localhost:11434/v1', optionalKey: true },
+  { id: 'anthropic',    label: 'Anthropic',        needsKey: true,  needsUrl: false, placeholder: 'sk-ant-...', defaultModel: 'claude-haiku-4-5-20251001' },
+  { id: 'openai',       label: 'OpenAI',           needsKey: true,  needsUrl: false, placeholder: 'sk-...',     defaultModel: 'gpt-4o-mini' },
+  { id: 'ollama',       label: 'Ollama',           needsKey: false, needsUrl: true,  placeholder: '',            defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com', optionalKey: true },
+  { id: 'gemini',       label: 'Google Gemini',    needsKey: true,  needsUrl: false, placeholder: 'AIza...',    defaultModel: 'gemini-1.5-flash' },
+  { id: 'openrouter',   label: 'OpenRouter',       needsKey: true,  needsUrl: false, placeholder: 'sk-or-...', defaultModel: 'openai/gpt-4o-mini' },
+  { id: 'custom',       label: 'Custom / Local',   needsKey: false, needsUrl: true,  placeholder: '',            defaultModel: '', defaultUrl: 'http://localhost:11434/v1', optionalKey: true },
 ]
 
 const STEP_ICONS = [Building2, Key, Users]
@@ -109,60 +108,73 @@ function StepLLM({ onNext, onBack }) {
   const saveLLMSettings = useOrgStore(s => s.saveLLMSettings)
   const testLLM = useOrgStore(s => s.testLLM)
 
-  const [providerId, setProviderId] = useState('ollama')
+  const [providerId, setProviderId] = useState('anthropic')
   const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('https://ollama.com')
-  const [model, setModel] = useState('gemma3:4b')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
   const [availableModels, setAvailableModels] = useState([])
-
-  // Pre-fill from backend (seeded from .env), then fetch live models
-  useEffect(() => {
-    fetch('/api/org').then(r => r.json()).then(d => {
-      if (d.llm_provider) setProviderId(d.llm_provider)
-      if (d.llm_api_key) setApiKey(d.llm_api_key)
-      if (d.llm_base_url) setBaseUrl(d.llm_base_url)
-      if (d.llm_model) setModel(d.llm_model)
-      // If Ollama, fetch live models
-      if (d.llm_provider === 'ollama' || !d.llm_provider) {
-        fetchOllamaModels()
-      }
-    }).catch(() => {})
-  }, [])
-
-  function fetchOllamaModels(url, key) {
-    const params = new URLSearchParams()
-    if (url || baseUrl) params.set('base_url', url || baseUrl)
-    if (key || apiKey) params.set('api_key', key || apiKey)
-    fetch(`/api/ollama/models?${params}`).then(r => r.json()).then(d => {
-      if (d.models?.length) {
-        setAvailableModels(d.models)
-        setModel(prev => d.models.includes(prev) ? prev : d.models[0])
-      }
-    }).catch(() => {})
-  }
+  const [fetchingModels, setFetchingModels] = useState(false)
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState(null) // null | 'ok' | 'error'
+  const [testResult, setTestResult] = useState(null)
   const [testMsg, setTestMsg] = useState('')
   const [saving, setSaving] = useState(false)
 
   const provider = PROVIDERS.find(p => p.id === providerId)
 
+  // Pre-fill from backend on mount
+  useEffect(() => {
+    fetch('/api/org').then(r => r.json()).then(d => {
+      const pid = d.llm_provider || 'anthropic'
+      const p = PROVIDERS.find(x => x.id === pid) || PROVIDERS[0]
+      setProviderId(pid)
+      setApiKey(d.llm_api_key || '')
+      setBaseUrl(d.llm_base_url || p.defaultUrl || '')
+      setModel(d.llm_model || p.defaultModel || '')
+      fetchModels(pid, d.llm_api_key || '', d.llm_base_url || p.defaultUrl || '')
+    }).catch(() => {})
+  }, [])
+
+  async function fetchModels(pid, key, url) {
+    setFetchingModels(true)
+    setAvailableModels([])
+    try {
+      const res = await fetch('/api/llm/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ llm_provider: pid, llm_api_key: key, llm_base_url: url, llm_model: '' }),
+      })
+      const data = await res.json()
+      if (data.models?.length) {
+        setAvailableModels(data.models)
+        setModel(prev => data.models.includes(prev) ? prev : data.models[0])
+      }
+    } catch {}
+    setFetchingModels(false)
+  }
+
   function selectProvider(id) {
     const p = PROVIDERS.find(x => x.id === id)
     setProviderId(id)
-    setModel(p.defaultModel)
-    if (p.defaultUrl) setBaseUrl(p.defaultUrl)
+    setModel(p.defaultModel || '')
+    setBaseUrl(p.defaultUrl || '')
+    setApiKey('')
     setAvailableModels([])
     setTestResult(null)
-    if (id === 'ollama') fetchOllamaModels()
+    // Fetch models immediately for providers that don't need a key
+    if (!p.needsKey || p.optionalKey) {
+      fetchModels(id, '', p.defaultUrl || '')
+    }
+  }
+
+  async function handleFetchModels() {
+    await fetchModels(providerId, apiKey, baseUrl)
   }
 
   async function runTest() {
     setTesting(true)
     setTestResult(null)
     try {
-      const payload = { llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model }
-      const res = await testLLM(payload)
+      const res = await testLLM({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
       setTestResult('ok')
       setTestMsg(res.response || 'Connected!')
     } catch (e) {
@@ -187,6 +199,7 @@ function StepLLM({ onNext, onBack }) {
         <p className="text-gray-500 mt-1">Your agents need a brain. Pick a provider and enter your credentials.</p>
       </div>
 
+      {/* Provider grid */}
       <div className="grid grid-cols-2 gap-2">
         {PROVIDERS.map(p => (
           <button
@@ -200,30 +213,61 @@ function StepLLM({ onNext, onBack }) {
         ))}
       </div>
 
+      {/* Credentials */}
       <div className="space-y-3">
-        {provider.needsKey && (
+        {(provider.needsKey || provider.optionalKey) && (
           <label className="block space-y-1.5">
-            <span className="text-sm font-medium text-gray-700">API Key {provider.optionalKey && <span className="text-gray-400 font-normal">(if required)</span>}</span>
-            <input
-              type="password"
-              className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
-              placeholder={provider.placeholder || 'Enter API key'}
-              value={apiKey}
-              onChange={e => { setApiKey(e.target.value); setTestResult(null) }}
-            />
+            <span className="text-sm font-medium text-gray-700">
+              API Key {provider.optionalKey && <span className="text-gray-400 font-normal">(optional)</span>}
+            </span>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
+                placeholder={provider.placeholder || 'Enter API key'}
+                value={apiKey}
+                onChange={e => { setApiKey(e.target.value); setTestResult(null); setAvailableModels([]) }}
+              />
+              <button
+                type="button"
+                onClick={handleFetchModels}
+                disabled={fetchingModels}
+                title="Fetch available models"
+                className="px-3 py-2 border border-gray-300 rounded-xl text-sm text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5"
+              >
+                {fetchingModels ? <Loader size={13} className="animate-spin" /> : null}
+                {fetchingModels ? 'Loading…' : 'Load Models'}
+              </button>
+            </div>
           </label>
         )}
+
         {provider.needsUrl && (
           <label className="block space-y-1.5">
             <span className="text-sm font-medium text-gray-700">Base URL</span>
-            <input
-              className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
-              placeholder="http://localhost:11434"
-              value={baseUrl}
-              onChange={e => { setBaseUrl(e.target.value); setTestResult(null) }}
-            />
+            <div className="flex gap-2">
+              <input
+                className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
+                placeholder="http://localhost:11434"
+                value={baseUrl}
+                onChange={e => { setBaseUrl(e.target.value); setTestResult(null); setAvailableModels([]) }}
+              />
+              {!provider.needsKey && (
+                <button
+                  type="button"
+                  onClick={handleFetchModels}
+                  disabled={fetchingModels}
+                  className="px-3 py-2 border border-gray-300 rounded-xl text-sm text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5"
+                >
+                  {fetchingModels ? <Loader size={13} className="animate-spin" /> : null}
+                  {fetchingModels ? 'Loading…' : 'Load Models'}
+                </button>
+              )}
+            </div>
           </label>
         )}
+
+        {/* Model selector */}
         <label className="block space-y-1.5">
           <span className="text-sm font-medium text-gray-700">Default model</span>
           {availableModels.length > 0 ? (
@@ -239,15 +283,16 @@ function StepLLM({ onNext, onBack }) {
               className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
               value={model}
               onChange={e => { setModel(e.target.value); setTestResult(null) }}
-              placeholder="e.g. gemma3:4b"
+              placeholder={fetchingModels ? 'Loading models…' : 'e.g. claude-haiku-4-5-20251001'}
             />
           )}
         </label>
       </div>
 
+      {/* Test connection */}
       <button
         onClick={runTest}
-        disabled={testing}
+        disabled={testing || !model}
         className="w-full flex items-center justify-center gap-2 border border-indigo-300 text-indigo-600 hover:bg-indigo-50 rounded-xl py-2.5 text-sm font-medium transition-colors disabled:opacity-40"
       >
         {testing ? <><Loader size={14} className="animate-spin" /> Testing…</> : 'Test Connection'}
@@ -266,7 +311,7 @@ function StepLLM({ onNext, onBack }) {
         </button>
         <button
           onClick={next}
-          disabled={saving}
+          disabled={saving || !model}
           className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded-xl py-3 font-medium transition-colors"
         >
           {saving ? <Loader size={16} className="animate-spin" /> : <>Continue <ChevronRight size={16} /></>}

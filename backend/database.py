@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS api_providers (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL DEFAULT 'llm',
+    provider   TEXT NOT NULL DEFAULT '',
+    api_key    TEXT NOT NULL DEFAULT '',
+    base_url   TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS agent_connections (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     from_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -89,6 +99,11 @@ async def init(data_dir: str) -> None:
     await _db.execute("PRAGMA journal_mode=WAL")
     await _db.execute("PRAGMA foreign_keys=ON")
     await _db.executescript(SCHEMA)
+    # Migrations for existing DBs
+    try:
+        await _db.execute("ALTER TABLE agents ADD COLUMN api_provider_id TEXT REFERENCES api_providers(id)")
+    except Exception:
+        pass
     await _db.commit()
 
 
@@ -162,6 +177,47 @@ async def get_all_api_keys() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── API Providers ─────────────────────────────────────────────────────────────
+
+async def create_api_provider(provider: dict) -> dict:
+    await _conn().execute(
+        "INSERT INTO api_providers(id, name, type, provider, api_key, base_url) VALUES(?, ?, ?, ?, ?, ?)",
+        (provider["id"], provider["name"], provider.get("type", "llm"),
+         provider.get("provider", ""), provider.get("api_key", ""), provider.get("base_url", "")),
+    )
+    await _conn().commit()
+    return provider
+
+
+async def get_all_api_providers() -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT id, name, type, provider, api_key, base_url, created_at FROM api_providers ORDER BY created_at"
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_api_provider(provider_id: str, updates: dict) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM api_providers WHERE id = ?", (provider_id,)
+    )).fetchone()
+    if not row:
+        return None
+    current = dict(row)
+    current.update({k: v for k, v in updates.items() if v is not None})
+    await _conn().execute(
+        "UPDATE api_providers SET name=?, type=?, provider=?, api_key=?, base_url=? WHERE id=?",
+        (current["name"], current["type"], current["provider"],
+         current["api_key"], current["base_url"], provider_id),
+    )
+    await _conn().commit()
+    return current
+
+
+async def delete_api_provider(provider_id: str) -> None:
+    await _conn().execute("DELETE FROM api_providers WHERE id = ?", (provider_id,))
+    await _conn().commit()
+
+
 # ── Agents ────────────────────────────────────────────────────────────────────
 
 async def save_agent(agent: dict) -> None:
@@ -169,14 +225,15 @@ async def save_agent(agent: dict) -> None:
     await _conn().execute(
         """INSERT INTO agents(id, name, role, description, system_prompt,
            llm_provider, llm_model, skills, is_ceo, avatar_color,
-           max_context_messages, canvas_x, canvas_y)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           max_context_messages, canvas_x, canvas_y, api_provider_id)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              name=excluded.name, role=excluded.role, description=excluded.description,
              system_prompt=excluded.system_prompt, llm_provider=excluded.llm_provider,
              llm_model=excluded.llm_model, skills=excluded.skills, is_ceo=excluded.is_ceo,
              avatar_color=excluded.avatar_color, max_context_messages=excluded.max_context_messages,
-             canvas_x=excluded.canvas_x, canvas_y=excluded.canvas_y""",
+             canvas_x=excluded.canvas_x, canvas_y=excluded.canvas_y,
+             api_provider_id=excluded.api_provider_id""",
         (
             agent["id"], agent["name"], agent.get("role", ""),
             agent.get("description", ""), agent.get("system_prompt", ""),
@@ -185,6 +242,7 @@ async def save_agent(agent: dict) -> None:
             agent.get("avatar_color", "#4F46E5"),
             agent.get("max_context_messages", 20),
             agent.get("canvas_x", 0), agent.get("canvas_y", 0),
+            agent.get("api_provider_id"),
         ),
     )
     await _conn().commit()
