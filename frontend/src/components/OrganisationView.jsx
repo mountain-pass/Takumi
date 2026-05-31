@@ -7,6 +7,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { Plus, X, Trash2, Check, Network, Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import AgentModal from './AgentModal'
+import AIPromptWizard from './AIPromptWizard'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +145,7 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
   async function handleSave() {
@@ -152,7 +154,7 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   }
 
   return (
-    <div className="w-80 shrink-0 bg-white border-l border-gray-100 flex flex-col overflow-hidden z-10">
+    <div className="w-[30%] min-w-80 shrink-0 bg-white border-l border-gray-100 flex flex-col overflow-hidden z-10">
       <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl flex items-center justify-center text-white font-bold text-sm"
@@ -175,11 +177,21 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
               value={form[k] || ''} onChange={e => set(k, e.target.value)} />
           </label>
         ))}
-        <label className="block space-y-1">
-          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">System Prompt</span>
+        <div className="block space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">System Prompt</span>
+            <AIPromptWizard
+              name={form.name}
+              role={form.role}
+              description={form.description}
+              currentPrompt={form.system_prompt}
+              onAccept={prompt => set('system_prompt', prompt)}
+              onError={setError}
+            />
+          </div>
           <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-none"
             rows={5} value={form.system_prompt || ''} onChange={e => set('system_prompt', e.target.value)} />
-        </label>
+        </div>
         <div className="grid grid-cols-2 gap-3">
           <label className="space-y-1">
             <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider</span>
@@ -219,6 +231,12 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
           <Check size={14} /> {saving ? 'Saving…' : 'Save Changes'}
         </button>
       </div>
+
+      {error && (
+        <div className="px-5 pb-4">
+          <p className="text-red-500 text-xs bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>
+        </div>
+      )}
     </div>
   )
 }
@@ -518,21 +536,15 @@ export default function OrganisationView() {
         <DotGrid />
 
         {/* SVG: connections + preview */}
+        {/* SVG layer 1: visible lines (below nodes) */}
         <svg className="absolute inset-0 w-full h-full pointer-events-none z-10">
           <defs>
-            {/* Arrow for normal connections */}
             <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
               <path d="M0,0 L0,8 L10,4 z" fill="#818cf8" />
             </marker>
-            {/* Arrow for selected connections */}
             <marker id="arr-sel" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
               <path d="M0,0 L0,8 L10,4 z" fill="#6366f1" />
             </marker>
-            {/* Arrow for hover */}
-            <marker id="arr-hov" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
-              <path d="M0,0 L0,8 L10,4 z" fill="#4f46e5" />
-            </marker>
-            {/* Arrow for drag preview */}
             <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
               <path d="M0,0 L0,8 L10,4 z" fill="#f59e0b" />
             </marker>
@@ -540,36 +552,15 @@ export default function OrganisationView() {
 
           {livePaths.map(p => (
             <g key={`${p.fromId}-${p.toId}`}>
-              {/* Wide invisible hit area */}
-              <path
-                d={p.d}
-                fill="none"
-                stroke="transparent"
-                strokeWidth="20"
-                className="pointer-events-auto cursor-pointer"
-                onClick={e => { e.stopPropagation(); handleConnClick(p, p.labelX, p.labelY) }}
-              />
-              {/* Visible line */}
               <path
                 d={p.d}
                 fill="none"
                 stroke={p.isSelected ? '#6366f1' : '#a5b4fc'}
                 strokeWidth={p.isSelected ? 2.5 : 2}
                 markerEnd={p.isSelected ? 'url(#arr-sel)' : 'url(#arr)'}
-                className="pointer-events-none transition-colors"
               />
-              {/* Animated dash overlay on hover (via CSS) */}
-              <path
-                d={p.d}
-                fill="none"
-                stroke="transparent"
-                strokeWidth="20"
-                className="pointer-events-auto cursor-pointer conn-hover-trigger"
-                onClick={e => { e.stopPropagation(); handleConnClick(p, p.labelX, p.labelY) }}
-              />
-              {/* Label background pill + text */}
               {p.label && (
-                <g className="pointer-events-none select-none">
+                <g>
                   <rect
                     x={p.labelX - p.label.length * 3.2 - 8}
                     y={p.labelY - 10}
@@ -580,29 +571,35 @@ export default function OrganisationView() {
                     stroke={p.isSelected ? '#a5b4fc' : '#e5e7eb'}
                     strokeWidth="1"
                   />
-                  <text
-                    x={p.labelX}
-                    y={p.labelY + 3}
-                    textAnchor="middle"
-                    fontSize="10"
-                    fontWeight="500"
-                    fill={p.isSelected ? '#4338ca' : '#6366f1'}
-                  >
-                    {p.label}
-                  </text>
+                  <text x={p.labelX} y={p.labelY + 3} textAnchor="middle" fontSize="10" fontWeight="500"
+                    fill={p.isSelected ? '#4338ca' : '#6366f1'}>{p.label}</text>
                 </g>
               )}
             </g>
           ))}
 
-          {/* Live drag preview */}
           {connLine && (
             <path
               d={previewBezier(connLine.x1, connLine.y1, connLine.x2, connLine.y2)}
               fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="6 3"
-              markerEnd="url(#arr-p)" className="pointer-events-none"
+              markerEnd="url(#arr-p)"
             />
           )}
+        </svg>
+
+        {/* SVG layer 2: invisible hit areas (above nodes) */}
+        <svg className="absolute inset-0 w-full h-full" style={{ pointerEvents: 'none', zIndex: 25 }}>
+          {livePaths.map(p => (
+            <path
+              key={`hit-${p.fromId}-${p.toId}`}
+              d={p.d}
+              fill="none"
+              stroke="transparent"
+              strokeWidth="24"
+              style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+              onClick={e => { e.stopPropagation(); handleConnClick(p, p.labelX, p.labelY) }}
+            />
+          ))}
         </svg>
 
         {/* Connection popover */}
@@ -618,7 +615,7 @@ export default function OrganisationView() {
         )}
 
         {/* Nodes */}
-        <div className="absolute inset-0 z-20">
+        <div className="absolute inset-0 z-20 pointer-events-none [&>*]:pointer-events-auto">
           {agents.map((agent, i) => {
             const pos = getPosFor(agent, i)
             const isConnectTarget = !!connDrag.current && connDrag.current.fromId !== agent.config.id

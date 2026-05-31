@@ -3,6 +3,7 @@
  */
 import React, { useState } from 'react'
 import { useOrgStore } from '../stores/orgStore'
+import AIPromptWizard from './AIPromptWizard'
 
 const PROVIDERS = ['anthropic', 'openai', 'ollama', 'gemini', 'glm', 'minimax']
 
@@ -72,8 +73,18 @@ export default function AgentModal({ onClose }) {
             <span className="text-xs font-medium text-gray-500">Description</span>
             <input className="input" value={form.description} onChange={e => set('description', e.target.value)} placeholder="What this agent specialises in" />
           </label>
-          <label className="space-y-1 col-span-2">
-            <span className="text-xs font-medium text-gray-500">System Prompt *</span>
+          <div className="space-y-1 col-span-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-gray-500">System Prompt *</span>
+              <AIPromptWizard
+                name={form.name}
+                role={form.role}
+                description={form.description}
+                currentPrompt={form.system_prompt}
+                onAccept={prompt => set('system_prompt', prompt)}
+                onError={setError}
+              />
+            </div>
             <textarea
               className="input resize-none"
               rows={4}
@@ -81,7 +92,7 @@ export default function AgentModal({ onClose }) {
               onChange={e => set('system_prompt', e.target.value)}
               placeholder="You are a specialist in... Your job is to..."
             />
-          </label>
+          </div>
 
           <label className="space-y-1">
             <span className="text-xs font-medium text-gray-500">LLM Provider</span>
@@ -115,8 +126,6 @@ export default function AgentModal({ onClose }) {
           </label>
         </div>
 
-        {error && <p className="text-red-500 text-sm">{error}</p>}
-
         <div className="flex gap-3 pt-2">
           <button onClick={onClose} className="flex-1 border border-gray-200 rounded-xl py-2 text-sm hover:bg-gray-50">
             Cancel
@@ -129,6 +138,8 @@ export default function AgentModal({ onClose }) {
             {saving ? 'Adding…' : 'Add Agent'}
           </button>
         </div>
+
+        {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
       </div>
 
       <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; } .input:focus { ring: 2px solid #6366f1; border-color: #6366f1; }`}</style>

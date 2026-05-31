@@ -117,20 +117,28 @@ async def get_model_catalogue():
 # ── Live Ollama model list ────────────────────────────────────────────────────
 
 @router.get("/ollama/models")
-async def get_ollama_models():
+async def get_ollama_models(base_url: str | None = None, api_key: str | None = None):
     import httpx
     rt = runtime_settings.get()
-    base_url = rt.get("llm_base_url", "").rstrip("/")
-    api_key = rt.get("llm_api_key", "")
+    base_url = (base_url or rt.get("llm_base_url", "")).rstrip("/")
+    api_key = api_key if api_key is not None else rt.get("llm_api_key", "")
     if not base_url:
         return {"models": []}
     try:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{base_url}/api/tags", headers=headers)
+        is_cloud = "ollama.com" in base_url
+        if is_cloud:
+            url = "https://ollama.com/v1/models"
+        else:
+            url = f"{base_url}/api/tags"
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
+            if is_cloud:
+                models = [m["id"] for m in data.get("data", data.get("models", []))]
+            else:
+                models = [m["name"] for m in data.get("models", [])]
             return {"models": models}
     except Exception:
         return {"models": []}
@@ -151,6 +159,7 @@ async def get_org():
 @router.post("/org")
 async def save_org(req: OrgRequest):
     runtime_settings.update({"org_name": req.org_name, "org_description": req.org_description})
+    await database.set_many_settings({"org_name": req.org_name, "org_description": req.org_description})
     return runtime_settings.get()
 
 
@@ -165,7 +174,15 @@ class LLMSettingsRequest(BaseModel):
 
 @router.post("/settings/llm")
 async def save_llm_settings(req: LLMSettingsRequest):
-    runtime_settings.update(req.model_dump())
+    data = req.model_dump()
+    runtime_settings.update(data)
+    await database.set_many_settings({
+        "llm_provider": data["llm_provider"],
+        "llm_model": data["llm_model"],
+        "llm_base_url": data["llm_base_url"],
+    })
+    if data["llm_api_key"]:
+        await database.save_api_key(data["llm_provider"], data["llm_api_key"], data["llm_base_url"])
     return {"ok": True}
 
 

@@ -54,6 +54,21 @@ async def lifespan(app: FastAPI):
     runtime_settings.init(settings.data_dir, env_settings=settings)
     await database.init(settings.data_dir)
     await database.migrate_from_json(settings.data_dir)
+    # Restore persisted settings from SQLite into runtime state
+    db_settings = await database.get_all_settings()
+    if db_settings:
+        patch = {}
+        for key in ("org_name", "org_description", "llm_provider", "llm_model", "llm_base_url", "configured"):
+            if key in db_settings:
+                patch[key] = db_settings[key] if key != "configured" else (db_settings[key] == "True")
+        if "llm_provider" in db_settings:
+            api_key_row = await database.get_api_key(db_settings["llm_provider"])
+            if api_key_row:
+                patch["llm_api_key"] = api_key_row["api_key"]
+                if not patch.get("llm_base_url"):
+                    patch["llm_base_url"] = api_key_row.get("base_url", "")
+        if patch:
+            runtime_settings.update(patch)
     orchestrator.set_ws_broadcast(manager.broadcast)
     await orchestrator.start()
     logger.info(f"Takumi backend running on {settings.host}:{settings.port}")

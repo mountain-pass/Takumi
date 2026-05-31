@@ -13,7 +13,7 @@ import {
   Network,
   Wifi,
   WifiOff,
-
+  Settings,
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
@@ -27,6 +27,7 @@ import SkillMarketplaceView from './components/SkillMarketplaceView'
 import WorkflowView from './components/WorkflowView'
 import OfficeView from './components/OfficeView'
 import APISettingsView from './components/APISettingsView'
+import SystemSettingsView from './components/SystemSettingsView'
 import ChannelView from './components/ChannelView'
 import OrganisationView from './components/OrganisationView'
 
@@ -47,6 +48,7 @@ const SETTINGS_NAV = [
   { id: 'api',          icon: KeyRound,  label: 'API' },
   { id: 'channels',     icon: Radio,     label: 'Channels' },
   { id: 'organisation', icon: Network,   label: 'Organisation' },
+  { id: 'settings',     icon: Settings,  label: 'Settings' },
 ]
 
 const VIEW_MAP = {
@@ -56,6 +58,7 @@ const VIEW_MAP = {
   workflows:    <WorkflowView />,
   office:       <OfficeView />,
   api:          <APISettingsView />,
+  settings:     <SystemSettingsView />,
   channels:     <ChannelView />,
   organisation: <OrganisationView />,
 }
