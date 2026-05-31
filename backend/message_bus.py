@@ -7,6 +7,7 @@ import asyncio
 from collections import defaultdict
 from typing import Callable, Awaitable
 from .models import AgentMessage
+from . import database
 
 
 MessageHandler = Callable[[AgentMessage], Awaitable[None]]
@@ -38,6 +39,21 @@ class MessageBus:
         self._history.append(message)
         if len(self._history) > self._max_history:
             self._history = self._history[-self._max_history:]
+
+        try:
+            await database.save_message({
+                "id": message.id,
+                "conversation_id": message.metadata.get("conversation_id"),
+                "from_agent_id": message.from_agent,
+                "to_agent_id": message.to_agent,
+                "content": message.content,
+                "role": "assistant",
+                "task_id": message.task_id,
+                "metadata": message.metadata,
+                "created_at": message.timestamp.isoformat(),
+            })
+        except Exception:
+            pass
 
         handlers: list[MessageHandler] = []
 

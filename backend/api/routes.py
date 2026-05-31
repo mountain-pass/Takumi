@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from ..orchestrator import orchestrator
 from ..models import AgentConfig, LLMProvider
 from .. import runtime_settings
+from .. import database
 
 router = APIRouter(prefix="/api")
 
@@ -66,6 +67,7 @@ async def delete_agent(agent_id: str):
     return {"ok": True}
 
 
+@router.put("/agents/{agent_id}")
 @router.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, req: UpdateAgentRequest):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
@@ -115,20 +117,28 @@ async def get_model_catalogue():
 # ── Live Ollama model list ────────────────────────────────────────────────────
 
 @router.get("/ollama/models")
-async def get_ollama_models():
+async def get_ollama_models(base_url: str | None = None, api_key: str | None = None):
     import httpx
     rt = runtime_settings.get()
-    base_url = rt.get("llm_base_url", "").rstrip("/")
-    api_key = rt.get("llm_api_key", "")
+    base_url = (base_url or rt.get("llm_base_url", "")).rstrip("/")
+    api_key = api_key if api_key is not None else rt.get("llm_api_key", "")
     if not base_url:
         return {"models": []}
     try:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{base_url}/api/tags", headers=headers)
+        is_cloud = "ollama.com" in base_url
+        if is_cloud:
+            url = "https://ollama.com/v1/models"
+        else:
+            url = f"{base_url}/api/tags"
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
+            if is_cloud:
+                models = [m["id"] for m in data.get("data", data.get("models", []))]
+            else:
+                models = [m["name"] for m in data.get("models", [])]
             return {"models": models}
     except Exception:
         return {"models": []}
@@ -149,6 +159,7 @@ async def get_org():
 @router.post("/org")
 async def save_org(req: OrgRequest):
     runtime_settings.update({"org_name": req.org_name, "org_description": req.org_description})
+    await database.set_many_settings({"org_name": req.org_name, "org_description": req.org_description})
     return runtime_settings.get()
 
 
@@ -163,7 +174,15 @@ class LLMSettingsRequest(BaseModel):
 
 @router.post("/settings/llm")
 async def save_llm_settings(req: LLMSettingsRequest):
-    runtime_settings.update(req.model_dump())
+    data = req.model_dump()
+    runtime_settings.update(data)
+    await database.set_many_settings({
+        "llm_provider": data["llm_provider"],
+        "llm_model": data["llm_model"],
+        "llm_base_url": data["llm_base_url"],
+    })
+    if data["llm_api_key"]:
+        await database.save_api_key(data["llm_provider"], data["llm_api_key"], data["llm_base_url"])
     return {"ok": True}
 
 
@@ -264,4 +283,82 @@ async def enhance_prompt(req: PromptEnhanceRequest):
 @router.post("/setup/complete")
 async def complete_setup():
     runtime_settings.update({"configured": True})
+    await database.set_setting("configured", "True")
     return {"ok": True}
+
+
+# ── Agent connections ─────────────────────────────────────────────────────────
+
+class ConnectionRequest(BaseModel):
+    from_id: str
+    to_id: str
+    label: str = ""
+
+
+class UpdateConnectionRequest(BaseModel):
+    label: str = ""
+
+
+@router.get("/connections")
+async def list_connections():
+    return await database.get_all_connections()
+
+
+@router.post("/connections", status_code=201)
+async def create_connection(req: ConnectionRequest):
+    conn_id = await database.save_connection(req.from_id, req.to_id, req.label)
+    return {"id": conn_id, "from_id": req.from_id, "to_id": req.to_id, "label": req.label}
+
+
+@router.put("/connections/{from_id}/{to_id}")
+async def update_connection(from_id: str, to_id: str, req: UpdateConnectionRequest):
+    await database.update_connection_label(from_id, to_id, req.label)
+    return {"ok": True}
+
+
+@router.delete("/connections/{from_id}/{to_id}")
+async def remove_connection(from_id: str, to_id: str):
+    await database.delete_connection(from_id, to_id)
+    return {"ok": True}
+
+
+# ── Canvas positions ──────────────────────────────────────────────────────────
+
+class CanvasPositionsRequest(BaseModel):
+    positions: dict[str, dict]
+
+
+@router.post("/canvas/positions")
+async def save_positions(req: CanvasPositionsRequest):
+    await database.save_all_canvas_positions(req.positions)
+    for agent in orchestrator.get_agents():
+        pos = req.positions.get(agent.config.id)
+        if pos:
+            agent.config.canvas_x = pos.get("x", 0)
+            agent.config.canvas_y = pos.get("y", 0)
+    return {"ok": True}
+
+
+# ── Conversations ─────────────────────────────────────────────────────────────
+
+@router.get("/conversations")
+async def list_conversations(limit: int = 50):
+    return await database.get_conversations(limit)
+
+
+@router.get("/conversations/{conv_id}/messages")
+async def get_conversation_messages(conv_id: str, limit: int = 200):
+    return await database.get_messages(conversation_id=conv_id, limit=limit)
+
+
+# ── Message history (agent-to-agent) ──────────────────────────────────────────
+
+@router.get("/messages/history")
+async def get_message_history(
+    from_agent: str | None = None,
+    to_agent: str | None = None,
+    limit: int = 100,
+):
+    if from_agent and to_agent:
+        return await database.get_agent_to_agent_messages(from_agent, to_agent, limit)
+    return await database.get_messages(from_agent_id=from_agent, to_agent_id=to_agent, limit=limit)

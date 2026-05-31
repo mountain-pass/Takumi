@@ -11,11 +11,11 @@ import { useOrgStore } from '../stores/orgStore'
 const PROVIDERS = [
   { id: 'anthropic', label: 'Anthropic', needsKey: true, needsUrl: false, placeholder: 'sk-ant-...', defaultModel: 'claude-haiku-4-5-20251001' },
   { id: 'openai',    label: 'OpenAI',    needsKey: true, needsUrl: false, placeholder: 'sk-...',     defaultModel: 'gpt-4o-mini' },
-  { id: 'ollama',    label: 'Ollama',    needsKey: false, needsUrl: true, placeholder: '',            defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com' },
+  { id: 'ollama',    label: 'Ollama',    needsKey: true, needsUrl: true, placeholder: '',             defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com', optionalKey: true },
   { id: 'gemini',    label: 'Google Gemini', needsKey: true, needsUrl: false, placeholder: 'AIza...', defaultModel: 'gemini-1.5-flash' },
   { id: 'glm',       label: 'GLM (Zhipu)', needsKey: true, needsUrl: false, placeholder: '',         defaultModel: 'glm-4-flash' },
   { id: 'minimax',   label: 'MiniMax',   needsKey: true, needsUrl: false, placeholder: '',           defaultModel: 'abab6.5s-chat' },
-  { id: 'custom',    label: 'Custom / Local (OpenAI-compatible)', needsKey: false, needsUrl: true, placeholder: '', defaultModel: 'default', defaultUrl: 'http://localhost:11434/v1' },
+  { id: 'custom',    label: 'Custom / Local (OpenAI-compatible)', needsKey: true, needsUrl: true, placeholder: '', defaultModel: 'default', defaultUrl: 'http://localhost:11434/v1', optionalKey: true },
 ]
 
 const STEP_ICONS = [Building2, Key, Users]
@@ -129,8 +129,11 @@ function StepLLM({ onNext, onBack }) {
     }).catch(() => {})
   }, [])
 
-  function fetchOllamaModels() {
-    fetch('/api/ollama/models').then(r => r.json()).then(d => {
+  function fetchOllamaModels(url, key) {
+    const params = new URLSearchParams()
+    if (url || baseUrl) params.set('base_url', url || baseUrl)
+    if (key || apiKey) params.set('api_key', key || apiKey)
+    fetch(`/api/ollama/models?${params}`).then(r => r.json()).then(d => {
       if (d.models?.length) {
         setAvailableModels(d.models)
         setModel(prev => d.models.includes(prev) ? prev : d.models[0])
@@ -174,7 +177,7 @@ function StepLLM({ onNext, onBack }) {
     setSaving(true)
     await saveLLMSettings({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
     setSaving(false)
-    onNext()
+    onNext(providerId, model)
   }
 
   return (
@@ -200,7 +203,7 @@ function StepLLM({ onNext, onBack }) {
       <div className="space-y-3">
         {provider.needsKey && (
           <label className="block space-y-1.5">
-            <span className="text-sm font-medium text-gray-700">API Key</span>
+            <span className="text-sm font-medium text-gray-700">API Key {provider.optionalKey && <span className="text-gray-400 font-normal">(if required)</span>}</span>
             <input
               type="password"
               className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
@@ -219,18 +222,6 @@ function StepLLM({ onNext, onBack }) {
               value={baseUrl}
               onChange={e => { setBaseUrl(e.target.value); setTestResult(null) }}
             />
-            {provider.needsKey === false && (
-              <label className="block space-y-1.5 mt-3">
-                <span className="text-sm font-medium text-gray-700">API Key <span className="text-gray-400 font-normal">(if required)</span></span>
-                <input
-                  type="password"
-                  className="w-full border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono"
-                  placeholder="Optional"
-                  value={apiKey}
-                  onChange={e => { setApiKey(e.target.value); setTestResult(null) }}
-                />
-              </label>
-            )}
           </label>
         )}
         <label className="block space-y-1.5">
@@ -386,18 +377,13 @@ function AgentForm({ onAdd, llmProvider, llmModel, enhancePrompt }) {
   )
 }
 
-function StepTeam({ onNext, onBack }) {
+function StepTeam({ onNext, onBack, llmProvider = 'ollama', llmModel = 'gemma3:4b' }) {
   const createAgent = useOrgStore(s => s.createAgent)
   const enhancePrompt = useOrgStore(s => s.enhancePrompt)
   const completeSetup = useOrgStore(s => s.completeSetup)
-  const rt = useOrgStore(s => s)
   const [agents, setAgents] = useState([])
   const [showForm, setShowForm] = useState(true)
   const [launching, setLaunching] = useState(false)
-
-  // Read saved llm settings from store (or fallback)
-  const llmProvider = 'ollama'
-  const llmModel = 'llama3'
 
   async function addAgent(form) {
     await createAgent(form)
@@ -467,6 +453,7 @@ function StepTeam({ onNext, onBack }) {
 
 export default function SetupWizard() {
   const [step, setStep] = useState(0)
+  const [llmSettings, setLlmSettings] = useState({ provider: 'ollama', model: 'gemma3:4b' })
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-purple-50 flex items-center justify-center p-4">
@@ -483,8 +470,8 @@ export default function SetupWizard() {
         <StepBar current={step} />
 
         {step === 0 && <StepOrg onNext={() => setStep(1)} />}
-        {step === 1 && <StepLLM onNext={() => setStep(2)} onBack={() => setStep(0)} />}
-        {step === 2 && <StepTeam onNext={() => {}} onBack={() => setStep(1)} />}
+        {step === 1 && <StepLLM onNext={(provider, model) => { setLlmSettings({ provider, model }); setStep(2) }} onBack={() => setStep(0)} />}
+        {step === 2 && <StepTeam onNext={() => {}} onBack={() => setStep(1)} llmProvider={llmSettings.provider} llmModel={llmSettings.model} />}
       </div>
 
       <style>{`
