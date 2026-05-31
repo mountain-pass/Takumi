@@ -41,6 +41,20 @@ def update(patch: dict) -> None:
     _save()
 
 
+def reset() -> None:
+    global _state
+    _state = {
+        "org_name": "",
+        "org_description": "",
+        "configured": False,
+        "llm_provider": "",
+        "llm_api_key": "",
+        "llm_base_url": "",
+        "llm_model": "",
+    }
+    _save()
+
+
 def _path() -> Path:
     p = Path(_data_dir)
     p.mkdir(parents=True, exist_ok=True)

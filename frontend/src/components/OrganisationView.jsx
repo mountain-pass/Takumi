@@ -241,19 +241,26 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
           </label>
         ))}
         <div className="block space-y-1">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">System Prompt</span>
-            <AIPromptWizard
-              name={form.name}
-              role={form.role}
-              description={form.description}
-              currentPrompt={form.system_prompt}
-              onAccept={prompt => set('system_prompt', prompt)}
-              onError={setError}
-            />
-          </div>
-          <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y min-h-[120px]"
-            rows={5} value={form.system_prompt || ''} onChange={e => set('system_prompt', e.target.value)} />
+          <AIPromptWizard
+            name={form.name}
+            role={form.role}
+            description={form.description}
+            currentPrompt={form.system_prompt}
+            onAccept={prompt => set('system_prompt', prompt)}
+            onError={setError}
+          >
+            {({ trigger, actions }) => (
+              <>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">System Prompt</span>
+                  {trigger}
+                </div>
+                <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y min-h-[120px]"
+                  rows={5} value={form.system_prompt || ''} onChange={e => set('system_prompt', e.target.value)} />
+                {actions}
+              </>
+            )}
+          </AIPromptWizard>
         </div>
         <div className="space-y-1">
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider & Model</span>

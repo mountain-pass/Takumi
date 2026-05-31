@@ -2,17 +2,17 @@
  * SystemSettingsView — manage system LLM provider, org name, and onboarding settings.
  */
 import React, { useState, useEffect } from 'react'
-import { Settings, CheckCircle, Loader2, Save } from 'lucide-react'
+import { Settings, CheckCircle, Loader2, Save, Trash2, AlertTriangle } from 'lucide-react'
 import { useOrg, useOllamaModels, useSaveOrg, useSaveLLMSettings, useTestLLM } from '../hooks/useApi'
+import { useOrgStore } from '../stores/orgStore'
 
 const PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic', needsUrl: false, defaultModel: 'claude-haiku-4-5-20251001' },
-  { id: 'openai',    label: 'OpenAI',    needsUrl: false, defaultModel: 'gpt-4o-mini' },
-  { id: 'ollama',    label: 'Ollama',    needsUrl: true,  defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com' },
-  { id: 'gemini',    label: 'Google Gemini', needsUrl: false, defaultModel: 'gemini-1.5-flash' },
-  { id: 'glm',       label: 'GLM (Zhipu)', needsUrl: false, defaultModel: 'glm-4-flash' },
-  { id: 'minimax',   label: 'MiniMax',   needsUrl: false, defaultModel: 'abab6.5s-chat' },
-  { id: 'custom',    label: 'Custom / OpenAI-compatible', needsUrl: true, defaultModel: 'default', defaultUrl: 'http://localhost:11434/v1' },
+  { id: 'anthropic',    label: 'Anthropic',      needsUrl: false, defaultModel: 'claude-haiku-4-5-20251001' },
+  { id: 'openai',       label: 'OpenAI',         needsUrl: false, defaultModel: 'gpt-4o-mini' },
+  { id: 'ollama',       label: 'Ollama',         needsUrl: true,  defaultModel: 'gemma3:4b', defaultUrl: 'https://ollama.com' },
+  { id: 'gemini',       label: 'Google Gemini',  needsUrl: false, defaultModel: 'gemini-1.5-flash' },
+  { id: 'openrouter',   label: 'OpenRouter',     needsUrl: false, defaultModel: 'openai/gpt-4o-mini' },
+  { id: 'custom',       label: 'Custom',         needsUrl: true,  defaultModel: '', defaultUrl: 'http://localhost:11434/v1' },
 ]
 
 export default function SystemSettingsView() {
@@ -20,6 +20,7 @@ export default function SystemSettingsView() {
   const saveOrgMut = useSaveOrg()
   const saveLLMMut = useSaveLLMSettings()
   const testLLMMut = useTestLLM()
+  const fetchOrg = useOrgStore(s => s.fetchOrg)
 
   const [orgName, setOrgName] = useState('')
   const [orgDesc, setOrgDesc] = useState('')
@@ -30,6 +31,8 @@ export default function SystemSettingsView() {
   const [saved, setSaved] = useState(false)
   const [testResult, setTestResult] = useState(null)
   const [testMsg, setTestMsg] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   // Populate form from cached org data
   const populated = React.useRef(false)
@@ -84,6 +87,20 @@ export default function SystemSettingsView() {
     } catch (e) {
       setTestResult('error')
       setTestMsg(e.message)
+    }
+  }
+
+  async function handleDeleteOrg() {
+    setDeleting(true)
+    try {
+      const res = await fetch('/api/org/reset', { method: 'POST' })
+      if (!res.ok) throw new Error('Failed to reset')
+      // Reload the app — fetchOrg will detect setupDone=false and show the wizard
+      fetchOrg()
+      window.location.reload()
+    } catch (e) {
+      setDeleting(false)
+      setShowDeleteConfirm(false)
     }
   }
 
@@ -220,6 +237,60 @@ export default function SystemSettingsView() {
           >
             {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? <><CheckCircle size={14} /> Saved</> : <><Save size={14} /> Save Settings</>}
           </button>
+        </div>
+
+        <hr className="border-gray-200" />
+
+        {/* Danger zone */}
+        <div className="space-y-4">
+          <h2 className="text-sm font-semibold text-red-600 uppercase tracking-wide">Danger Zone</h2>
+          <div className="border border-red-200 rounded-xl p-4 space-y-3">
+            <div>
+              <p className="text-sm font-medium text-gray-900">Delete Organisation</p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Permanently delete all data — agents, connections, conversations, API providers, and settings.
+                The app will restart from the onboarding wizard.
+              </p>
+            </div>
+
+            {!showDeleteConfirm ? (
+              <button
+                onClick={() => setShowDeleteConfirm(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-sm font-medium transition-colors"
+              >
+                <Trash2 size={14} /> Delete Organisation
+              </button>
+            ) : (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-4 space-y-3">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle size={18} className="text-red-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-red-800">This action cannot be undone</p>
+                    <p className="text-xs text-red-600 mt-1">
+                      All agents, conversations, messages, API providers, and settings will be permanently deleted.
+                      You will be taken back to the onboarding wizard to start fresh.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowDeleteConfirm(false)}
+                    className="flex-1 border border-gray-200 rounded-xl py-2 text-sm hover:bg-gray-50 font-medium"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleDeleteOrg}
+                    disabled={deleting}
+                    className="flex-1 flex items-center justify-center gap-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-xl py-2 text-sm font-medium transition-colors"
+                  >
+                    {deleting ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                    {deleting ? 'Deleting…' : 'Yes, delete everything'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

@@ -18,6 +18,7 @@ from .message_bus import MessageBus, message_bus
 from .config import Settings, get_settings
 from .persistence import save_org, load_org
 from . import database
+from .agent_folders import ensure_agent_folder, remove_agent_folder, remove_all_agent_folders
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class Orchestrator:
     async def add_agent(self, config: AgentConfig) -> BaseAgent:
         agent = await self._spawn_agent(config)
         self._persist()
+        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description)
         await database.save_agent(config.model_dump(mode="json"))
         await self._broadcast(WSEvent(
             type=WSEventType.AGENT_ADDED,
@@ -73,6 +75,7 @@ class Orchestrator:
     async def remove_agent(self, agent_id: str) -> None:
         agent = self._agents.get(agent_id)
         if agent:
+            remove_agent_folder(self.settings.data_dir, agent.config.name)
             await agent.stop()
             del self._agents[agent_id]
             self._persist()
@@ -93,6 +96,18 @@ class Orchestrator:
         self._persist()
         await database.save_agent(new_config.model_dump(mode="json"))
         return new_config
+
+    def reset(self) -> None:
+        for agent in list(self._agents.values()):
+            import asyncio
+            try:
+                asyncio.get_event_loop().create_task(agent.stop())
+            except Exception:
+                pass
+        self._agents.clear()
+        self._tasks.clear()
+        self._ceo = None
+        remove_all_agent_folders(self.settings.data_dir)
 
     def get_agents(self) -> list[BaseAgent]:
         return list(self._agents.values())
@@ -151,6 +166,7 @@ class Orchestrator:
 
         agent.set_status_callback(self._on_agent_status_change)
         self._agents[config.id] = agent
+        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description)
         await agent.start()
         return agent
 
