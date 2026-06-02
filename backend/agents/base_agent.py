@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 from ..models import AgentConfig, AgentState, AgentStatus, AgentMessage, MessageRole
 from ..llm_adapters import get_adapter, LLMResponse
-from ..llm_adapters.factory import get_adapter_for_agent
 from ..message_bus import MessageBus
 from .. import database
 
@@ -84,7 +83,10 @@ class BaseAgent:
         self.bus = message_bus
         self.settings = settings
         self.state = AgentState(config=config)
-        self._adapter = get_adapter_for_agent(config, settings)
+        # Placeholder adapter — orchestrator._resolve_agent_adapter() overwrites
+        # this with the correct provider credentials from the DB at spawn time.
+        from .. import runtime_settings as _rt
+        self._adapter = get_adapter(config.llm_provider, settings, _rt.get())
         self._conversation: list[dict] = []   # rolling window (agent's long-term memory)
         self._task_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
         self._running = False
@@ -272,6 +274,7 @@ class BaseAgent:
         # (includes prior messages for context) but tool rounds go into work_messages
         work_messages = list(self._conversation[-self.config.max_context_messages:])
         tools_used = 0
+        confused_nudges = 0
 
         for round_num in range(max_rounds):
             await self._set_status(
@@ -292,9 +295,11 @@ class BaseAgent:
 
             if not tool_call:
                 # No tool call — this might be the final answer
-                if self._is_confused_response(response.content) and tools_used > 0:
-                    # LLM is confused — nudge it to synthesize
-                    logger.warning("[%s] Confused response at round %d, nudging", self.config.name, round_num)
+                if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 2:
+                    # LLM is confused — nudge it to synthesize (max 2 nudges)
+                    confused_nudges += 1
+                    logger.warning("[%s] Confused response at round %d (nudge %d/2), nudging",
+                                   self.config.name, round_num, confused_nudges)
                     work_messages.append({"role": "assistant", "content": response.content})
                     work_messages.append({"role": "user", "content":
                         "[System] You already have all tool results above. "
