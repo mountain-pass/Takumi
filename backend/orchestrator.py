@@ -19,6 +19,7 @@ from .config import Settings, get_settings
 from .persistence import save_org, load_org
 from . import database
 from .agent_folders import ensure_agent_folder, remove_agent_folder, remove_all_agent_folders
+from .task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class Orchestrator:
         self._ws_broadcast: BroadcastFn | None = None
         self._running = False
         self._ceo: CEOAgent | None = None
+        self._scheduler = TaskScheduler(self)
 
     # ── Boot / Shutdown ───────────────────────────────────────────────────────
 
@@ -52,10 +54,12 @@ class Orchestrator:
         self.bus.subscribe_all(self._on_any_message)
 
         asyncio.create_task(self._heartbeat_loop(), name="orchestrator-heartbeat")
+        await self._scheduler.start()
         logger.info("Orchestrator started with %d agents", len(self._agents))
 
     async def stop(self) -> None:
         self._running = False
+        await self._scheduler.stop()
         for agent in list(self._agents.values()):
             await agent.stop()
 
@@ -64,7 +68,7 @@ class Orchestrator:
     async def add_agent(self, config: AgentConfig) -> BaseAgent:
         agent = await self._spawn_agent(config)
         self._persist()
-        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description)
+        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description, config.system_prompt)
         await database.save_agent(config.model_dump(mode="json"))
         await self._broadcast(WSEvent(
             type=WSEventType.AGENT_ADDED,
@@ -159,16 +163,45 @@ class Orchestrator:
     async def _spawn_agent(self, config: AgentConfig) -> BaseAgent:
         if config.is_ceo:
             agent = CEOAgent(config, self.bus, self.settings)
-            agent.set_orchestrator(self)
             self._ceo = agent
         else:
             agent = BaseAgent(config, self.bus, self.settings)
 
+        # Resolve api_provider_id → adapter with correct api_key/base_url
+        if config.api_provider_id:
+            await self._resolve_agent_adapter(agent, config.api_provider_id)
+
+        agent.set_orchestrator(self)
         agent.set_status_callback(self._on_agent_status_change)
         self._agents[config.id] = agent
-        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description)
+        ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description, config.system_prompt)
         await agent.start()
         return agent
+
+    async def _resolve_agent_adapter(self, agent: BaseAgent, provider_id: str) -> None:
+        """Look up the API provider and re-init the agent's LLM adapter with the correct credentials."""
+        from .llm_adapters import get_adapter
+        from .models import LLMProvider
+        prov = await database.get_api_provider(provider_id)
+        if not prov:
+            logger.warning("API provider %s not found for agent %s", provider_id, agent.config.name)
+            return
+        runtime = {
+            "llm_api_key": prov.get("api_key", ""),
+            "llm_base_url": prov.get("base_url", ""),
+        }
+        # Use the provider record's provider type, not the agent's stale llm_provider
+        provider_type = prov.get("provider", "") or agent.config.llm_provider
+        try:
+            llm_provider = LLMProvider(provider_type)
+        except ValueError:
+            logger.warning("[%s] Unknown provider type '%s', falling back to agent config", agent.config.name, provider_type)
+            llm_provider = agent.config.llm_provider
+        try:
+            agent._adapter = get_adapter(llm_provider, self.settings, runtime)
+            logger.info("[%s] Using provider '%s' (%s, base_url=%s)", agent.config.name, prov["name"], provider_type, prov.get("base_url", "")[:40])
+        except Exception as e:
+            logger.error("[%s] Failed to resolve provider %s: %s", agent.config.name, provider_id, e)
 
     async def _on_agent_status_change(self, agent: BaseAgent) -> None:
         await self._broadcast(WSEvent(

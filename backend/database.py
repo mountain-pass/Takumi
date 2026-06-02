@@ -66,10 +66,11 @@ CREATE TABLE IF NOT EXISTS agent_connections (
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
-    id         TEXT PRIMARY KEY,
-    title      TEXT NOT NULL DEFAULT 'New conversation',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    id           TEXT PRIMARY KEY,
+    title        TEXT NOT NULL DEFAULT 'New conversation',
+    is_temporary INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -86,6 +87,45 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_agents ON messages(from_agent_id, to_agent_id);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id              TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    assigned_by     TEXT NOT NULL DEFAULT 'user',
+    title           TEXT NOT NULL,
+    instruction     TEXT NOT NULL DEFAULT '',
+    task_type       TEXT NOT NULL DEFAULT 'adhoc',
+    priority        TEXT NOT NULL DEFAULT 'normal',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    schedule_cron   TEXT,
+    schedule_human  TEXT,
+    next_run_at     TEXT,
+    last_run_at     TEXT,
+    result          TEXT,
+    parent_task_id  TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    token_count     INTEGER NOT NULL DEFAULT 0,
+    run_count       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at      TEXT,
+    completed_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent ON agent_tasks(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_next_run ON agent_tasks(next_run_at);
+
+CREATE TABLE IF NOT EXISTS agent_task_logs (
+    id          TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    agent_id    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    token_count INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_logs_task ON agent_task_logs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_logs_agent ON agent_task_logs(agent_id, created_at);
 """
 
 
@@ -100,10 +140,15 @@ async def init(data_dir: str) -> None:
     await _db.execute("PRAGMA foreign_keys=ON")
     await _db.executescript(SCHEMA)
     # Migrations for existing DBs
-    try:
-        await _db.execute("ALTER TABLE agents ADD COLUMN api_provider_id TEXT REFERENCES api_providers(id)")
-    except Exception:
-        pass
+    for migration in [
+        "ALTER TABLE agents ADD COLUMN api_provider_id TEXT REFERENCES api_providers(id)",
+        "ALTER TABLE conversations ADD COLUMN is_temporary INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_tasks ADD COLUMN depends_on TEXT",
+    ]:
+        try:
+            await _db.execute(migration)
+        except Exception:
+            pass
     await _db.commit()
 
 
@@ -211,6 +256,14 @@ async def update_api_provider(provider_id: str, updates: dict) -> dict | None:
     )
     await _conn().commit()
     return current
+
+
+async def get_api_provider(provider_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT id, name, type, provider, api_key, base_url, created_at FROM api_providers WHERE id = ?",
+        (provider_id,),
+    )).fetchone()
+    return dict(row) if row else None
 
 
 async def delete_api_provider(provider_id: str) -> None:
@@ -323,19 +376,26 @@ async def save_all_canvas_positions(positions: dict[str, dict]) -> None:
 
 # ── Conversations ─────────────────────────────────────────────────────────────
 
-async def create_conversation(conv_id: str, title: str = "New conversation") -> dict:
+async def create_conversation(conv_id: str, title: str = "New conversation", is_temporary: bool = False) -> dict:
     now = datetime.utcnow().isoformat()
     await _conn().execute(
-        "INSERT INTO conversations(id, title, created_at, updated_at) VALUES(?, ?, ?, ?)",
-        (conv_id, title, now, now),
+        "INSERT INTO conversations(id, title, is_temporary, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+        (conv_id, title, int(is_temporary), now, now),
     )
     await _conn().commit()
-    return {"id": conv_id, "title": title, "created_at": now, "updated_at": now}
+    return {"id": conv_id, "title": title, "is_temporary": is_temporary, "created_at": now, "updated_at": now}
+
+
+async def get_conversation(conv_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM conversations WHERE id = ?", (conv_id,)
+    )).fetchone()
+    return dict(row) if row else None
 
 
 async def get_conversations(limit: int = 50) -> list[dict]:
     rows = await (await _conn().execute(
-        "SELECT * FROM conversations ORDER BY updated_at DESC LIMIT ?", (limit,)
+        "SELECT * FROM conversations WHERE is_temporary = 0 ORDER BY updated_at DESC LIMIT ?", (limit,)
     )).fetchall()
     return [dict(r) for r in rows]
 
@@ -345,6 +405,12 @@ async def update_conversation(conv_id: str, title: str) -> None:
         "UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?",
         (title, conv_id),
     )
+    await _conn().commit()
+
+
+async def delete_conversation(conv_id: str) -> None:
+    await _conn().execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+    await _conn().execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
     await _conn().commit()
 
 
@@ -403,6 +469,147 @@ async def get_messages(
         result.append(d)
     return result
 
+
+# ── Agent Tasks ──────────────────────────────────────────────────────────────
+
+async def can_assign_task(from_agent_id: str, to_agent_id: str) -> bool:
+    """Check if from_agent has a connection to to_agent (directional)."""
+    if from_agent_id == "user":
+        return True  # user can assign to anyone
+    row = await (await _conn().execute(
+        "SELECT 1 FROM agent_connections WHERE from_id = ? AND to_id = ?",
+        (from_agent_id, to_agent_id),
+    )).fetchone()
+    return row is not None
+
+
+async def create_task(task: dict) -> dict:
+    await _conn().execute(
+        """INSERT INTO agent_tasks(
+            id, agent_id, assigned_by, title, instruction, task_type,
+            priority, status, schedule_cron, schedule_human, next_run_at,
+            parent_task_id, conversation_id, depends_on
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            task["id"], task["agent_id"], task.get("assigned_by", "user"),
+            task["title"], task.get("instruction", ""),
+            task.get("task_type", "adhoc"), task.get("priority", "normal"),
+            task.get("status", "pending"), task.get("schedule_cron"),
+            task.get("schedule_human"), task.get("next_run_at"),
+            task.get("parent_task_id"), task.get("conversation_id"),
+            task.get("depends_on"),
+        ),
+    )
+    await _conn().commit()
+    return task
+
+
+async def get_task(task_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+    )).fetchone()
+    return dict(row) if row else None
+
+
+async def get_tasks_for_agent(agent_id: str, status: str | None = None) -> list[dict]:
+    if status:
+        rows = await (await _conn().execute(
+            "SELECT * FROM agent_tasks WHERE agent_id = ? AND status = ? ORDER BY created_at DESC",
+            (agent_id, status),
+        )).fetchall()
+    else:
+        rows = await (await _conn().execute(
+            "SELECT * FROM agent_tasks WHERE agent_id = ? ORDER BY created_at DESC",
+            (agent_id,),
+        )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_tasks(status: str | None = None, limit: int = 100) -> list[dict]:
+    if status:
+        rows = await (await _conn().execute(
+            "SELECT * FROM agent_tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        )).fetchall()
+    else:
+        rows = await (await _conn().execute(
+            "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+        )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_due_tasks(now_iso: str) -> list[dict]:
+    """Get tasks with next_run_at <= now that are pending or standing."""
+    rows = await (await _conn().execute(
+        "SELECT * FROM agent_tasks WHERE next_run_at <= ? AND status IN ('pending', 'paused') ORDER BY next_run_at",
+        (now_iso,),
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_task(task_id: str, updates: dict) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+    )).fetchone()
+    if not row:
+        return None
+    current = dict(row)
+    current.update({k: v for k, v in updates.items() if v is not None})
+    await _conn().execute(
+        """UPDATE agent_tasks SET
+            title=?, instruction=?, task_type=?, priority=?, status=?,
+            schedule_cron=?, schedule_human=?, next_run_at=?, last_run_at=?,
+            result=?, token_count=?, run_count=?, started_at=?, completed_at=?
+        WHERE id=?""",
+        (
+            current["title"], current["instruction"], current["task_type"],
+            current["priority"], current["status"], current["schedule_cron"],
+            current["schedule_human"], current["next_run_at"], current["last_run_at"],
+            current["result"], current["token_count"], current["run_count"],
+            current["started_at"], current["completed_at"], task_id,
+        ),
+    )
+    await _conn().commit()
+    return current
+
+
+async def delete_task(task_id: str) -> None:
+    await _conn().execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
+    await _conn().commit()
+
+
+# ── Agent Task Logs ──────────────────────────────────────────────────────────
+
+async def create_task_log(log: dict) -> dict:
+    await _conn().execute(
+        """INSERT INTO agent_task_logs(id, task_id, agent_id, action, detail, token_count)
+           VALUES(?, ?, ?, ?, ?, ?)""",
+        (
+            log["id"], log["task_id"], log["agent_id"],
+            log["action"], log.get("detail", ""), log.get("token_count", 0),
+        ),
+    )
+    await _conn().commit()
+    return log
+
+
+async def get_task_logs(task_id: str, limit: int = 50) -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM agent_task_logs WHERE task_id = ? ORDER BY created_at ASC LIMIT ?",
+        (task_id, limit),
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_agent_task_logs(agent_id: str, limit: int = 100) -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM agent_task_logs WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+        (agent_id, limit),
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Messages (agent-to-agent) ────────────────────────────────────────────────
 
 async def get_agent_to_agent_messages(agent_a: str, agent_b: str, limit: int = 50) -> list[dict]:
     rows = await (await _conn().execute(
