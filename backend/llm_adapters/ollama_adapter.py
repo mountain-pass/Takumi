@@ -3,6 +3,7 @@ from typing import AsyncIterator
 import httpx
 import json
 from .base import BaseLLMAdapter, LLMResponse
+from ._content import to_openai, to_ollama_native
 
 
 def _is_cloud(base_url: str) -> bool:
@@ -23,7 +24,19 @@ class OllamaAdapter(BaseLLMAdapter):
             self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     def _build_messages(self, system_prompt: str, messages: list[dict]) -> list[dict]:
-        return [{"role": "system", "content": system_prompt}] + messages
+        if self._cloud:
+            # Cloud uses the OpenAI-compatible endpoint (image_url blocks).
+            conv = [{"role": m["role"], "content": to_openai(m["content"])} for m in messages]
+        else:
+            # Native /api/chat takes a base64 `images` array on the message.
+            conv = []
+            for m in messages:
+                text, images = to_ollama_native(m["content"])
+                msg = {"role": m["role"], "content": text}
+                if images:
+                    msg["images"] = images
+                conv.append(msg)
+        return [{"role": "system", "content": system_prompt}] + conv
 
     async def complete(self, system_prompt, messages, model, max_tokens=2048, temperature=0.7) -> LLMResponse:
         msgs = self._build_messages(system_prompt, messages)

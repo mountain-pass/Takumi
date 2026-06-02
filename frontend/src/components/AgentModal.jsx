@@ -23,6 +23,7 @@ export default function AgentModal({ onClose }) {
     api_provider_id: '',
     llm_model: '',
     avatar_color: '#4F46E5',
+    skills: ['web_search', 'web_fetch'],
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -106,10 +107,20 @@ export default function AgentModal({ onClose }) {
               <select
                 className="input"
                 value={form.api_provider_id}
-                onChange={e => { set('api_provider_id', e.target.value); set('llm_model', '') }}
+                onChange={e => {
+                  const pid = e.target.value
+                  const prov = llmProviders.find(p => p.id === pid)
+                  set('api_provider_id', pid)
+                  set('llm_model', '')
+                  if (prov) set('llm_provider', prov.provider)
+                }}
               >
                 <option value="">Select provider…</option>
-                {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                {llmProviders.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.provider ? p.provider.charAt(0).toUpperCase() + p.provider.slice(1) : 'Unknown'})
+                  </option>
+                ))}
               </select>
             ) : (
               <div className="flex items-center gap-2">
@@ -141,6 +152,34 @@ export default function AgentModal({ onClose }) {
               <input className="input" value={form.llm_model} onChange={e => set('llm_model', e.target.value)} placeholder="Enter model name" />
             )}
           </label>
+
+          {/* Skills */}
+          <div className="space-y-1 col-span-2">
+            <span className="text-xs font-medium text-gray-500">Skills</span>
+            <div className="flex flex-wrap gap-3 pt-1">
+              {[
+                { id: 'web_search', label: 'Web Search', desc: 'Search the internet' },
+                { id: 'web_fetch', label: 'Web Fetch', desc: 'Read web pages' },
+              ].map(skill => (
+                <label key={skill.id} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.skills.includes(skill.id)}
+                    onChange={e => {
+                      if (e.target.checked) {
+                        set('skills', [...form.skills, skill.id])
+                      } else {
+                        set('skills', form.skills.filter(s => s !== skill.id))
+                      }
+                    }}
+                    className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span className="text-xs text-gray-700">{skill.label}</span>
+                  <span className="text-[10px] text-gray-400">— {skill.desc}</span>
+                </label>
+              ))}
+            </div>
+          </div>
 
           <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Colour</span>

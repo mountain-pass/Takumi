@@ -117,6 +117,12 @@ class CEOAgent(BaseAgent):
     def __init__(self, config: AgentConfig, message_bus, settings) -> None:
         super().__init__(config, message_bus, settings)
         self._orchestrator: "Orchestrator | None" = None
+        # Task ids already included in a synthesis pushed to the user, so we
+        # don't re-synthesize the same results on every later task completion.
+        self._reported_task_ids: set[str] = set()
+        # Guard against overlapping synthesis runs (which leave the CEO
+        # appearing stuck in "Synthesizing results...").
+        self._synthesizing: bool = False
 
     def set_orchestrator(self, orchestrator: "Orchestrator") -> None:
         self._orchestrator = orchestrator
@@ -225,6 +231,7 @@ class CEOAgent(BaseAgent):
         """When a task completes, check if all CEO-assigned active tasks are done.
         If so, synthesize results and push to user's chat via WebSocket.
         """
+        acquired = False
         try:
             all_tasks = await database.get_all_tasks(limit=100)
             # Find tasks assigned by CEO that are still pending/in_progress/blocked
@@ -248,6 +255,26 @@ class CEOAgent(BaseAgent):
 
             if not completed_tasks:
                 return
+
+            # Only synthesize if there are NEWLY completed tasks we haven't
+            # already reported. Otherwise every later task completion (duplicate
+            # agent replies, routine tasks, etc.) would re-trigger synthesis of
+            # the same old results — the endless "Synthesizing results..." loop.
+            new_completed = [t for t in completed_tasks if t["id"] not in self._reported_task_ids]
+            if not new_completed:
+                return
+
+            # Prevent overlapping synthesis runs from leaving the CEO stuck in
+            # the THINKING state.
+            if self._synthesizing:
+                return
+            self._synthesizing = True
+            acquired = True
+
+            # Mark these as reported up-front so concurrent completions don't
+            # queue a second synthesis of the same batch.
+            for t in completed_tasks:
+                self._reported_task_ids.add(t["id"])
 
             # Build a summary from completed task results
             agents_by_id = {}
@@ -308,6 +335,9 @@ class CEOAgent(BaseAgent):
         except Exception as e:
             logger.error("[CEO] Error synthesizing results: %s", e, exc_info=True)
             await self._set_status(AgentStatus.IDLE, action=None)
+        finally:
+            if acquired:
+                self._synthesizing = False
 
     async def _unblock_dependents(self, completed_task: dict, result: str) -> None:
         """When a task completes, find blocked tasks that depend on it and dispatch them."""
@@ -434,8 +464,23 @@ class CEOAgent(BaseAgent):
             f"## Connections (who you can assign to)\n{connections}"
         )
 
-    async def chat_with_context(self, user_message: str) -> tuple[str, list[dict]]:
-        """Chat with full org context. Returns (response_text, executed_actions)."""
+    async def chat_with_context(
+        self,
+        user_message: str,
+        image_parts: list | None = None,
+        ephemeral: bool = False,
+        history: list[dict] | None = None,
+    ) -> tuple[str, list[dict]]:
+        """Chat with full org context. Returns (response_text, executed_actions).
+
+        `image_parts` is an optional list of normalized image content parts
+        ({"type": "image", "media_type", "data"}) for vision-capable models.
+
+        When `ephemeral` is True (temporary chat), NOTHING is persisted: the
+        CEO's conversation memory is left untouched, no tasks are created or
+        delegated, and the only context is the in-screen `history` provided by
+        the caller. This keeps temporary chats fully private and transient.
+        """
         # Build full context
         roster = self._build_agent_roster()
         connections = await self._build_connection_map_async()
@@ -448,7 +493,35 @@ class CEOAgent(BaseAgent):
             f"### Active tasks\n{active_tasks_text}"
         )
 
-        self._add_to_conversation("user", user_message + context)
+        text = user_message + context
+        user_content = [{"type": "text", "text": text}, *image_parts] if image_parts else text
+
+        if ephemeral:
+            # Stateless, private turn — do not touch self._conversation.
+            text = (
+                user_message
+                + "\n\n[This is a private, temporary chat. Answer the user directly. "
+                "Do NOT create tasks, delegate to agents, or output any action JSON — "
+                "nothing here is saved.]"
+                + context
+            )
+            user_content = [{"type": "text", "text": text}, *image_parts] if image_parts else text
+            msgs = []
+            for h in (history or []):
+                if h.get("role") in ("user", "assistant") and h.get("content"):
+                    msgs.append({"role": h["role"], "content": h["content"]})
+            msgs.append({"role": "user", "content": user_content})
+            system = await self._build_system_prompt()
+            response = await self._adapter.complete(
+                system_prompt=system, messages=msgs, model=self.config.llm_model,
+            )
+            return response.content, []
+
+        if image_parts:
+            # Multimodal: text block followed by image blocks.
+            self._add_to_conversation("user", user_content)
+        else:
+            self._add_to_conversation("user", text)
         # CEO delegates — does NOT use tools itself (specialists do the work)
         response = await self._llm_complete()
         self._add_to_conversation("assistant", response.content)

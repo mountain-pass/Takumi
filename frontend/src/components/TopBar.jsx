@@ -1,15 +1,16 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { Bell, BellDot, X, AlertCircle, Info, CheckCircle, ChevronRight } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import { useAgentTasks } from '../hooks/useApi'
 
 // ── Agent status pill ─────────────────────────────────────────────────────────
 
 const STATUS_CONFIG = {
-  working:  { color: 'bg-blue-500',   pulse: true,  label: 'Working' },
-  thinking: { color: 'bg-purple-500', pulse: true,  label: 'Thinking' },
-  waiting:  { color: 'bg-amber-400',  pulse: false, label: 'Waiting' },
-  idle:     { color: 'bg-green-400',  pulse: false, label: 'Idle' },
-  offline:  { color: 'bg-gray-300',   pulse: false, label: 'Offline' },
+  working:  { color: 'bg-green-500',  pulse: true,  label: 'Working' },
+  thinking: { color: 'bg-blue-500',   pulse: true,  label: 'Thinking' },
+  idle:     { color: 'bg-gray-400',   pulse: false, label: 'Idle' },
+  error:    { color: 'bg-red-500',    pulse: false, label: 'Error' },
+  offline:  { color: 'bg-red-500',    pulse: false, label: 'Offline' },
 }
 
 function StatusDot({ status }) {
@@ -24,17 +25,21 @@ function StatusDot({ status }) {
   )
 }
 
-function AgentStatusPills({ agents }) {
-  // Group by status
+function AgentStatusPills({ agents, agentsWithActiveTasks = new Set() }) {
+  // Group by effective status (account for active tasks)
   const counts = agents.reduce((acc, a) => {
-    const s = a.status || 'idle'
+    let s = a.status || 'idle'
+    // If agent has active tasks but status is idle, show as working
+    if (s === 'idle' && agentsWithActiveTasks.has(a.config?.id)) {
+      s = 'working'
+    }
     acc[s] = (acc[s] || 0) + 1
     return acc
   }, {})
 
   if (agents.length === 0) return null
 
-  const order = ['working', 'thinking', 'waiting', 'idle', 'offline']
+  const order = ['working', 'thinking', 'idle', 'error', 'offline']
 
   return (
     <div className="flex items-center gap-2">
@@ -102,6 +107,10 @@ function NotificationPanel({ notifications, onDismiss, onClear }) {
 
 export default function TopBar() {
   const agents = useOrgStore(s => s.agents)
+  const { data: allTasks = [] } = useAgentTasks()
+  const agentsWithActiveTasks = new Set(
+    allTasks.filter(t => t.status === 'in_progress' || t.status === 'pending').map(t => t.agent_id)
+  )
   const [open, setOpen] = useState(false)
   const [notifications, setNotifications] = useState([
     {
@@ -143,7 +152,7 @@ export default function TopBar() {
 
       {/* Right side */}
       <div className="flex items-center gap-3 ml-auto" ref={ref}>
-      <AgentStatusPills agents={agents} />
+      <AgentStatusPills agents={agents} agentsWithActiveTasks={agentsWithActiveTasks} />
 
         {/* Notification bell */}
         <div className="relative">

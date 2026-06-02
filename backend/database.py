@@ -630,8 +630,17 @@ async def get_agent_to_agent_messages(agent_a: str, agent_b: str, limit: int = 5
 # ── Migration helper ──────────────────────────────────────────────────────────
 
 async def migrate_from_json(data_dir: str) -> None:
-    """One-time import from legacy JSON files into SQLite."""
+    """One-time import from legacy JSON files into SQLite.
+
+    Guarded so it runs only once: on every subsequent startup the SQLite
+    settings are authoritative. Without this guard, organisation.json (which
+    holds the original/default org name) would re-overwrite the user's saved
+    org name on every restart.
+    """
     import os
+
+    if await get_setting("_json_migrated", "") == "1":
+        return
 
     # Migrate runtime_settings.json
     rs_path = Path(data_dir) / "runtime_settings.json"
@@ -674,3 +683,7 @@ async def migrate_from_json(data_dir: str) -> None:
 
         except Exception:
             pass
+
+    # Mark migration complete so legacy JSON files never re-clobber the
+    # authoritative SQLite settings on subsequent restarts.
+    await set_setting("_json_migrated", "1")
