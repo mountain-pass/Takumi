@@ -1,19 +1,19 @@
 from __future__ import annotations
+import logging
 from ..models import LLMProvider
 from .base import BaseLLMAdapter
+
+logger = logging.getLogger(__name__)
 
 
 def get_adapter(provider: LLMProvider, settings, runtime: dict | None = None) -> BaseLLMAdapter:
     """Return the right adapter for a given provider.
 
-    Priority: runtime dict (request body / wizard values) > env vars.
-    This ensures the test-connection endpoint always tests the credentials
-    the user actually typed, not whatever is cached in the environment.
+    Priority: runtime dict (from api_providers table or request body) > env vars.
     """
     rt = runtime or {}
 
     def _key(rt_key: str, env_val: str) -> str:
-        """Runtime value wins over env var."""
         return rt.get(rt_key) or env_val or ""
 
     def _url(rt_key: str, env_val: str, fallback: str) -> str:
@@ -60,3 +60,44 @@ def get_adapter(provider: LLMProvider, settings, runtime: dict | None = None) ->
         return CustomAdapter(base_url=base_url, api_key=api_key)
 
     raise ValueError(f"Unknown LLM provider: {provider}")
+
+
+def get_adapter_for_agent(config, settings) -> BaseLLMAdapter:
+    """Create an LLM adapter using the agent's linked api_provider record.
+
+    Looks up the agent's api_provider_id in the DB to get the correct
+    base_url, api_key, and provider — so each agent uses its own credentials.
+    Falls back to global settings if no provider is linked.
+    """
+    import sqlite3
+
+    provider_id = config.api_provider_id
+    rt = {}
+
+    if provider_id:
+        try:
+            db_path = settings.data_dir + "/takumi.db"
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT provider, api_key, base_url FROM api_providers WHERE id = ?",
+                (provider_id,)
+            ).fetchone()
+            conn.close()
+
+            if row:
+                rt["llm_api_key"] = row["api_key"]
+                rt["llm_base_url"] = row["base_url"]
+                logger.info(
+                    "[%s] Using api_provider '%s': provider=%s, base_url=%s",
+                    config.name, provider_id[:8], row["provider"], row["base_url"]
+                )
+            else:
+                logger.warning(
+                    "[%s] api_provider_id '%s' not found in DB, using global settings",
+                    config.name, provider_id[:8]
+                )
+        except Exception as e:
+            logger.error("[%s] Failed to load api_provider: %s", config.name, e)
+
+    return get_adapter(config.llm_provider, settings, rt)

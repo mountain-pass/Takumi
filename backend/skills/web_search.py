@@ -1,32 +1,51 @@
 """
 Web search and fetch skills for agents.
-Uses DuckDuckGo (no API key required) and httpx for page fetching.
+Uses SearXNG (self-hosted) for search and httpx for page fetching.
 """
 from __future__ import annotations
+import os
 import logging
 import httpx
 from html.parser import HTMLParser
 
 logger = logging.getLogger(__name__)
 
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8888")
+
 
 async def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web using DuckDuckGo and return results as text."""
+    """Search the web using SearXNG and return results as text."""
     try:
-        url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        url = f"{SEARXNG_URL}/search"
+        params = {
+            "q": query,
+            "format": "json",
+            "categories": "general",
         }
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.post(url, data={"q": query}, headers=headers)
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Takumi-Agent/1.0",
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
-            results = _parse_ddg_html(resp.text, max_results)
-            if not results:
-                return f"No search results found for: {query}"
-            output = f"Search results for: {query}\n\n"
-            for i, r in enumerate(results, 1):
-                output += f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}\n\n"
-            return output.strip()
+            data = resp.json()
+
+        results = data.get("results", [])[:max_results]
+        if not results:
+            return f"No search results found for: {query}"
+
+        output = f"Search results for: {query}\n\n"
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "No title")
+            link = r.get("url", "")
+            snippet = r.get("content", "No description")
+            output += f"{i}. {title}\n   {link}\n   {snippet}\n\n"
+        return output.strip()
+
+    except httpx.ConnectError:
+        logger.error("SearXNG not reachable at %s — is it running?", SEARXNG_URL)
+        return f"Search unavailable: SearXNG is not running at {SEARXNG_URL}. Start it with: docker compose up -d"
     except Exception as e:
         logger.error("Web search failed: %s", e)
         return f"Search failed: {e}"
@@ -48,60 +67,6 @@ async def web_fetch(url: str, max_chars: int = 5000) -> str:
     except Exception as e:
         logger.error("Web fetch failed for %s: %s", url, e)
         return f"Failed to fetch {url}: {e}"
-
-
-# ── DuckDuckGo HTML parser ───────────────────────────────────────────────────
-
-class _DDGParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self._current = {}
-        self._capture = None
-        self._in_result = False
-
-    def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
-        cls = attrs_dict.get("class", "")
-
-        if tag == "a" and "result__a" in cls:
-            self._in_result = True
-            self._current = {"title": "", "url": attrs_dict.get("href", ""), "snippet": ""}
-            self._capture = "title"
-        elif tag == "a" and "result__snippet" in cls:
-            self._capture = "snippet"
-        elif tag == "td" and "result-sponsored" in cls:
-            self._in_result = False  # skip ads
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self._capture in ("title", "snippet"):
-            self._capture = None
-        if tag == "tr" and self._in_result and self._current.get("title"):
-            # Clean up URL
-            url = self._current.get("url", "")
-            if "uddg=" in url:
-                import urllib.parse
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-                url = parsed.get("uddg", [url])[0]
-            self._current["url"] = url
-            self.results.append(self._current)
-            self._current = {}
-            self._in_result = False
-
-    def handle_data(self, data):
-        if self._capture == "title":
-            self._current["title"] = self._current.get("title", "") + data.strip()
-        elif self._capture == "snippet":
-            self._current["snippet"] = self._current.get("snippet", "") + data.strip()
-
-
-def _parse_ddg_html(html: str, max_results: int) -> list[dict]:
-    parser = _DDGParser()
-    try:
-        parser.feed(html)
-    except Exception:
-        pass
-    return parser.results[:max_results]
 
 
 # ── Simple text extractor ────────────────────────────────────────────────────
@@ -137,7 +102,6 @@ def _extract_text(html: str) -> str:
     except Exception:
         pass
     text = " ".join(parser.text_parts)
-    # Collapse whitespace
     import re
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
