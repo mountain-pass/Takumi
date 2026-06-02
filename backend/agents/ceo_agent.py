@@ -575,8 +575,95 @@ class CEOAgent(BaseAgent):
 
     # ── Action execution ─────────────────────────────────────────────────────
 
+    def _agent_name_map(self) -> dict[str, str]:
+        """Map agent_id -> display name for agents the orchestrator knows about."""
+        names: dict[str, str] = {}
+        if self._orchestrator:
+            for a in self._orchestrator.get_agents():
+                names[a.config.id] = a.config.name
+        return names
+
+    def _autowire_dependencies(self, actions: list[dict]) -> list[dict]:
+        """Infer sequential dependencies across a batch of create_task actions.
+
+        The CEO LLM is not reliable about populating the structured `depends_on`
+        field, so when it assigns work to several agents in one batch we detect
+        when one task references another agent (by name) that is also being
+        assigned work in the same batch. We then:
+          1. Set the dependent task's `depends_on` to the upstream task's title
+             (so it is created as `blocked` and unblocked when the upstream
+             agent reports back), and
+          2. Augment the upstream task's instruction so that agent KNOWS its
+             output is a prerequisite and will be handed to the downstream agent.
+        """
+        creates = [a for a in actions if a.get("type") == "create_task" and a.get("agent_id")]
+        if len(creates) < 2:
+            return actions
+
+        name_map = self._agent_name_map()
+        # Build a lookup of agent_name (lower) -> task for tasks in this batch
+        by_agent_name = {}
+        for a in creates:
+            nm = name_map.get(a.get("agent_id", ""), "")
+            if nm:
+                by_agent_name[nm.lower()] = a
+
+        # Phrases that signal "this task consumes another agent's output"
+        dep_signals = (
+            "once ", "after ", "based on", "using ", "use the", "take ",
+            "from ", "findings", "research", "results", "output", "provided by",
+            "hand off", "handoff", "organize", "organise", "compile", "summari",
+        )
+
+        for task in creates:
+            if task.get("depends_on"):
+                continue  # CEO already wired this one
+            text = f"{task.get('title','')} {task.get('instruction','')}".lower()
+            my_agent = task.get("agent_id", "")
+
+            for other_name_lower, other_task in by_agent_name.items():
+                if other_task is task:
+                    continue
+                if other_task.get("agent_id") == my_agent:
+                    continue
+                # Does this task mention the other agent by name?
+                if other_name_lower not in text:
+                    continue
+                # And does it look like it consumes their output?
+                if not any(sig in text for sig in dep_signals):
+                    continue
+
+                upstream_title = other_task.get("title", "")
+                if not upstream_title:
+                    continue
+
+                # 1. Mark this (downstream) task as dependent
+                task["depends_on"] = upstream_title
+                downstream_name = name_map.get(my_agent, "the next agent")
+
+                # 2. Tell the upstream agent its output feeds the downstream agent
+                handoff_note = (
+                    f"\n\nIMPORTANT — HANDOFF: When you finish, your output is a "
+                    f"prerequisite for {downstream_name}'s task "
+                    f"(\"{upstream_title}\" → \"{task.get('title','')}\"). "
+                    f"Report your complete findings back to the CEO; the CEO will "
+                    f"forward them to {downstream_name} so they can continue."
+                )
+                upstream_instruction = other_task.get("instruction", "")
+                if "HANDOFF" not in upstream_instruction:
+                    other_task["instruction"] = upstream_instruction + handoff_note
+
+                logger.info(
+                    "[CEO] Auto-wired dependency: '%s' (%s) depends on '%s'",
+                    task.get("title", ""), downstream_name, upstream_title,
+                )
+                break  # one upstream dependency is enough
+
+        return actions
+
     async def _execute_actions(self, actions: list[dict]) -> list[dict]:
         """Execute parsed actions and return results."""
+        actions = self._autowire_dependencies(actions)
         results = []
         for action in actions:
             action_type = action.get("type", "")
