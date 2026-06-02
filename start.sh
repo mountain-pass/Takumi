@@ -4,6 +4,14 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
+# SearXNG (search engine)
+echo "▶ Starting SearXNG search engine..."
+if command -v docker &> /dev/null && docker info &> /dev/null; then
+  docker compose -f "$ROOT/docker-compose.yml" up -d 2>/dev/null || true
+else
+  echo "   ⚠ Docker not running — web search will be unavailable"
+fi
+
 # Backend
 echo "▶ Starting backend..."
 cd "$ROOT"
