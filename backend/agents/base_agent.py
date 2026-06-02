@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from ..models import AgentConfig, AgentState, AgentStatus, AgentMessage, MessageRole
 from ..llm_adapters import get_adapter, LLMResponse
+from ..llm_adapters.factory import get_adapter_for_agent
 from ..message_bus import MessageBus
 from .. import database
 
@@ -83,8 +84,7 @@ class BaseAgent:
         self.bus = message_bus
         self.settings = settings
         self.state = AgentState(config=config)
-        from .. import runtime_settings as _rt
-        self._adapter = get_adapter(config.llm_provider, settings, _rt.get())
+        self._adapter = get_adapter_for_agent(config, settings)
         self._conversation: list[dict] = []   # rolling window (agent's long-term memory)
         self._task_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
         self._running = False
