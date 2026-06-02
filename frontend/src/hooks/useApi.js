@@ -232,3 +232,78 @@ export function useTestProvider() {
     mutationFn: (id) => apiFetch(`${API}/providers/${id}/test`, { method: 'POST' }),
   })
 }
+
+// ── Agent Tasks ─────────────────────────────────────────────────────────────
+
+export const taskKeys = {
+  all: ['agent-tasks'],
+  forAgent: (agentId) => ['agent-tasks', agentId],
+  detail: (taskId) => ['agent-tasks', 'detail', taskId],
+  logs: (taskId) => ['agent-tasks', 'logs', taskId],
+  agentLogs: (agentId) => ['agent-task-logs', agentId],
+}
+
+export function useAgentTasks(agentId, status) {
+  const params = new URLSearchParams()
+  if (agentId) params.set('agent_id', agentId)
+  if (status) params.set('status', status)
+  return useQuery({
+    queryKey: agentId ? taskKeys.forAgent(agentId) : taskKeys.all,
+    queryFn: () => apiFetch(`${API}/agent-tasks?${params}`),
+  })
+}
+
+export function useAgentTask(taskId) {
+  return useQuery({
+    queryKey: taskKeys.detail(taskId),
+    queryFn: () => apiFetch(`${API}/agent-tasks/${taskId}`),
+    enabled: !!taskId,
+  })
+}
+
+export function useTaskLogs(taskId) {
+  return useQuery({
+    queryKey: taskKeys.logs(taskId),
+    queryFn: () => apiFetch(`${API}/agent-tasks/${taskId}/logs`),
+    enabled: !!taskId,
+  })
+}
+
+export function useCreateTask() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data) => apiFetch(`${API}/agent-tasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: taskKeys.all })
+      if (variables.agent_id) qc.invalidateQueries({ queryKey: taskKeys.forAgent(variables.agent_id) })
+    },
+  })
+}
+
+export function useUpdateTask() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }) => apiFetch(`${API}/agent-tasks/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: taskKeys.all })
+      qc.invalidateQueries({ queryKey: taskKeys.detail(variables.id) })
+      qc.invalidateQueries({ queryKey: taskKeys.logs(variables.id) })
+    },
+  })
+}
+
+export function useDeleteTask() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id) => apiFetch(`${API}/agent-tasks/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: taskKeys.all }),
+  })
+}

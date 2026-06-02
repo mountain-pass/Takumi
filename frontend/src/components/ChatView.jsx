@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import {
   Send, Plus, Loader2, MessageSquare, PanelRightOpen, PanelRightClose,
-  Trash2, Clock, Sparkles, ToggleLeft, ToggleRight,
+  Trash2, Clock, Sparkles, ToggleLeft, ToggleRight, Paperclip, X, FileText,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -19,6 +19,7 @@ export default function ChatView() {
   const [activeConvId, setActiveConvId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
+  const [attachments, setAttachments] = useState([])  // {id, name, mime_type, kind, data, preview}
   const [sending, setSending] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   const [temporary, setTemporary] = useState(false)
@@ -52,6 +53,9 @@ export default function ChatView() {
         if (msg.metadata?.actions) {
           msg.actions = msg.metadata.actions
         }
+        if (msg.metadata?.attachments) {
+          msg.attachments = msg.metadata.attachments
+        }
       }
       setMessages(data)
     } catch {}
@@ -61,6 +65,19 @@ export default function ChatView() {
     setActiveConvId(null)
     setMessages([])
     setInput('')
+    setAttachments([])
+    setTimeout(() => inputRef.current?.focus(), 100)
+  }
+
+  // Toggling Temporary always starts a fresh, isolated chat window. The prior
+  // (persisted) conversation is left untouched; ephemeral context is discarded
+  // when toggled off or navigated away.
+  function toggleTemporary() {
+    setTemporary(t => !t)
+    setActiveConvId(null)
+    setMessages([])
+    setInput('')
+    setAttachments([])
     setTimeout(() => inputRef.current?.focus(), 100)
   }
 
@@ -77,20 +94,58 @@ export default function ChatView() {
     loadConversations()
   }
 
+  async function addFiles(fileList) {
+    const files = Array.from(fileList || [])
+    for (const file of files) {
+      const data = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result)  // data: URI
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+      const kind = file.type.startsWith('image/') ? 'image' : 'document'
+      setAttachments(prev => [...prev, {
+        id: crypto.randomUUID(),
+        name: file.name,
+        mime_type: file.type || 'application/octet-stream',
+        kind,
+        data,
+        preview: kind === 'image' ? data : null,
+      }])
+    }
+  }
+
+  function removeAttachment(id) {
+    setAttachments(prev => prev.filter(a => a.id !== id))
+  }
+
   async function handleSend() {
-    if (!input.trim() || sending) return
+    if ((!input.trim() && attachments.length === 0) || sending) return
     const text = input.trim()
+    const sentAttachments = attachments
     setInput('')
+    setAttachments([])
     setSending(true)
 
     const convId = activeConvId || crypto.randomUUID()
     if (!activeConvId) setActiveConvId(convId)
+
+    // For temporary chats, send the in-screen history so the CEO has context
+    // for the duration of this window only — nothing is persisted server-side.
+    const history = temporary
+      ? messages
+          .filter(m => m.role === 'user' || m.role === 'assistant')
+          .map(m => ({ role: m.role, content: m.content }))
+      : []
 
     setMessages(prev => [...prev, {
       id: crypto.randomUUID(),
       role: 'user',
       content: text,
       from_agent_id: 'user',
+      attachments: sentAttachments.map(a => ({
+        id: a.id, name: a.name, mime_type: a.mime_type, kind: a.kind, url: a.preview,
+      })),
       created_at: new Date().toISOString(),
     }])
 
@@ -102,6 +157,10 @@ export default function ChatView() {
           conversation_id: convId,
           message: text,
           is_temporary: temporary,
+          history,
+          attachments: sentAttachments.map(a => ({
+            name: a.name, mime_type: a.mime_type, data: a.data,
+          })),
         }),
       })
 
@@ -159,7 +218,7 @@ export default function ChatView() {
           <div className="flex items-center gap-3">
             {/* Temporary chat toggle */}
             <button
-              onClick={() => setTemporary(t => !t)}
+              onClick={toggleTemporary}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
                 temporary
                   ? 'text-amber-700 bg-amber-50 border border-amber-200'
@@ -196,6 +255,9 @@ export default function ChatView() {
                   handleSend={handleSend}
                   sending={sending}
                   temporary={temporary}
+                  attachments={attachments}
+                  addFiles={addFiles}
+                  removeAttachment={removeAttachment}
                   centered
                 />
               }
@@ -227,6 +289,9 @@ export default function ChatView() {
               handleSend={handleSend}
               sending={sending}
               temporary={temporary}
+              attachments={attachments}
+              addFiles={addFiles}
+              removeAttachment={removeAttachment}
             />
           </div>
         )}
@@ -280,28 +345,77 @@ export default function ChatView() {
   )
 }
 
-function InputBar({ inputRef, input, setInput, handleKeyDown, handleSend, sending, temporary, centered }) {
+function InputBar({ inputRef, input, setInput, handleKeyDown, handleSend, sending, temporary, centered, attachments = [], addFiles, removeAttachment }) {
+  const fileRef = useRef(null)
+
+  function onPaste(e) {
+    const files = Array.from(e.clipboardData?.files || [])
+    if (files.length && addFiles) { e.preventDefault(); addFiles(files) }
+  }
+
+  const canSend = (input.trim() || attachments.length > 0) && !sending
+
   return (
     <div className={centered ? 'w-full max-w-xl mx-auto' : 'max-w-3xl mx-auto'}>
-      <div className={`flex items-end gap-2 bg-gray-50 border border-gray-200 rounded-2xl px-4 py-2 focus-within:border-indigo-400 focus-within:ring-1 focus-within:ring-indigo-400 transition-all ${centered ? 'shadow-lg shadow-gray-200/50' : ''}`}>
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={temporary ? 'Temporary chat — not saved to history' : 'Message CEO…'}
-          rows={1}
-          className="flex-1 bg-transparent resize-none outline-none text-sm py-1.5 max-h-32 placeholder:text-gray-400"
-          style={{ height: 'auto', minHeight: '24px' }}
-          onInput={e => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
-        />
-        <button
-          onClick={handleSend}
-          disabled={!input.trim() || sending}
-          className="p-2 text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-30 disabled:hover:bg-indigo-600 rounded-xl transition-colors shrink-0"
-        >
-          {sending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
-        </button>
+      <div className={`bg-gray-50 border border-gray-200 rounded-2xl px-4 py-2 focus-within:border-indigo-400 focus-within:ring-1 focus-within:ring-indigo-400 transition-all ${centered ? 'shadow-lg shadow-gray-200/50' : ''}`}>
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 pt-1 pb-2">
+            {attachments.map(a => (
+              <div key={a.id} className="relative group">
+                {a.kind === 'image' && a.preview ? (
+                  <img src={a.preview} alt={a.name} className="h-14 w-14 object-cover rounded-lg border border-gray-200" />
+                ) : (
+                  <div className="flex items-center gap-1.5 h-14 px-3 rounded-lg border border-gray-200 bg-white max-w-[160px]">
+                    <FileText size={16} className="text-gray-400 shrink-0" />
+                    <span className="text-xs text-gray-600 truncate">{a.name}</span>
+                  </div>
+                )}
+                <button
+                  onClick={() => removeAttachment(a.id)}
+                  className="absolute -top-1.5 -right-1.5 bg-gray-700 text-white rounded-full p-0.5 hover:bg-gray-900"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex items-end gap-2">
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            accept="image/*,.pdf,.txt,.md,.csv,.json,.docx"
+            className="hidden"
+            onChange={e => { addFiles && addFiles(e.target.files); e.target.value = '' }}
+          />
+          <button
+            onClick={() => fileRef.current?.click()}
+            title="Attach images or files"
+            className="p-2 text-gray-400 hover:text-indigo-600 rounded-xl transition-colors shrink-0"
+          >
+            <Paperclip size={16} />
+          </button>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onPaste={onPaste}
+            placeholder={temporary ? 'Temporary chat — not saved to history' : 'Message CEO…'}
+            rows={1}
+            className="flex-1 bg-transparent resize-none outline-none text-sm py-1.5 max-h-32 placeholder:text-gray-400"
+            style={{ height: 'auto', minHeight: '24px' }}
+            onInput={e => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!canSend}
+            className="p-2 text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-30 disabled:hover:bg-indigo-600 rounded-xl transition-colors shrink-0"
+          >
+            {sending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+          </button>
+        </div>
       </div>
       {temporary && (
         <p className="text-[10px] text-amber-600 mt-1.5 text-center">
@@ -367,6 +481,7 @@ function ChatBubble({ message }) {
   const isUser = message.role === 'user'
   const actions = message.actions || []
   const summaries = message.action_summaries || []
+  const attachments = message.attachments || []
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -378,8 +493,30 @@ function ChatBubble({ message }) {
         {!isUser && (
           <span className="text-[10px] font-semibold text-indigo-500 uppercase tracking-wide block mb-1">CEO</span>
         )}
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {attachments.map(a => (
+              a.kind === 'image' && a.url ? (
+                <a key={a.id} href={a.url} target="_blank" rel="noreferrer">
+                  <img src={a.url} alt={a.name} className="h-28 w-28 object-cover rounded-lg border border-black/10" />
+                </a>
+              ) : (
+                <a
+                  key={a.id}
+                  href={a.url || '#'}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-lg max-w-[180px] ${isUser ? 'bg-indigo-500/40' : 'bg-white border border-gray-200'}`}
+                >
+                  <FileText size={16} className="shrink-0 opacity-70" />
+                  <span className="text-xs truncate">{a.name}</span>
+                </a>
+              )
+            ))}
+          </div>
+        )}
         {isUser ? (
-          <div className="whitespace-pre-wrap">{message.content}</div>
+          message.content ? <div className="whitespace-pre-wrap">{message.content}</div> : null
         ) : (
           <div className="prose-sm">
             <MarkdownContent text={message.content} />

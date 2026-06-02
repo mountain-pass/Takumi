@@ -7,6 +7,7 @@ from typing import AsyncIterator
 import httpx
 import json
 from .base import BaseLLMAdapter, LLMResponse
+from ._content import flatten_text
 
 
 class MiniMaxAdapter(BaseLLMAdapter):
@@ -28,7 +29,7 @@ class MiniMaxAdapter(BaseLLMAdapter):
             mm_messages.append({
                 "sender_type": "USER" if m["role"] == "user" else "BOT",
                 "sender_name": "User" if m["role"] == "user" else "Assistant",
-                "text": m["content"],
+                "text": flatten_text(m["content"]),
             })
         return {
             "model": model,

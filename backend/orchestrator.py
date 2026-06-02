@@ -10,13 +10,12 @@ from datetime import datetime
 from typing import Any, Callable, Awaitable
 
 from .models import (
-    AgentConfig, AgentState, AgentStatus, Task, WSEvent, WSEventType, OrganisationConfig
+    AgentConfig, AgentState, AgentStatus, Task, WSEvent, WSEventType
 )
 from .agents.base_agent import BaseAgent
 from .agents.ceo_agent import CEOAgent, make_ceo_config
 from .message_bus import MessageBus, message_bus
 from .config import Settings, get_settings
-from .persistence import save_org, load_org
 from . import database
 from .agent_folders import ensure_agent_folder, remove_agent_folder, remove_all_agent_folders
 from .task_scheduler import TaskScheduler
@@ -24,6 +23,15 @@ from .task_scheduler import TaskScheduler
 logger = logging.getLogger(__name__)
 
 BroadcastFn = Callable[[str], Awaitable[None]]
+
+# Fields that belong to AgentConfig (the agents table has extra columns like
+# created_at that pydantic should not receive).
+_AGENT_CONFIG_FIELDS = set(AgentConfig.model_fields.keys())
+
+
+def _agent_config_from_row(row: dict) -> AgentConfig:
+    """Build an AgentConfig from a DB agents row, ignoring extra columns."""
+    return AgentConfig(**{k: v for k, v in row.items() if k in _AGENT_CONFIG_FIELDS})
 
 
 class Orchestrator:
@@ -41,13 +49,18 @@ class Orchestrator:
 
     async def start(self) -> None:
         self._running = True
-        org = load_org(self.settings.data_dir)
 
-        if not org.agents:
-            # Bootstrap with a CEO
-            org.agents.append(make_ceo_config())
+        # Agents live in SQLite (the agents table). Load them from there.
+        agent_rows = await database.get_all_agents()
+        configs = [_agent_config_from_row(r) for r in agent_rows]
 
-        for cfg in org.agents:
+        if not configs:
+            # Bootstrap with a CEO and persist it to the DB.
+            ceo = make_ceo_config()
+            await database.save_agent(ceo.model_dump(mode="json"))
+            configs = [ceo]
+
+        for cfg in configs:
             await self._spawn_agent(cfg)
 
         # Subscribe bus to WS broadcaster
@@ -67,7 +80,6 @@ class Orchestrator:
 
     async def add_agent(self, config: AgentConfig) -> BaseAgent:
         agent = await self._spawn_agent(config)
-        self._persist()
         ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description, config.system_prompt)
         await database.save_agent(config.model_dump(mode="json"))
         await self._broadcast(WSEvent(
@@ -82,7 +94,6 @@ class Orchestrator:
             remove_agent_folder(self.settings.data_dir, agent.config.name)
             await agent.stop()
             del self._agents[agent_id]
-            self._persist()
             await database.delete_agent(agent_id)
             await self._broadcast(WSEvent(
                 type=WSEventType.AGENT_REMOVED,
@@ -97,7 +108,6 @@ class Orchestrator:
         await agent.stop()
         del self._agents[agent_id]
         await self._spawn_agent(new_config)
-        self._persist()
         await database.save_agent(new_config.model_dump(mode="json"))
         return new_config
 
@@ -235,13 +245,6 @@ class Orchestrator:
 
     def set_ws_broadcast(self, fn: BroadcastFn) -> None:
         self._ws_broadcast = fn
-
-    def _persist(self) -> None:
-        org = OrganisationConfig(
-            agents=[a.config for a in self._agents.values()]
-        )
-        save_org(org, self.settings.data_dir)
-
 
 # Singleton
 orchestrator = Orchestrator()

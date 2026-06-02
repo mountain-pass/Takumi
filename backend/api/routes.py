@@ -553,6 +553,18 @@ async def reset_org():
     await db.commit()
     runtime_settings.reset()
     orchestrator.reset()
+
+    # Remove the legacy organisation.json so the one-time JSON migration can't
+    # resurrect the wiped org/agents on the next restart (the DB is now the
+    # source of truth for organisation details).
+    import os
+    legacy = os.path.join(orchestrator.settings.data_dir, "organisation.json")
+    try:
+        if os.path.exists(legacy):
+            os.remove(legacy)
+    except OSError as e:
+        logger.warning("Could not remove legacy organisation.json: %s", e)
+
     return {"ok": True}
 
 
@@ -655,19 +667,100 @@ async def delete_conversation(conv_id: str):
 
 # ── Chat (user ↔ CEO) ────────────────────────────────────────────────────────
 
+class ChatAttachment(BaseModel):
+    name: str
+    mime_type: str = ""
+    data: str  # base64 (raw or data: URI)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatSendRequest(BaseModel):
     conversation_id: str
     message: str
     is_temporary: bool = False
+    attachments: list[ChatAttachment] = []
+    # For temporary chats: prior in-screen messages (never persisted).
+    history: list[ChatMessage] = []
 
 
 @router.post("/chat/send")
 async def chat_send(req: ChatSendRequest):
     import uuid
+    from .. import attachments as attach
 
     ceo = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
     if not ceo:
         raise HTTPException(400, "No CEO agent available")
+
+    provider = ceo.config.llm_provider.value if hasattr(ceo.config.llm_provider, "value") else str(ceo.config.llm_provider)
+    model = ceo.config.llm_model
+    can_see = attach.model_supports_vision(provider, model)
+
+    # ── Temporary chat: fully ephemeral. Nothing is saved to disk, DB, or the
+    #    CEO's memory. Attachments are decoded in-memory only. ──────────────────
+    if req.is_temporary:
+        image_parts = []
+        doc_sections = []
+        for a in req.attachments:
+            try:
+                raw, b64, mime = attach.decode_b64(a.data, a.mime_type)
+            except Exception as e:
+                logger.error("Failed to decode temporary attachment %s: %s", a.name, e)
+                continue
+            if attach.kind_for(mime or "") == "image":
+                image_parts.append({"type": "image", "media_type": mime or "image/png", "data": b64})
+            else:
+                text = attach.extract_text_from_bytes(raw, mime)
+                if text.strip():
+                    doc_sections.append(f"\n\n--- Attached file: {a.name} ---\n{text[:attach.MAX_DOC_CHARS]}")
+                else:
+                    doc_sections.append(f"\n\n--- Attached file: {a.name} (could not extract text) ---")
+
+        message_for_llm = req.message + "".join(doc_sections)
+        vision_warning = ""
+        llm_image_parts = None
+        if image_parts:
+            if can_see:
+                llm_image_parts = image_parts
+            else:
+                adapter = getattr(ceo, "_adapter", None)
+                is_ollama_cloud = (provider == "ollama" and getattr(adapter, "_cloud", False))
+                described = ""
+                if is_ollama_cloud and adapter is not None:
+                    for vmodel in attach.OLLAMA_CLOUD_VISION_MODELS:
+                        described = await attach.describe_images(adapter, image_parts, vmodel, prompt_hint=req.message)
+                        if described.strip():
+                            break
+                if described.strip():
+                    message_for_llm += f"\n\n--- Image analysis (auto-decoded by a vision model) ---\n{described}"
+                else:
+                    vision_warning = attach.vision_unsupported_message(provider, model)
+                    message_for_llm += f"\n\n[Note: {len(image_parts)} image(s) were attached but the current model cannot view them.]"
+
+        history = [{"role": m.role, "content": m.content} for m in req.history if m.role in ("user", "assistant")]
+        try:
+            response_content, _ = await ceo.chat_with_context(
+                message_for_llm, image_parts=llm_image_parts, ephemeral=True, history=history
+            )
+        except Exception as e:
+            logger.error(f"CEO LLM call failed: {e}", exc_info=True)
+            raise HTTPException(502, f"CEO LLM call failed: {e}")
+
+        display_content = _strip_ceo_json(response_content)
+        if vision_warning:
+            display_content = f"{vision_warning}\n\n{display_content}"
+        return {
+            "id": str(uuid.uuid4()),
+            "content": display_content,
+            "from_agent_id": ceo.config.id,
+            "role": "assistant",
+            "actions": [],
+            "action_summaries": [],
+        }
 
     conv = await database.get_conversation(req.conversation_id)
     if not conv:
@@ -677,6 +770,70 @@ async def chat_send(req: ChatSendRequest):
             is_temporary=req.is_temporary,
         )
 
+    # ── Process attachments: persist to disk, extract document text, and
+    #    prepare image parts for vision-capable models ────────────────────────
+    data_dir = orchestrator.settings.data_dir
+
+    saved_meta = []      # stored on the user message for display/history
+    image_parts = []     # native image blocks (normalized)
+    doc_sections = []     # extracted document text appended to the message
+    for a in req.attachments:
+        try:
+            meta = attach.save_attachment(data_dir, req.conversation_id, a.name, a.mime_type, a.data)
+        except Exception as e:
+            logger.error("Failed to save attachment %s: %s", a.name, e)
+            continue
+        saved_meta.append({k: meta[k] for k in ("id", "name", "mime_type", "kind", "url", "size")})
+
+        if meta["kind"] == "image":
+            image_parts.append({
+                "type": "image",
+                "media_type": meta["mime_type"],
+                "data": attach.read_base64(meta["path"]),
+            })
+        else:
+            text = attach.extract_text(meta["path"], meta["mime_type"])
+            if text.strip():
+                doc_sections.append(f"\n\n--- Attached file: {meta['name']} ---\n{text[:attach.MAX_DOC_CHARS]}")
+            else:
+                doc_sections.append(f"\n\n--- Attached file: {meta['name']} (could not extract text) ---")
+
+    message_for_llm = req.message + "".join(doc_sections)
+    vision_warning = ""
+    llm_image_parts = None  # passed to the CEO only when its own model can see
+
+    if image_parts:
+        if can_see:
+            # CEO's own model is multimodal — send images natively.
+            llm_image_parts = image_parts
+        else:
+            # CEO's model can't see images. If it's on Ollama Cloud, transparently
+            # decode the image(s) with a cloud vision model and inject the
+            # description as text — no need for the user to switch models.
+            adapter = getattr(ceo, "_adapter", None)
+            is_ollama_cloud = (
+                provider == "ollama" and getattr(adapter, "_cloud", False)
+            )
+            described = ""
+            if is_ollama_cloud and adapter is not None:
+                for vmodel in attach.OLLAMA_CLOUD_VISION_MODELS:
+                    described = await attach.describe_images(
+                        adapter, image_parts, vmodel, prompt_hint=req.message
+                    )
+                    if described.strip():
+                        logger.info("[chat] Decoded %d image(s) via Ollama Cloud vision model '%s'",
+                                    len(image_parts), vmodel)
+                        break
+            if described.strip():
+                message_for_llm += (
+                    f"\n\n--- Image analysis (auto-decoded by a vision model) ---\n{described}"
+                )
+            else:
+                vision_warning = attach.vision_unsupported_message(provider, model)
+                message_for_llm += (
+                    f"\n\n[Note: {len(image_parts)} image(s) were attached but the current model cannot view them.]"
+                )
+
     user_msg_id = str(uuid.uuid4())
     await database.save_message({
         "id": user_msg_id,
@@ -685,10 +842,13 @@ async def chat_send(req: ChatSendRequest):
         "to_agent_id": ceo.config.id,
         "content": req.message,
         "role": "user",
+        "metadata": {"attachments": saved_meta} if saved_meta else {},
     })
 
     try:
-        response_content, executed_actions = await ceo.chat_with_context(req.message)
+        response_content, executed_actions = await ceo.chat_with_context(
+            message_for_llm, image_parts=llm_image_parts
+        )
     except Exception as e:
         logger.error(f"CEO LLM call failed: {e}", exc_info=True)
         raise HTTPException(502, f"CEO LLM call failed: {e}")
@@ -711,6 +871,8 @@ async def chat_send(req: ChatSendRequest):
     # Strip JSON action block from the content shown to user
     import re
     display_content = _strip_ceo_json(response_content)
+    if vision_warning:
+        display_content = f"{vision_warning}\n\n{display_content}"
 
     # Build human-readable action summaries
     action_summaries = []
@@ -737,6 +899,23 @@ async def chat_send(req: ChatSendRequest):
         "actions": executed_actions,
         "action_summaries": action_summaries,
     }
+
+
+# ── Uploaded attachment files ────────────────────────────────────────────────
+
+@router.get("/uploads/{conversation_id}/{filename}")
+async def get_upload(conversation_id: str, filename: str):
+    import os
+    import re as _re
+    from fastapi.responses import FileResponse
+
+    # Prevent path traversal — only allow plain filename/conversation segments.
+    safe_conv = _re.sub(r"[^A-Za-z0-9_-]", "_", conversation_id)
+    safe_name = os.path.basename(filename)
+    path = os.path.join(orchestrator.settings.data_dir, "uploads", safe_conv, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "File not found")
+    return FileResponse(path)
 
 
 # ── API Providers ────────────────────────────────────────────────────────────

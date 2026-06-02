@@ -2,11 +2,15 @@ from __future__ import annotations
 from typing import AsyncIterator
 import anthropic
 from .base import BaseLLMAdapter, LLMResponse
+from ._content import to_anthropic
 
 
 class AnthropicAdapter(BaseLLMAdapter):
     def __init__(self, api_key: str) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
+
+    def _conv(self, messages: list[dict]) -> list[dict]:
+        return [{"role": m["role"], "content": to_anthropic(m["content"])} for m in messages]
 
     async def complete(self, system_prompt, messages, model, max_tokens=2048, temperature=0.7) -> LLMResponse:
         resp = await self._client.messages.create(
@@ -14,7 +18,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=messages,
+            messages=self._conv(messages),
         )
         return LLMResponse(
             content=resp.content[0].text,
@@ -29,7 +33,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=messages,
+            messages=self._conv(messages),
         ) as stream:
             async for text in stream.text_stream:
                 yield text
