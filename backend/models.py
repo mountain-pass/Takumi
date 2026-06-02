@@ -99,6 +99,7 @@ class WSEventType(str, Enum):
     AGENT_ADDED = "agent_added"
     AGENT_REMOVED = "agent_removed"
     HEARTBEAT = "heartbeat"
+    TASK_COMPLETED = "task_completed"
     ERROR = "error"
 
 

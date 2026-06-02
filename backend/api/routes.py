@@ -2,8 +2,11 @@
 REST API routes for agent & task management.
 """
 from __future__ import annotations
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 from ..orchestrator import orchestrator
 from ..models import AgentConfig, LLMProvider
 from ..agents.ceo_agent import make_ceo_config
@@ -11,6 +14,65 @@ from .. import runtime_settings
 from .. import database
 
 router = APIRouter(prefix="/api")
+
+import re
+import json as _json
+
+def _strip_ceo_json(content: str) -> str:
+    """Remove JSON blocks from CEO responses and extract the human-readable message.
+
+    Handles multiple formats:
+    1. ```json { "actions": [...] } ``` — fenced code block
+    2. ```json { "delegate": [...], "message_to_user": "..." } ``` — legacy fenced
+    3. Raw JSON object with message_to_user field
+    """
+    if not content:
+        return content
+
+    # Try to extract message_to_user from anywhere in the content
+    extracted_msg = None
+
+    # Check fenced json blocks first
+    fenced = re.search(r'```json\s*\n(.*?)```', content, re.DOTALL)
+    if fenced:
+        try:
+            data = _json.loads(fenced.group(1).strip())
+            if isinstance(data, dict) and "message_to_user" in data:
+                extracted_msg = data["message_to_user"]
+        except Exception:
+            pass
+        # Strip the fenced block
+        content = re.sub(r'\s*```json\s*\n.*?```\s*', '', content, flags=re.DOTALL).strip()
+        if extracted_msg and not content:
+            return extracted_msg
+        return content or extracted_msg or ""
+
+    # Check for raw JSON object (no fences) — entire content is JSON
+    stripped = content.strip()
+    if stripped.startswith('{') and stripped.endswith('}'):
+        try:
+            data = _json.loads(stripped)
+            if isinstance(data, dict):
+                if "message_to_user" in data:
+                    return data["message_to_user"]
+                # It's a JSON object but no message — strip it
+                return ""
+        except Exception:
+            pass
+
+    # Check if content has a JSON object somewhere in the middle/end
+    json_match = re.search(r'(\{[\s\S]*"(?:actions|delegate)"[\s\S]*\})\s*$', content)
+    if json_match:
+        before = content[:json_match.start()].strip()
+        try:
+            data = _json.loads(json_match.group(1))
+            if isinstance(data, dict) and "message_to_user" in data:
+                extracted_msg = data["message_to_user"]
+        except Exception:
+            pass
+        return before or extracted_msg or content
+
+    return content
 
 
 # ── Request bodies ────────────────────────────────────────────────────────────
@@ -106,6 +168,129 @@ async def list_tasks():
 async def submit_task(req: SubmitTaskRequest):
     task = await orchestrator.submit_task(req.title, req.description)
     return task.model_dump(mode="json")
+
+
+# ── Agent Tasks ───────────────────────────────────────────────────────────────
+
+class CreateTaskRequest(BaseModel):
+    agent_id: str
+    assigned_by: str = "user"
+    title: str
+    instruction: str = ""
+    task_type: str = "adhoc"
+    priority: str = "normal"
+    schedule_cron: str | None = None
+    schedule_human: str | None = None
+    parent_task_id: str | None = None
+    conversation_id: str | None = None
+
+
+class UpdateTaskRequest(BaseModel):
+    title: str | None = None
+    instruction: str | None = None
+    task_type: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    schedule_cron: str | None = None
+    schedule_human: str | None = None
+    result: str | None = None
+
+
+@router.get("/agent-tasks")
+async def list_agent_tasks(agent_id: str | None = None, status: str | None = None, limit: int = 100):
+    if agent_id:
+        return await database.get_tasks_for_agent(agent_id, status)
+    return await database.get_all_tasks(status, limit)
+
+
+@router.get("/agent-tasks/{task_id}")
+async def get_agent_task(task_id: str):
+    task = await database.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
+@router.post("/agent-tasks", status_code=201)
+async def create_agent_task(req: CreateTaskRequest):
+    import uuid
+    # Validate connection: assigned_by must have a connection to agent_id
+    if not await database.can_assign_task(req.assigned_by, req.agent_id):
+        raise HTTPException(
+            403,
+            f"Agent '{req.assigned_by}' has no connection to agent '{req.agent_id}'. "
+            "Tasks can only be assigned through existing connections."
+        )
+    # Validate agent exists
+    agents = await database.get_all_agents()
+    if not any(a["id"] == req.agent_id for a in agents):
+        raise HTTPException(404, "Target agent not found")
+
+    task_id = str(uuid.uuid4())
+    task = {
+        "id": task_id,
+        **req.model_dump(),
+    }
+    await database.create_task(task)
+
+    # Create initial log entry
+    await database.create_task_log({
+        "id": str(uuid.uuid4()),
+        "task_id": task_id,
+        "agent_id": req.assigned_by,
+        "action": "created",
+        "detail": f"Task assigned to agent by {req.assigned_by}",
+    })
+
+    return await database.get_task(task_id)
+
+
+@router.patch("/agent-tasks/{task_id}")
+async def update_agent_task(task_id: str, req: UpdateTaskRequest):
+    import uuid
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No updates provided")
+
+    task = await database.update_task(task_id, updates)
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    # Log status changes
+    if "status" in updates:
+        await database.create_task_log({
+            "id": str(uuid.uuid4()),
+            "task_id": task_id,
+            "agent_id": task["agent_id"],
+            "action": updates["status"],
+            "detail": updates.get("result", ""),
+        })
+
+    return task
+
+
+@router.delete("/agent-tasks/{task_id}")
+async def delete_agent_task(task_id: str):
+    task = await database.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await database.delete_task(task_id)
+    return {"ok": True}
+
+
+@router.get("/agent-tasks/{task_id}/logs")
+async def get_task_logs(task_id: str, limit: int = 50):
+    return await database.get_task_logs(task_id, limit)
+
+
+@router.get("/agents/{agent_id}/tasks")
+async def get_agent_tasks(agent_id: str, status: str | None = None):
+    return await database.get_tasks_for_agent(agent_id, status)
+
+
+@router.get("/agents/{agent_id}/task-logs")
+async def get_agent_task_log_history(agent_id: str, limit: int = 100):
+    return await database.get_agent_task_logs(agent_id, limit)
 
 
 # ── Messages ──────────────────────────────────────────────────────────────────
@@ -362,8 +547,8 @@ async def enhance_prompt(req: PromptEnhanceRequest):
 async def reset_org():
     """Wipe all data and return to onboarding."""
     db = database._conn()
-    for table in ("messages", "conversations", "agent_connections", "agents",
-                  "api_providers", "api_keys", "org_settings"):
+    for table in ("agent_task_logs", "agent_tasks", "messages", "conversations",
+                  "agent_connections", "agents", "api_providers", "api_keys", "org_settings"):
         await db.execute(f"DELETE FROM {table}")
     await db.commit()
     runtime_settings.reset()
@@ -439,7 +624,119 @@ async def list_conversations(limit: int = 50):
 
 @router.get("/conversations/{conv_id}/messages")
 async def get_conversation_messages(conv_id: str, limit: int = 200):
-    return await database.get_messages(conversation_id=conv_id, limit=limit)
+    messages = await database.get_messages(conversation_id=conv_id, limit=limit)
+    agents_by_id = {a.config.id: a.config.name for a in orchestrator.get_agents()}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            msg["content"] = _strip_ceo_json(msg.get("content", ""))
+            # Reconstruct action_summaries from stored metadata
+            actions = msg.get("metadata", {}).get("actions", [])
+            summaries = []
+            for act in actions:
+                atype = act.get("action", "")
+                if act.get("status") != "ok":
+                    continue
+                if atype == "create_task":
+                    name = agents_by_id.get(act.get("agent_id", ""), act.get("agent", "agent"))
+                    summaries.append(f"📋 Task created for **{name}**")
+                elif atype == "delegate":
+                    name = agents_by_id.get(act.get("agent_id", ""), "agent")
+                    summaries.append(f"💬 Message sent to **{name}**")
+            if summaries:
+                msg["action_summaries"] = summaries
+    return messages
+
+
+@router.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    await database.delete_conversation(conv_id)
+    return {"ok": True}
+
+
+# ── Chat (user ↔ CEO) ────────────────────────────────────────────────────────
+
+class ChatSendRequest(BaseModel):
+    conversation_id: str
+    message: str
+    is_temporary: bool = False
+
+
+@router.post("/chat/send")
+async def chat_send(req: ChatSendRequest):
+    import uuid
+
+    ceo = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
+    if not ceo:
+        raise HTTPException(400, "No CEO agent available")
+
+    conv = await database.get_conversation(req.conversation_id)
+    if not conv:
+        await database.create_conversation(
+            req.conversation_id,
+            title=req.message[:80],
+            is_temporary=req.is_temporary,
+        )
+
+    user_msg_id = str(uuid.uuid4())
+    await database.save_message({
+        "id": user_msg_id,
+        "conversation_id": req.conversation_id,
+        "from_agent_id": "user",
+        "to_agent_id": ceo.config.id,
+        "content": req.message,
+        "role": "user",
+    })
+
+    try:
+        response_content, executed_actions = await ceo.chat_with_context(req.message)
+    except Exception as e:
+        logger.error(f"CEO LLM call failed: {e}", exc_info=True)
+        raise HTTPException(502, f"CEO LLM call failed: {e}")
+
+    assistant_msg_id = str(uuid.uuid4())
+    await database.save_message({
+        "id": assistant_msg_id,
+        "conversation_id": req.conversation_id,
+        "from_agent_id": ceo.config.id,
+        "to_agent_id": "user",
+        "content": response_content,
+        "role": "assistant",
+        "metadata": {"actions": executed_actions} if executed_actions else {},
+    })
+
+    if not req.is_temporary:
+        first_msg = req.message[:80]
+        await database.update_conversation(req.conversation_id, first_msg)
+
+    # Strip JSON action block from the content shown to user
+    import re
+    display_content = _strip_ceo_json(response_content)
+
+    # Build human-readable action summaries
+    action_summaries = []
+    agents_by_id = {a.config.id: a.config.name for a in orchestrator.get_agents()}
+    for act in executed_actions:
+        atype = act.get("action", "")
+        status = act.get("status", "")
+        if status != "ok":
+            continue
+        if atype == "create_task":
+            agent_name = agents_by_id.get(act.get("agent_id", ""), act.get("agent", "agent"))
+            action_summaries.append(f"📋 Task created for **{agent_name}**")
+        elif atype == "delegate":
+            agent_name = agents_by_id.get(act.get("agent_id", ""), "agent")
+            action_summaries.append(f"💬 Message sent to **{agent_name}**")
+        elif atype in ("pause_task", "resume_task", "cancel_task"):
+            action_summaries.append(f"⏸️ Task {atype.replace('_task', '')}d")
+
+    return {
+        "id": assistant_msg_id,
+        "content": display_content,
+        "from_agent_id": ceo.config.id,
+        "role": "assistant",
+        "actions": executed_actions,
+        "action_summaries": action_summaries,
+    }
 
 
 # ── API Providers ────────────────────────────────────────────────────────────
