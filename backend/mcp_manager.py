@@ -22,6 +22,26 @@ logger = logging.getLogger(__name__)
 CALL_TIMEOUT = 120  # seconds for a single tool call
 
 
+def _format_exc(exc: BaseException, depth: int = 0) -> str:
+    """Flatten an exception (incl. anyio ExceptionGroup) into a readable message."""
+    if depth > 5:
+        return str(exc) or exc.__class__.__name__
+    # ExceptionGroup / BaseExceptionGroup (anyio TaskGroup wrappers)
+    subs = getattr(exc, "exceptions", None)
+    if subs:
+        parts = [_format_exc(s, depth + 1) for s in subs]
+        # Collapse a single sub-exception so we surface the real cause directly.
+        if len(parts) == 1:
+            return parts[0]
+        return "; ".join(parts)
+    cls = exc.__class__.__name__
+    msg = str(exc).strip()
+    # Our own intentional messages (RuntimeError) read fine without a class prefix.
+    if isinstance(exc, RuntimeError):
+        return msg or cls
+    return f"{cls}: {msg}" if msg else cls
+
+
 def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_") or "server"
 
@@ -94,11 +114,67 @@ class _ServerConn:
             ), "sse"
         raise ValueError(f"Unknown MCP transport: {transport}")
 
+    async def _preflight(self) -> None:
+        """For http/sse: probe the endpoint so we can surface a clear error.
+
+        The MCP SDK swallows HTTP errors (e.g. 401) and only propagates an opaque
+        BrokenResourceError, so we do a lightweight initialize POST first.
+        """
+        transport = (self.config.get("transport") or "stdio").lower()
+        if transport not in ("http", "sse"):
+            return
+        import httpx
+        url = self.config.get("url", "")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **(dict(self.config.get("headers", {}) or {})),
+        }
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "takumi", "version": "1.0"}},
+        }
+        def _auth_error(status: int, wa: str):
+            hint = " This server uses OAuth." if "resource_metadata" in wa else ""
+            return RuntimeError(
+                f"Authentication required (HTTP {status}).{hint} "
+                "Add a valid token in the server's Headers, e.g. "
+                '{"Authorization": "Bearer <token>"}.'
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                if resp.status_code in (401, 403):
+                    raise _auth_error(resp.status_code, resp.headers.get("www-authenticate", ""))
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Server returned HTTP {resp.status_code}: {resp.text[:200]}")
+                # initialize succeeded — mirror the SDK handshake by sending the
+                # `notifications/initialized` notification. Some servers allow
+                # initialize anonymously but gate this step (and real calls) on auth,
+                # which the SDK surfaces only as an opaque BrokenResourceError.
+                sid = resp.headers.get("mcp-session-id")
+                probe_headers = dict(headers)
+                if sid:
+                    probe_headers["mcp-session-id"] = sid
+                note = await client.post(
+                    url, headers=probe_headers,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                )
+                if note.status_code in (401, 403):
+                    raise _auth_error(note.status_code, note.headers.get("www-authenticate", ""))
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Could not reach {url}: {_format_exc(e)}") from None
+
     async def _run(self) -> None:
         from mcp import ClientSession
         self.status = "connecting"
         self.error = ""
         try:
+            await self._preflight()
             ctx, kind = await self._open_transport()
             async with ctx as streams:
                 # stdio/sse yield (read, write); http yields (read, write, get_session_id)
@@ -110,13 +186,13 @@ class _ServerConn:
                     self._ready.set()
                     logger.info("[mcp:%s] connected — %d tool(s)", self.slug, len(self.tools))
                     await self._serve(session)
-        except Exception as e:
+        except BaseException as e:
             self.status = "error"
-            self.error = str(e)
-            logger.error("[mcp:%s] connection failed: %s", self.slug, e)
+            self.error = _format_exc(e)
+            logger.error("[mcp:%s] connection failed: %s", self.slug, self.error, exc_info=True)
             self._ready.set()
             # Fail any queued calls.
-            self._drain_with_error(e)
+            self._drain_with_error(RuntimeError(self.error))
 
     async def _load_tools(self, session) -> None:
         resp = await session.list_tools()
