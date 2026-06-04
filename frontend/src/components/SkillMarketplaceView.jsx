@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Plug, Plus, Trash2, RefreshCw, X, CheckCircle2, AlertCircle, Loader2, Server } from 'lucide-react'
+import { Plug, Plus, Trash2, RefreshCw, X, CheckCircle2, AlertCircle, Loader2, Server, Lock, LogIn, LogOut } from 'lucide-react'
 
 const API = '/api'
 const apiFetch = (url, opts) => fetch(url, opts).then(async r => {
@@ -9,7 +9,7 @@ const apiFetch = (url, opts) => fetch(url, opts).then(async r => {
 
 const BLANK = {
   name: '', transport: 'stdio', command: '', args: '', env: '',
-  url: '', headers: '', enabled: true,
+  url: '', headers: '', auth: 'none', enabled: true,
 }
 
 export default function SkillMarketplaceView() {
@@ -18,19 +18,40 @@ export default function SkillMarketplaceView() {
   const [editing, setEditing] = useState(null)   // server object or BLANK
   const [busyId, setBusyId] = useState(null)
 
-  async function load() {
-    setLoading(true)
+  async function load(silent = false) {
+    if (!silent) setLoading(true)
     try { setServers(await apiFetch(`${API}/mcp/servers`)) }
     catch (e) { console.error(e) }
-    finally { setLoading(false) }
+    finally { if (!silent) setLoading(false) }
   }
   useEffect(() => { load() }, [])
+
+  // While any server is awaiting OAuth authorization, poll so the card flips to
+  // "connected" once the user finishes the browser consent.
+  const awaiting = servers.some(s => s.status === 'awaiting_auth')
+  useEffect(() => {
+    if (!awaiting) return
+    const t = setInterval(() => load(true), 2500)
+    return () => clearInterval(t)
+  }, [awaiting])
 
   async function refresh(id) {
     setBusyId(id)
     try { await apiFetch(`${API}/mcp/servers/${id}/refresh`, { method: 'POST' }); await load() }
     catch (e) { alert(`Refresh failed: ${e.message}`) }
     finally { setBusyId(null) }
+  }
+
+  function authorize(s) {
+    if (s.authorize_url) {
+      window.open(s.authorize_url, 'mcp-oauth', 'width=600,height=760')
+      load(true)
+    }
+  }
+
+  async function signout(id) {
+    await apiFetch(`${API}/mcp/servers/${id}/signout`, { method: 'POST' })
+    load()
   }
 
   async function remove(id) {
@@ -69,7 +90,8 @@ export default function SkillMarketplaceView() {
           <div className="grid gap-3">
             {servers.map(s => (
               <ServerCard key={s.id} s={s} busy={busyId === s.id}
-                onRefresh={() => refresh(s.id)} onEdit={() => setEditing(s)} onRemove={() => remove(s.id)} />
+                onRefresh={() => refresh(s.id)} onEdit={() => setEditing(s)} onRemove={() => remove(s.id)}
+                onAuthorize={() => authorize(s)} onSignout={() => signout(s.id)} />
             ))}
           </div>
         )}
@@ -86,6 +108,7 @@ function StatusBadge({ status, error }) {
   const map = {
     connected: ['text-green-700 bg-green-50', <CheckCircle2 size={12} key="i" />, 'Connected'],
     connecting: ['text-amber-700 bg-amber-50', <Loader2 size={12} className="animate-spin" key="i" />, 'Connecting'],
+    awaiting_auth: ['text-blue-700 bg-blue-50', <Lock size={12} key="i" />, 'Needs sign-in'],
     error: ['text-red-700 bg-red-50', <AlertCircle size={12} key="i" />, 'Error'],
     disconnected: ['text-gray-500 bg-gray-100', <AlertCircle size={12} key="i" />, 'Offline'],
   }
@@ -97,7 +120,7 @@ function StatusBadge({ status, error }) {
   )
 }
 
-function ServerCard({ s, busy, onRefresh, onEdit, onRemove }) {
+function ServerCard({ s, busy, onRefresh, onEdit, onRemove, onAuthorize, onSignout }) {
   return (
     <div className="border border-gray-200 rounded-xl p-4">
       <div className="flex items-start justify-between">
@@ -123,6 +146,23 @@ function ServerCard({ s, busy, onRefresh, onEdit, onRemove }) {
       </div>
 
       {s.error && <p className="text-xs text-red-600 mt-2">{s.error}</p>}
+
+      {s.status === 'awaiting_auth' && (
+        <div className="mt-3 flex items-center gap-2">
+          <button onClick={onAuthorize}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg">
+            <LogIn size={13} /> Authorize with provider
+          </button>
+          <span className="text-[11px] text-gray-400">Opens a sign-in window; this card updates automatically.</span>
+        </div>
+      )}
+
+      {s.auth === 'oauth' && s.status === 'connected' && (
+        <button onClick={onSignout}
+          className="mt-3 flex items-center gap-1.5 px-2 py-1 text-[11px] text-gray-500 hover:text-red-600 hover:bg-gray-100 rounded-lg">
+          <LogOut size={12} /> Sign out
+        </button>
+      )}
 
       {s.tools && s.tools.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
@@ -162,6 +202,7 @@ function ServerModal({ server, onClose, onSaved }) {
       env,
       url: form.url.trim(),
       headers,
+      auth: form.transport === 'stdio' ? 'none' : form.auth,
       enabled: form.enabled,
     }
     if (!body.name) { setErr('Name is required'); return }
@@ -219,9 +260,21 @@ function ServerModal({ server, onClose, onSaved }) {
               <Field label="URL">
                 <input className={inp} value={form.url} onChange={e => set('url', e.target.value)} placeholder="https://example.com/mcp" />
               </Field>
-              <Field label="Headers (JSON, optional)">
-                <textarea className={`${inp} font-mono text-xs h-20`} value={form.headers} onChange={e => set('headers', e.target.value)} placeholder='{"Authorization": "Bearer ..."}' />
+              <Field label="Authentication">
+                <select className={inp} value={form.auth} onChange={e => set('auth', e.target.value)}>
+                  <option value="none">None / static header</option>
+                  <option value="oauth">OAuth 2.0 (sign in with provider)</option>
+                </select>
               </Field>
+              {form.auth === 'oauth' ? (
+                <p className="text-[11px] text-gray-400 -mt-1">
+                  After saving, click <b>Authorize with provider</b> on the server card to sign in. Tokens are stored and refreshed automatically.
+                </p>
+              ) : (
+                <Field label="Headers (JSON, optional)">
+                  <textarea className={`${inp} font-mono text-xs h-20`} value={form.headers} onChange={e => set('headers', e.target.value)} placeholder='{"Authorization": "Bearer ..."}' />
+                </Field>
+              )}
             </>
           )}
 

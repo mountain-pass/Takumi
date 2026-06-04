@@ -61,6 +61,15 @@ class _ServerConn:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
+        # OAuth (http/sse with auth='oauth')
+        self.authorize_url: str = ""
+        self._auth_future: asyncio.Future | None = None
+        self._auth_state: str = ""
+
+    @property
+    def is_oauth(self) -> bool:
+        return (self.config.get("auth") or "none").lower() == "oauth" \
+            and (self.config.get("transport") or "").lower() in ("http", "sse")
 
     async def start(self) -> None:
         self._ready.clear()
@@ -73,6 +82,12 @@ class _ServerConn:
             self.error = self.error or "Timed out connecting to MCP server"
 
     async def stop(self) -> None:
+        # Cancel any in-flight OAuth authorization waiting on the browser.
+        if self._auth_state:
+            from .mcp_oauth import cancel_pending_for
+            cancel_pending_for(lambda s: s == self._auth_state)
+        if self._auth_future and not self._auth_future.done():
+            self._auth_future.cancel()
         if self._task and not self._task.done():
             await self._queue.put(("stop", None, None))
             try:
@@ -81,6 +96,7 @@ class _ServerConn:
                 self._task.cancel()
         self.status = "disconnected"
         self.tools = []
+        self.authorize_url = ""
 
     async def call(self, tool: str, arguments: dict):
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -92,6 +108,10 @@ class _ServerConn:
     async def _open_transport(self):
         """Return an async-context-manager yielding (read, write) streams."""
         transport = (self.config.get("transport") or "stdio").lower()
+        auth = None
+        if self.is_oauth:
+            from .mcp_oauth import build_oauth_provider
+            auth = build_oauth_provider(self)
         if transport == "stdio":
             from mcp.client.stdio import stdio_client, StdioServerParameters
             params = StdioServerParameters(
@@ -105,12 +125,14 @@ class _ServerConn:
             return streamablehttp_client(
                 self.config.get("url", ""),
                 headers=dict(self.config.get("headers", {}) or {}) or None,
+                auth=auth,
             ), "http"
         if transport == "sse":
             from mcp.client.sse import sse_client
             return sse_client(
                 self.config.get("url", ""),
                 headers=dict(self.config.get("headers", {}) or {}) or None,
+                auth=auth,
             ), "sse"
         raise ValueError(f"Unknown MCP transport: {transport}")
 
@@ -122,6 +144,9 @@ class _ServerConn:
         """
         transport = (self.config.get("transport") or "stdio").lower()
         if transport not in ("http", "sse"):
+            return
+        # OAuth servers are expected to 401 until authorized; the provider handles it.
+        if self.is_oauth:
             return
         import httpx
         url = self.config.get("url", "")
@@ -173,6 +198,7 @@ class _ServerConn:
         from mcp import ClientSession
         self.status = "connecting"
         self.error = ""
+        self.authorize_url = ""
         try:
             await self._preflight()
             ctx, kind = await self._open_transport()
@@ -294,6 +320,7 @@ class MCPManager:
             "slug": conn.slug,
             "status": conn.status,
             "error": conn.error,
+            "authorize_url": conn.authorize_url,
             "tools": [{"name": t["name"], "full_name": t["full_name"], "description": t["description"]}
                       for t in conn.tools],
         }

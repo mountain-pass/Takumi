@@ -1101,6 +1101,7 @@ class MCPServerBody(BaseModel):
     env: dict[str, str] = {}
     url: str = ""
     headers: dict[str, str] = {}
+    auth: str = "none"                  # 'none' | 'oauth'
     enabled: bool = True
 
 
@@ -1109,7 +1110,9 @@ def _mcp_public(s: dict) -> dict:
     from ..mcp_manager import mcp_manager
     status = mcp_manager.status_for(s["id"])
     return {**s, "status": status.get("status", "disconnected"),
-            "error": status.get("error", ""), "tools": status.get("tools", [])}
+            "error": status.get("error", ""),
+            "authorize_url": status.get("authorize_url", ""),
+            "tools": status.get("tools", [])}
 
 
 @router.get("/mcp/servers")
@@ -1144,6 +1147,7 @@ async def update_mcp_server(server_id: str, req: MCPServerBody):
 async def delete_mcp_server(server_id: str):
     from ..mcp_manager import mcp_manager
     await mcp_manager.remove(server_id)
+    await database.clear_mcp_oauth(server_id)
     await database.delete_mcp_server(server_id)
     return {"ok": True}
 
@@ -1156,3 +1160,40 @@ async def refresh_mcp_server(server_id: str):
         raise HTTPException(404, "MCP server not found")
     await mcp_manager.refresh(record)
     return _mcp_public(record)
+
+
+@router.post("/mcp/servers/{server_id}/signout")
+async def signout_mcp_server(server_id: str):
+    """Forget stored OAuth tokens and disconnect (forces re-authorization)."""
+    from ..mcp_manager import mcp_manager
+    await mcp_manager.remove(server_id)
+    await database.clear_mcp_oauth(server_id)
+    return {"ok": True}
+
+
+@router.get("/mcp/oauth/callback")
+async def mcp_oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth redirect target. Resolves the pending flow and reconnects the server."""
+    from fastapi.responses import HTMLResponse
+    from ..mcp_oauth import resolve_callback
+
+    def page(title: str, msg: str, ok: bool) -> HTMLResponse:
+        colour = "#059669" if ok else "#DC2626"
+        return HTMLResponse(
+            f"""<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>
+            <style>body{{font-family:-apple-system,system-ui,sans-serif;display:flex;
+            height:100vh;margin:0;align-items:center;justify-content:center;background:#f9fafb}}
+            .card{{text-align:center;padding:2rem 2.5rem;background:#fff;border-radius:1rem;
+            box-shadow:0 1px 3px rgba(0,0,0,.1)}}h1{{color:{colour};font-size:1.1rem;margin:0 0 .5rem}}
+            p{{color:#6b7280;font-size:.85rem;margin:0}}</style></head>
+            <body><div class='card'><h1>{title}</h1><p>{msg}</p></div>
+            <script>setTimeout(()=>window.close(),2500)</script></body></html>"""
+        )
+
+    if error:
+        return page("Authorization failed", error, False)
+    if not code or not state:
+        return page("Authorization failed", "Missing code or state.", False)
+    if resolve_callback(state, code):
+        return page("Authorized ✓", "You can close this window and return to Takumi.", True)
+    return page("Authorization expired", "This request was not recognised. Please try connecting again.", False)

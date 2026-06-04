@@ -74,8 +74,16 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     env        TEXT NOT NULL DEFAULT '{}',       -- stdio: JSON object
     url        TEXT NOT NULL DEFAULT '',          -- http/sse: server URL
     headers    TEXT NOT NULL DEFAULT '{}',        -- http/sse: JSON object
+    auth       TEXT NOT NULL DEFAULT 'none',       -- 'none' | 'oauth'
     enabled    INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS mcp_oauth (
+    server_id   TEXT PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+    tokens      TEXT NOT NULL DEFAULT '',   -- OAuthToken JSON
+    client_info TEXT NOT NULL DEFAULT '',   -- OAuthClientInformationFull JSON
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -157,6 +165,7 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agents ADD COLUMN api_provider_id TEXT REFERENCES api_providers(id)",
         "ALTER TABLE conversations ADD COLUMN is_temporary INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_tasks ADD COLUMN depends_on TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN auth TEXT NOT NULL DEFAULT 'none'",
     ]:
         try:
             await _db.execute(migration)
@@ -362,6 +371,7 @@ def _row_to_mcp(r) -> dict:
     d["env"] = json.loads(d.get("env") or "{}")
     d["headers"] = json.loads(d.get("headers") or "{}")
     d["enabled"] = bool(d["enabled"])
+    d["auth"] = d.get("auth") or "none"
     return d
 
 
@@ -381,17 +391,18 @@ async def get_mcp_server(server_id: str) -> dict | None:
 
 async def save_mcp_server(s: dict) -> None:
     await _conn().execute(
-        """INSERT INTO mcp_servers(id, name, transport, command, args, env, url, headers, enabled)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """INSERT INTO mcp_servers(id, name, transport, command, args, env, url, headers, auth, enabled)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              name=excluded.name, transport=excluded.transport, command=excluded.command,
              args=excluded.args, env=excluded.env, url=excluded.url,
-             headers=excluded.headers, enabled=excluded.enabled""",
+             headers=excluded.headers, auth=excluded.auth, enabled=excluded.enabled""",
         (
             s["id"], s["name"], s.get("transport", "stdio"),
             s.get("command", ""), json.dumps(s.get("args", [])),
             json.dumps(s.get("env", {})), s.get("url", ""),
-            json.dumps(s.get("headers", {})), int(s.get("enabled", True)),
+            json.dumps(s.get("headers", {})), s.get("auth", "none"),
+            int(s.get("enabled", True)),
         ),
     )
     await _conn().commit()
@@ -399,6 +410,39 @@ async def save_mcp_server(s: dict) -> None:
 
 async def delete_mcp_server(server_id: str) -> None:
     await _conn().execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+    await _conn().commit()
+
+
+# ── MCP OAuth token storage ───────────────────────────────────────────────────
+
+async def get_mcp_oauth(server_id: str) -> dict:
+    """Return {'tokens': <json str or ''>, 'client_info': <json str or ''>}."""
+    row = await (await _conn().execute(
+        "SELECT tokens, client_info FROM mcp_oauth WHERE server_id = ?", (server_id,)
+    )).fetchone()
+    if not row:
+        return {"tokens": "", "client_info": ""}
+    return {"tokens": row["tokens"] or "", "client_info": row["client_info"] or ""}
+
+
+async def set_mcp_oauth(server_id: str, *, tokens: str | None = None,
+                        client_info: str | None = None) -> None:
+    cur = await get_mcp_oauth(server_id)
+    t = tokens if tokens is not None else cur["tokens"]
+    c = client_info if client_info is not None else cur["client_info"]
+    await _conn().execute(
+        """INSERT INTO mcp_oauth(server_id, tokens, client_info, updated_at)
+           VALUES(?, ?, ?, datetime('now'))
+           ON CONFLICT(server_id) DO UPDATE SET
+             tokens=excluded.tokens, client_info=excluded.client_info,
+             updated_at=excluded.updated_at""",
+        (server_id, t, c),
+    )
+    await _conn().commit()
+
+
+async def clear_mcp_oauth(server_id: str) -> None:
+    await _conn().execute("DELETE FROM mcp_oauth WHERE server_id = ?", (server_id,))
     await _conn().commit()
 
 
