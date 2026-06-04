@@ -470,6 +470,37 @@ class CEOAgent(BaseAgent):
             f"## Connections (who you can assign to)\n{connections}"
         )
 
+    async def _connected_mcp_server_ids(self) -> set[str]:
+        """MCP server ids granted to agents the Manager is connected to."""
+        if not self._orchestrator:
+            return set()
+        try:
+            conns = await database.get_all_connections()
+        except Exception:
+            return set()
+        out_ids = {c["to_id"] for c in conns if c["from_id"] == self.config.id}
+        owned: set[str] = set()
+        for a in self._orchestrator.get_agents():
+            if a.config.id in out_ids:
+                for s in a.config.skills:
+                    if s.startswith("mcp:") and ":" in s:
+                        owned.add(s.split(":", 1)[1])
+        return owned
+
+    async def _effective_skills(self) -> list[str]:
+        """Hide MCP tools that a connected specialist owns, so the Manager
+        delegates to them instead of running the tool itself. The grant is kept
+        only as a fallback when no connected agent has that server."""
+        delegatable = await self._connected_mcp_server_ids()
+        if not delegatable:
+            return self.config.skills
+        result = []
+        for s in self.config.skills:
+            if s.startswith("mcp:") and ":" in s and s.split(":", 1)[1] in delegatable:
+                continue  # owned by a specialist — delegate instead
+            result.append(s)
+        return result
+
     async def _complete_with_tools(
         self, msgs: list[dict], system: str, max_rounds: int = 6,
     ):
