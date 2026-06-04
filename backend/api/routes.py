@@ -2,8 +2,11 @@
 REST API routes for agent & task management.
 """
 from __future__ import annotations
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 from ..orchestrator import orchestrator
 from ..models import AgentConfig, LLMProvider
 from ..agents.ceo_agent import make_ceo_config
@@ -11,6 +14,65 @@ from .. import runtime_settings
 from .. import database
 
 router = APIRouter(prefix="/api")
+
+import re
+import json as _json
+
+def _strip_ceo_json(content: str) -> str:
+    """Remove JSON blocks from CEO responses and extract the human-readable message.
+
+    Handles multiple formats:
+    1. ```json { "actions": [...] } ``` — fenced code block
+    2. ```json { "delegate": [...], "message_to_user": "..." } ``` — legacy fenced
+    3. Raw JSON object with message_to_user field
+    """
+    if not content:
+        return content
+
+    # Try to extract message_to_user from anywhere in the content
+    extracted_msg = None
+
+    # Check fenced json blocks first
+    fenced = re.search(r'```json\s*\n(.*?)```', content, re.DOTALL)
+    if fenced:
+        try:
+            data = _json.loads(fenced.group(1).strip())
+            if isinstance(data, dict) and "message_to_user" in data:
+                extracted_msg = data["message_to_user"]
+        except Exception:
+            pass
+        # Strip the fenced block
+        content = re.sub(r'\s*```json\s*\n.*?```\s*', '', content, flags=re.DOTALL).strip()
+        if extracted_msg and not content:
+            return extracted_msg
+        return content or extracted_msg or ""
+
+    # Check for raw JSON object (no fences) — entire content is JSON
+    stripped = content.strip()
+    if stripped.startswith('{') and stripped.endswith('}'):
+        try:
+            data = _json.loads(stripped)
+            if isinstance(data, dict):
+                if "message_to_user" in data:
+                    return data["message_to_user"]
+                # It's a JSON object but no message — strip it
+                return ""
+        except Exception:
+            pass
+
+    # Check if content has a JSON object somewhere in the middle/end
+    json_match = re.search(r'(\{[\s\S]*"(?:actions|delegate)"[\s\S]*\})\s*$', content)
+    if json_match:
+        before = content[:json_match.start()].strip()
+        try:
+            data = _json.loads(json_match.group(1))
+            if isinstance(data, dict) and "message_to_user" in data:
+                extracted_msg = data["message_to_user"]
+        except Exception:
+            pass
+        return before or extracted_msg or content
+
+    return content
 
 
 # ── Request bodies ────────────────────────────────────────────────────────────
@@ -77,7 +139,7 @@ async def delete_agent(agent_id: str):
     if not agent:
         raise HTTPException(404, "Agent not found")
     if agent.config.is_ceo:
-        raise HTTPException(400, "Cannot remove the CEO agent")
+        raise HTTPException(400, "Cannot remove the Manager agent")
     await orchestrator.remove_agent(agent_id)
     return {"ok": True}
 
@@ -106,6 +168,129 @@ async def list_tasks():
 async def submit_task(req: SubmitTaskRequest):
     task = await orchestrator.submit_task(req.title, req.description)
     return task.model_dump(mode="json")
+
+
+# ── Agent Tasks ───────────────────────────────────────────────────────────────
+
+class CreateTaskRequest(BaseModel):
+    agent_id: str
+    assigned_by: str = "user"
+    title: str
+    instruction: str = ""
+    task_type: str = "adhoc"
+    priority: str = "normal"
+    schedule_cron: str | None = None
+    schedule_human: str | None = None
+    parent_task_id: str | None = None
+    conversation_id: str | None = None
+
+
+class UpdateTaskRequest(BaseModel):
+    title: str | None = None
+    instruction: str | None = None
+    task_type: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    schedule_cron: str | None = None
+    schedule_human: str | None = None
+    result: str | None = None
+
+
+@router.get("/agent-tasks")
+async def list_agent_tasks(agent_id: str | None = None, status: str | None = None, limit: int = 100):
+    if agent_id:
+        return await database.get_tasks_for_agent(agent_id, status)
+    return await database.get_all_tasks(status, limit)
+
+
+@router.get("/agent-tasks/{task_id}")
+async def get_agent_task(task_id: str):
+    task = await database.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
+@router.post("/agent-tasks", status_code=201)
+async def create_agent_task(req: CreateTaskRequest):
+    import uuid
+    # Validate connection: assigned_by must have a connection to agent_id
+    if not await database.can_assign_task(req.assigned_by, req.agent_id):
+        raise HTTPException(
+            403,
+            f"Agent '{req.assigned_by}' has no connection to agent '{req.agent_id}'. "
+            "Tasks can only be assigned through existing connections."
+        )
+    # Validate agent exists
+    agents = await database.get_all_agents()
+    if not any(a["id"] == req.agent_id for a in agents):
+        raise HTTPException(404, "Target agent not found")
+
+    task_id = str(uuid.uuid4())
+    task = {
+        "id": task_id,
+        **req.model_dump(),
+    }
+    await database.create_task(task)
+
+    # Create initial log entry
+    await database.create_task_log({
+        "id": str(uuid.uuid4()),
+        "task_id": task_id,
+        "agent_id": req.assigned_by,
+        "action": "created",
+        "detail": f"Task assigned to agent by {req.assigned_by}",
+    })
+
+    return await database.get_task(task_id)
+
+
+@router.patch("/agent-tasks/{task_id}")
+async def update_agent_task(task_id: str, req: UpdateTaskRequest):
+    import uuid
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No updates provided")
+
+    task = await database.update_task(task_id, updates)
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    # Log status changes
+    if "status" in updates:
+        await database.create_task_log({
+            "id": str(uuid.uuid4()),
+            "task_id": task_id,
+            "agent_id": task["agent_id"],
+            "action": updates["status"],
+            "detail": updates.get("result", ""),
+        })
+
+    return task
+
+
+@router.delete("/agent-tasks/{task_id}")
+async def delete_agent_task(task_id: str):
+    task = await database.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await database.delete_task(task_id)
+    return {"ok": True}
+
+
+@router.get("/agent-tasks/{task_id}/logs")
+async def get_task_logs(task_id: str, limit: int = 50):
+    return await database.get_task_logs(task_id, limit)
+
+
+@router.get("/agents/{agent_id}/tasks")
+async def get_agent_tasks(agent_id: str, status: str | None = None):
+    return await database.get_tasks_for_agent(agent_id, status)
+
+
+@router.get("/agents/{agent_id}/task-logs")
+async def get_agent_task_log_history(agent_id: str, limit: int = 100):
+    return await database.get_agent_task_logs(agent_id, limit)
 
 
 # ── Messages ──────────────────────────────────────────────────────────────────
@@ -362,12 +547,24 @@ async def enhance_prompt(req: PromptEnhanceRequest):
 async def reset_org():
     """Wipe all data and return to onboarding."""
     db = database._conn()
-    for table in ("messages", "conversations", "agent_connections", "agents",
-                  "api_providers", "api_keys", "org_settings"):
+    for table in ("agent_task_logs", "agent_tasks", "messages", "conversations",
+                  "agent_connections", "agents", "api_providers", "api_keys", "org_settings"):
         await db.execute(f"DELETE FROM {table}")
     await db.commit()
     runtime_settings.reset()
     orchestrator.reset()
+
+    # Remove the legacy organisation.json so the one-time JSON migration can't
+    # resurrect the wiped org/agents on the next restart (the DB is now the
+    # source of truth for organisation details).
+    import os
+    legacy = os.path.join(orchestrator.settings.data_dir, "organisation.json")
+    try:
+        if os.path.exists(legacy):
+            os.remove(legacy)
+    except OSError as e:
+        logger.warning("Could not remove legacy organisation.json: %s", e)
+
     return {"ok": True}
 
 
@@ -439,7 +636,286 @@ async def list_conversations(limit: int = 50):
 
 @router.get("/conversations/{conv_id}/messages")
 async def get_conversation_messages(conv_id: str, limit: int = 200):
-    return await database.get_messages(conversation_id=conv_id, limit=limit)
+    messages = await database.get_messages(conversation_id=conv_id, limit=limit)
+    agents_by_id = {a.config.id: a.config.name for a in orchestrator.get_agents()}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            msg["content"] = _strip_ceo_json(msg.get("content", ""))
+            # Reconstruct action_summaries from stored metadata
+            actions = msg.get("metadata", {}).get("actions", [])
+            summaries = []
+            for act in actions:
+                atype = act.get("action", "")
+                if act.get("status") != "ok":
+                    continue
+                if atype == "create_task":
+                    name = agents_by_id.get(act.get("agent_id", ""), act.get("agent", "agent"))
+                    summaries.append(f"📋 Task created for **{name}**")
+                elif atype == "delegate":
+                    name = agents_by_id.get(act.get("agent_id", ""), "agent")
+                    summaries.append(f"💬 Message sent to **{name}**")
+            if summaries:
+                msg["action_summaries"] = summaries
+    return messages
+
+
+@router.delete("/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    await database.delete_conversation(conv_id)
+    return {"ok": True}
+
+
+# ── Chat (user ↔ CEO) ────────────────────────────────────────────────────────
+
+class ChatAttachment(BaseModel):
+    name: str
+    mime_type: str = ""
+    data: str  # base64 (raw or data: URI)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatSendRequest(BaseModel):
+    conversation_id: str
+    message: str
+    is_temporary: bool = False
+    attachments: list[ChatAttachment] = []
+    # For temporary chats: prior in-screen messages (never persisted).
+    history: list[ChatMessage] = []
+
+
+@router.post("/chat/send")
+async def chat_send(req: ChatSendRequest):
+    import uuid
+    from .. import attachments as attach
+
+    ceo = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
+    if not ceo:
+        raise HTTPException(400, "No Manager agent available")
+
+    provider = ceo.config.llm_provider.value if hasattr(ceo.config.llm_provider, "value") else str(ceo.config.llm_provider)
+    model = ceo.config.llm_model
+    can_see = attach.model_supports_vision(provider, model)
+
+    # ── Temporary chat: fully ephemeral. Nothing is saved to disk, DB, or the
+    #    CEO's memory. Attachments are decoded in-memory only. ──────────────────
+    if req.is_temporary:
+        image_parts = []
+        doc_sections = []
+        for a in req.attachments:
+            try:
+                raw, b64, mime = attach.decode_b64(a.data, a.mime_type)
+            except Exception as e:
+                logger.error("Failed to decode temporary attachment %s: %s", a.name, e)
+                continue
+            if attach.kind_for(mime or "") == "image":
+                image_parts.append({"type": "image", "media_type": mime or "image/png", "data": b64})
+            else:
+                text = attach.extract_text_from_bytes(raw, mime)
+                if text.strip():
+                    doc_sections.append(f"\n\n--- Attached file: {a.name} ---\n{text[:attach.MAX_DOC_CHARS]}")
+                else:
+                    doc_sections.append(f"\n\n--- Attached file: {a.name} (could not extract text) ---")
+
+        message_for_llm = req.message + "".join(doc_sections)
+        vision_warning = ""
+        llm_image_parts = None
+        if image_parts:
+            if can_see:
+                llm_image_parts = image_parts
+            else:
+                adapter = getattr(ceo, "_adapter", None)
+                is_ollama_cloud = (provider == "ollama" and getattr(adapter, "_cloud", False))
+                described = ""
+                if is_ollama_cloud and adapter is not None:
+                    for vmodel in attach.OLLAMA_CLOUD_VISION_MODELS:
+                        described = await attach.describe_images(adapter, image_parts, vmodel, prompt_hint=req.message)
+                        if described.strip():
+                            break
+                if described.strip():
+                    message_for_llm += f"\n\n--- Image analysis (auto-decoded by a vision model) ---\n{described}"
+                else:
+                    vision_warning = attach.vision_unsupported_message(provider, model)
+                    message_for_llm += f"\n\n[Note: {len(image_parts)} image(s) were attached but the current model cannot view them.]"
+
+        history = [{"role": m.role, "content": m.content} for m in req.history if m.role in ("user", "assistant")]
+        try:
+            response_content, _ = await ceo.chat_with_context(
+                message_for_llm, image_parts=llm_image_parts, ephemeral=True, history=history
+            )
+        except Exception as e:
+            logger.error(f"CEO LLM call failed: {e}", exc_info=True)
+            raise HTTPException(502, f"CEO LLM call failed: {e}")
+
+        display_content = _strip_ceo_json(response_content)
+        if vision_warning:
+            display_content = f"{vision_warning}\n\n{display_content}"
+        return {
+            "id": str(uuid.uuid4()),
+            "content": display_content,
+            "from_agent_id": ceo.config.id,
+            "role": "assistant",
+            "actions": [],
+            "action_summaries": [],
+        }
+
+    conv = await database.get_conversation(req.conversation_id)
+    if not conv:
+        await database.create_conversation(
+            req.conversation_id,
+            title=req.message[:80],
+            is_temporary=req.is_temporary,
+        )
+
+    # ── Process attachments: persist to disk, extract document text, and
+    #    prepare image parts for vision-capable models ────────────────────────
+    data_dir = orchestrator.settings.data_dir
+
+    saved_meta = []      # stored on the user message for display/history
+    image_parts = []     # native image blocks (normalized)
+    doc_sections = []     # extracted document text appended to the message
+    for a in req.attachments:
+        try:
+            meta = attach.save_attachment(data_dir, req.conversation_id, a.name, a.mime_type, a.data)
+        except Exception as e:
+            logger.error("Failed to save attachment %s: %s", a.name, e)
+            continue
+        saved_meta.append({k: meta[k] for k in ("id", "name", "mime_type", "kind", "url", "size")})
+
+        if meta["kind"] == "image":
+            image_parts.append({
+                "type": "image",
+                "media_type": meta["mime_type"],
+                "data": attach.read_base64(meta["path"]),
+            })
+        else:
+            text = attach.extract_text(meta["path"], meta["mime_type"])
+            if text.strip():
+                doc_sections.append(f"\n\n--- Attached file: {meta['name']} ---\n{text[:attach.MAX_DOC_CHARS]}")
+            else:
+                doc_sections.append(f"\n\n--- Attached file: {meta['name']} (could not extract text) ---")
+
+    message_for_llm = req.message + "".join(doc_sections)
+    vision_warning = ""
+    llm_image_parts = None  # passed to the CEO only when its own model can see
+
+    if image_parts:
+        if can_see:
+            # CEO's own model is multimodal — send images natively.
+            llm_image_parts = image_parts
+        else:
+            # CEO's model can't see images. If it's on Ollama Cloud, transparently
+            # decode the image(s) with a cloud vision model and inject the
+            # description as text — no need for the user to switch models.
+            adapter = getattr(ceo, "_adapter", None)
+            is_ollama_cloud = (
+                provider == "ollama" and getattr(adapter, "_cloud", False)
+            )
+            described = ""
+            if is_ollama_cloud and adapter is not None:
+                for vmodel in attach.OLLAMA_CLOUD_VISION_MODELS:
+                    described = await attach.describe_images(
+                        adapter, image_parts, vmodel, prompt_hint=req.message
+                    )
+                    if described.strip():
+                        logger.info("[chat] Decoded %d image(s) via Ollama Cloud vision model '%s'",
+                                    len(image_parts), vmodel)
+                        break
+            if described.strip():
+                message_for_llm += (
+                    f"\n\n--- Image analysis (auto-decoded by a vision model) ---\n{described}"
+                )
+            else:
+                vision_warning = attach.vision_unsupported_message(provider, model)
+                message_for_llm += (
+                    f"\n\n[Note: {len(image_parts)} image(s) were attached but the current model cannot view them.]"
+                )
+
+    user_msg_id = str(uuid.uuid4())
+    await database.save_message({
+        "id": user_msg_id,
+        "conversation_id": req.conversation_id,
+        "from_agent_id": "user",
+        "to_agent_id": ceo.config.id,
+        "content": req.message,
+        "role": "user",
+        "metadata": {"attachments": saved_meta} if saved_meta else {},
+    })
+
+    try:
+        response_content, executed_actions = await ceo.chat_with_context(
+            message_for_llm, image_parts=llm_image_parts
+        )
+    except Exception as e:
+        logger.error(f"CEO LLM call failed: {e}", exc_info=True)
+        raise HTTPException(502, f"CEO LLM call failed: {e}")
+
+    assistant_msg_id = str(uuid.uuid4())
+    await database.save_message({
+        "id": assistant_msg_id,
+        "conversation_id": req.conversation_id,
+        "from_agent_id": ceo.config.id,
+        "to_agent_id": "user",
+        "content": response_content,
+        "role": "assistant",
+        "metadata": {"actions": executed_actions} if executed_actions else {},
+    })
+
+    if not req.is_temporary:
+        first_msg = req.message[:80]
+        await database.update_conversation(req.conversation_id, first_msg)
+
+    # Strip JSON action block from the content shown to user
+    import re
+    display_content = _strip_ceo_json(response_content)
+    if vision_warning:
+        display_content = f"{vision_warning}\n\n{display_content}"
+
+    # Build human-readable action summaries
+    action_summaries = []
+    agents_by_id = {a.config.id: a.config.name for a in orchestrator.get_agents()}
+    for act in executed_actions:
+        atype = act.get("action", "")
+        status = act.get("status", "")
+        if status != "ok":
+            continue
+        if atype == "create_task":
+            agent_name = agents_by_id.get(act.get("agent_id", ""), act.get("agent", "agent"))
+            action_summaries.append(f"📋 Task created for **{agent_name}**")
+        elif atype == "delegate":
+            agent_name = agents_by_id.get(act.get("agent_id", ""), "agent")
+            action_summaries.append(f"💬 Message sent to **{agent_name}**")
+        elif atype in ("pause_task", "resume_task", "cancel_task"):
+            action_summaries.append(f"⏸️ Task {atype.replace('_task', '')}d")
+
+    return {
+        "id": assistant_msg_id,
+        "content": display_content,
+        "from_agent_id": ceo.config.id,
+        "role": "assistant",
+        "actions": executed_actions,
+        "action_summaries": action_summaries,
+    }
+
+
+# ── Uploaded attachment files ────────────────────────────────────────────────
+
+@router.get("/uploads/{conversation_id}/{filename}")
+async def get_upload(conversation_id: str, filename: str):
+    import os
+    import re as _re
+    from fastapi.responses import FileResponse
+
+    # Prevent path traversal — only allow plain filename/conversation segments.
+    safe_conv = _re.sub(r"[^A-Za-z0-9_-]", "_", conversation_id)
+    safe_name = os.path.basename(filename)
+    path = os.path.join(orchestrator.settings.data_dir, "uploads", safe_conv, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "File not found")
+    return FileResponse(path)
 
 
 # ── API Providers ────────────────────────────────────────────────────────────
@@ -613,3 +1089,111 @@ async def get_message_history(
     if from_agent and to_agent:
         return await database.get_agent_to_agent_messages(from_agent, to_agent, limit)
     return await database.get_messages(from_agent_id=from_agent, to_agent_id=to_agent, limit=limit)
+
+
+# ── MCP servers ───────────────────────────────────────────────────────────────
+
+class MCPServerBody(BaseModel):
+    name: str
+    transport: str = "stdio"            # 'stdio' | 'http' | 'sse'
+    command: str = ""
+    args: list[str] = []
+    env: dict[str, str] = {}
+    url: str = ""
+    headers: dict[str, str] = {}
+    auth: str = "none"                  # 'none' | 'oauth'
+    enabled: bool = True
+
+
+def _mcp_public(s: dict) -> dict:
+    """Server record + live connection status/tools."""
+    from ..mcp_manager import mcp_manager
+    status = mcp_manager.status_for(s["id"])
+    return {**s, "status": status.get("status", "disconnected"),
+            "error": status.get("error", ""),
+            "authorize_url": status.get("authorize_url", ""),
+            "tools": status.get("tools", [])}
+
+
+@router.get("/mcp/servers")
+async def list_mcp_servers():
+    servers = await database.get_all_mcp_servers()
+    return [_mcp_public(s) for s in servers]
+
+
+@router.post("/mcp/servers", status_code=201)
+async def create_mcp_server(req: MCPServerBody):
+    import uuid
+    from ..mcp_manager import mcp_manager
+    record = {"id": str(uuid.uuid4()), **req.model_dump()}
+    await database.save_mcp_server(record)
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)
+
+
+@router.put("/mcp/servers/{server_id}")
+async def update_mcp_server(server_id: str, req: MCPServerBody):
+    from ..mcp_manager import mcp_manager
+    existing = await database.get_mcp_server(server_id)
+    if not existing:
+        raise HTTPException(404, "MCP server not found")
+    record = {"id": server_id, **req.model_dump()}
+    await database.save_mcp_server(record)
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)
+
+
+@router.delete("/mcp/servers/{server_id}")
+async def delete_mcp_server(server_id: str):
+    from ..mcp_manager import mcp_manager
+    await mcp_manager.remove(server_id)
+    await database.clear_mcp_oauth(server_id)
+    await database.delete_mcp_server(server_id)
+    return {"ok": True}
+
+
+@router.post("/mcp/servers/{server_id}/refresh")
+async def refresh_mcp_server(server_id: str):
+    from ..mcp_manager import mcp_manager
+    record = await database.get_mcp_server(server_id)
+    if not record:
+        raise HTTPException(404, "MCP server not found")
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)
+
+
+@router.post("/mcp/servers/{server_id}/signout")
+async def signout_mcp_server(server_id: str):
+    """Forget stored OAuth tokens and disconnect (forces re-authorization)."""
+    from ..mcp_manager import mcp_manager
+    await mcp_manager.remove(server_id)
+    await database.clear_mcp_oauth(server_id)
+    return {"ok": True}
+
+
+@router.get("/mcp/oauth/callback")
+async def mcp_oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth redirect target. Resolves the pending flow and reconnects the server."""
+    from fastapi.responses import HTMLResponse
+    from ..mcp_oauth import resolve_callback
+
+    def page(title: str, msg: str, ok: bool) -> HTMLResponse:
+        colour = "#059669" if ok else "#DC2626"
+        return HTMLResponse(
+            f"""<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>
+            <style>body{{font-family:-apple-system,system-ui,sans-serif;display:flex;
+            height:100vh;margin:0;align-items:center;justify-content:center;background:#f9fafb}}
+            .card{{text-align:center;padding:2rem 2.5rem;background:#fff;border-radius:1rem;
+            box-shadow:0 1px 3px rgba(0,0,0,.1)}}h1{{color:{colour};font-size:1.1rem;margin:0 0 .5rem}}
+            p{{color:#6b7280;font-size:.85rem;margin:0}}</style></head>
+            <body><div class='card'><h1>{title}</h1><p>{msg}</p></div>
+            <script>setTimeout(()=>window.close(),2500)</script></body></html>"""
+        )
+
+    if error:
+        return page("Authorization failed", error, False)
+    if not code or not state:
+        return page("Authorization failed", "Missing code or state.", False)
+    if resolve_callback(state, code):
+        return page("Authorized ✓", "You can close this window and return to Takumi.", True)
+    return page("Authorization expired", "This request was not recognised. Please try connecting again.", False)

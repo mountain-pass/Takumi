@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import AsyncIterator
 import google.generativeai as genai
 from .base import BaseLLMAdapter, LLMResponse
+from ._content import to_gemini
 
 
 class GeminiAdapter(BaseLLMAdapter):
@@ -16,7 +17,7 @@ class GeminiAdapter(BaseLLMAdapter):
 
     def _to_gemini_messages(self, messages: list[dict]) -> list[dict]:
         role_map = {"user": "user", "assistant": "model"}
-        return [{"role": role_map.get(m["role"], "user"), "parts": [m["content"]]} for m in messages]
+        return [{"role": role_map.get(m["role"], "user"), "parts": to_gemini(m["content"])} for m in messages]
 
     async def complete(self, system_prompt, messages, model, max_tokens=2048, temperature=0.7) -> LLMResponse:
         m = self._get_model(model, system_prompt)

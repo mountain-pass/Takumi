@@ -178,9 +178,19 @@ function ProviderModelPicker({ form, set }) {
         <select
           className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 bg-white"
           value={form.api_provider_id || ''}
-          onChange={e => { set('api_provider_id', e.target.value); set('llm_model', '') }}>
+          onChange={e => {
+            const pid = e.target.value
+            const prov = llmProviders.find(p => p.id === pid)
+            set('api_provider_id', pid)
+            set('llm_model', '')
+            if (prov) set('llm_provider', prov.provider)
+          }}>
           <option value="">Select provider…</option>
-          {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          {llmProviders.map(p => (
+            <option key={p.id} value={p.id}>
+              {p.name} ({p.provider ? p.provider.charAt(0).toUpperCase() + p.provider.slice(1) : 'Unknown'})
+            </option>
+          ))}
         </select>
       </label>
       <label className="space-y-1">
@@ -204,12 +214,31 @@ function ProviderModelPicker({ form, set }) {
   )
 }
 
+const BUILTIN_SKILLS = [
+  { id: 'web_search', label: 'Web Search' },
+  { id: 'web_fetch', label: 'Web Fetch' },
+  { id: 'read_file', label: 'Read File' },
+  { id: 'write_file', label: 'Write File' },
+  { id: 'list_files', label: 'List Files' },
+  { id: 'run_shell', label: 'Run Shell' },
+]
+
 function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [mcpServers, setMcpServers] = useState([])
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+
+  useEffect(() => { setForm({ ...config }) }, [config.id])
+  useEffect(() => {
+    fetch('/api/mcp/servers').then(r => r.ok ? r.json() : []).then(setMcpServers).catch(() => {})
+  }, [])
+
+  const skills = form.skills || []
+  const toggleSkill = (id, on) =>
+    set('skills', on ? [...skills, id] : skills.filter(s => s !== id))
 
   async function handleSave() {
     setSaving(true)
@@ -266,6 +295,43 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider & Model</span>
           <ProviderModelPicker form={form} set={set} />
         </div>
+        <div className="block space-y-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Skills</span>
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-1">
+            {BUILTIN_SKILLS.map(s => (
+              <label key={s.id} className="flex items-center gap-1.5 cursor-pointer">
+                <input type="checkbox" checked={skills.includes(s.id)}
+                  onChange={e => toggleSkill(s.id, e.target.checked)}
+                  className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+                <span className="text-xs text-gray-700">{s.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {mcpServers.length > 0 && (
+          <div className="block space-y-1">
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">MCP Tools</span>
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-1">
+              {mcpServers.map(srv => {
+                const token = `mcp:${srv.id}`
+                const n = (srv.tools || []).length
+                return (
+                  <label key={srv.id} className="flex items-center gap-1.5 cursor-pointer">
+                    <input type="checkbox" checked={skills.includes(token)}
+                      onChange={e => toggleSkill(token, e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+                    <span className="text-xs text-gray-700">{srv.name}</span>
+                    <span className="text-[10px] text-gray-400">
+                      {srv.status === 'connected' ? `· ${n} tool${n === 1 ? '' : 's'}` : `· ${srv.status}`}
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
         <label className="block space-y-1">
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Avatar colour</span>
           <div className="flex gap-2 flex-wrap pt-1">
@@ -302,7 +368,7 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
 
 // ── Agent node ────────────────────────────────────────────────────────────────
 
-function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onPortMouseDown, onInPortMouseUp, onClick, onDoubleClick }) {
+function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onPortMouseDown, onInPortMouseUp, onClick, onDoubleClick, providers = [] }) {
   const { config } = agent
 
   return (
@@ -327,7 +393,7 @@ function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onP
     >
       {config.is_ceo && (
         <span className="absolute -top-2.5 left-3 text-[9px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-600 uppercase tracking-wide z-10">
-          CEO
+          Manager
         </span>
       )}
 
@@ -342,7 +408,15 @@ function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onP
         </div>
       </div>
       <div className="px-3 pb-3">
-        <span className="text-[10px] text-gray-300 font-mono truncate block">{config.llm_provider}/{config.llm_model}</span>
+        <span className="text-[10px] text-gray-300 font-mono truncate block">
+          {(() => {
+            const prov = providers.find(p => p.id === config.api_provider_id)
+            const provLabel = prov
+              ? `${prov.provider || config.llm_provider}`
+              : config.llm_provider
+            return `${provLabel}/${config.llm_model}`
+          })()}
+        </span>
       </div>
 
       {/* Input port — top */}
@@ -391,6 +465,7 @@ export default function OrganisationView() {
   // TanStack queries — cached, auto-refetched, invalidated on mutations
   const { data: agentsData = [] } = useAgents()
   const { data: connectionsData = [] } = useConnections()
+  const { data: allProviders = [] } = useProviders()
 
   // Also keep WS-driven agents for real-time status updates
   const wsAgents = useOrgStore(s => s.agents)
@@ -700,6 +775,7 @@ export default function OrganisationView() {
               <AgentNode
                 key={agent.config.id}
                 agent={agent}
+                providers={allProviders}
                 pos={positions[agent.config.id] || pos}
                 selected={selectedAgent?.config?.id === agent.config.id}
                 isConnectTarget={isConnectTarget}

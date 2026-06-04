@@ -426,7 +426,7 @@ function StepTeam({ onNext, onBack, llmProvider = 'ollama', llmModel = 'gemma3:4
       .then(r => r.json())
       .then(data => {
         setCeoReady(true)
-        setAgents([{ name: data.config?.name || 'CEO', role: data.config?.role || 'Chief Executive Officer', avatar_color: data.config?.avatar_color || '#DC2626' }])
+        setAgents([{ name: data.config?.name || 'Manager', role: data.config?.role || 'Manager', avatar_color: data.config?.avatar_color || '#DC2626' }])
       })
       .catch(() => setCeoReady(true))
   }, [])
@@ -447,7 +447,7 @@ function StepTeam({ onNext, onBack, llmProvider = 'ollama', llmModel = 'gemma3:4
     <div className="space-y-5">
       <div>
         <h2 className="text-2xl font-bold text-gray-900">Build your team</h2>
-        <p className="text-gray-500 mt-1">Add specialist agents. The CEO agent is already included.</p>
+        <p className="text-gray-500 mt-1">Add specialist agents. The Manager agent is already included.</p>
       </div>
 
       {/* Existing agents */}

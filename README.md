@@ -14,6 +14,14 @@ Run a full AI organisation on your machine. Each agent has a specific role, its 
 
 ---
 
+## Prerequisites
+
+- **Python 3.12+**
+- **Node.js 18+**
+- **Docker** — required for web search (SearXNG). Make sure Docker Desktop is running before starting Takumi.
+
+---
+
 ## Quick start
 
 ### Option A — one command (recommended)
@@ -23,7 +31,9 @@ chmod +x start.sh
 ./start.sh
 ```
 
-This creates the Python venv, installs all dependencies, and starts both servers.
+This starts SearXNG (web search), creates the Python venv, installs all dependencies, and launches both servers.
+
+> **Note:** Docker Desktop must be running first. If Docker is not available, Takumi still works but agents won't be able to search the web.
 
 ### Option B — manual (run each in a separate terminal)
 
@@ -50,6 +60,12 @@ npm install
 
 # Start the dev server
 npm run dev
+```
+
+**Terminal 3 — SearXNG (web search engine)**
+
+```bash
+docker compose up -d
 ```
 
 Open **http://localhost:5173** in your browser.
@@ -96,9 +112,14 @@ Keys can also be entered through the setup wizard — no `.env` file required.
 
 ```
 takumi/
+├── docker-compose.yml            # SearXNG search engine
+├── searxng/                      # SearXNG config
+│   ├── settings.yml
+│   └── limiter.toml
 ├── backend/                      # Python / FastAPI
 │   ├── main.py                   # FastAPI app + WebSocket
 │   ├── orchestrator.py           # 24/7 engine, agent lifecycle
+│   ├── task_scheduler.py         # Recurring task scheduler
 │   ├── runtime_settings.py       # Mutable org/LLM config (persisted to data/)
 │   ├── config.py                 # Env-var settings (pydantic-settings)
 │   ├── models.py                 # Pydantic data models
@@ -107,6 +128,9 @@ takumi/
 │   ├── agents/
 │   │   ├── base_agent.py         # Base class all agents extend
 │   │   └── ceo_agent.py          # CEO — delegates tasks to specialists
+│   ├── skills/                   # Agent skills (tools)
+│   │   ├── registry.py           # Skill registry + tools prompt builder
+│   │   └── web_search.py         # web_search & web_fetch via SearXNG
 │   ├── llm_adapters/             # One adapter per provider
 │   │   ├── anthropic_adapter.py
 │   │   ├── openai_adapter.py

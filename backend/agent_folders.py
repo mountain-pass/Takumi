@@ -20,11 +20,16 @@ def agent_dir(data_dir: str, agent_name: str) -> Path:
     return agents_root(data_dir) / _slugify(agent_name)
 
 
-def ensure_agent_folder(data_dir: str, agent_name: str, agent_role: str = "", agent_description: str = "") -> Path:
+def ensure_agent_folder(data_dir: str, agent_name: str, agent_role: str = "",
+                        agent_description: str = "", system_prompt: str = "") -> Path:
     d = agent_dir(data_dir, agent_name)
     d.mkdir(parents=True, exist_ok=True)
 
-    _write_if_missing(d / "agent.md", f"# {agent_name}\n\n**Role:** {agent_role}\n\n**Description:** {agent_description}\n")
+    agent_md = f"# {agent_name}\n\n**Role:** {agent_role}\n\n**Description:** {agent_description}\n"
+    if system_prompt:
+        agent_md += f"\n---\n\n## System Prompt\n\n{system_prompt}\n"
+    (d / "agent.md").write_text(agent_md)
+
     _write_if_missing(d / "soul.md", f"# Soul — {agent_name}\n\nCore identity, values, and personality traits.\n")
     _write_if_missing(d / "memory.md", f"# Memory — {agent_name}\n\nPersistent memories and learned context.\n")
     _write_if_missing(d / "skills.md", f"# Skills — {agent_name}\n\nCapabilities and tools this agent can use.\n")

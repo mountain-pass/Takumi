@@ -82,6 +82,9 @@ export default function SystemSettingsView() {
     try {
       await saveOrgMut.mutateAsync({ org_name: orgName, org_description: orgDesc })
       await saveLLMMut.mutateAsync({ llm_provider: providerId, llm_api_key: apiKey, llm_base_url: baseUrl, llm_model: model })
+      // Refresh the Zustand store so the sidebar (which reads orgName from the
+      // store) picks up the new name/description immediately.
+      await fetchOrg()
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (e) {

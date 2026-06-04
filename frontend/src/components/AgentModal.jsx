@@ -1,7 +1,7 @@
 /**
  * AgentModal — create a new agent or view agent details.
  */
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
@@ -23,9 +23,18 @@ export default function AgentModal({ onClose }) {
     api_provider_id: '',
     llm_model: '',
     avatar_color: '#4F46E5',
+    skills: ['web_search', 'web_fetch'],
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [mcpServers, setMcpServers] = useState([])
+
+  useEffect(() => {
+    fetch('/api/mcp/servers')
+      .then(r => r.ok ? r.json() : [])
+      .then(setMcpServers)
+      .catch(() => {})
+  }, [])
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
@@ -53,11 +62,12 @@ export default function AgentModal({ onClose }) {
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={onClose}>
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 space-y-4"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col"
         onClick={e => e.stopPropagation()}
       >
-        <h2 className="text-lg font-bold text-gray-900">Add Agent</h2>
+        <h2 className="text-lg font-bold text-gray-900 px-6 pt-6 pb-4 border-b border-gray-100 shrink-0">Add Agent</h2>
 
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
         <div className="grid grid-cols-2 gap-3">
           <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Name *</span>
@@ -106,10 +116,20 @@ export default function AgentModal({ onClose }) {
               <select
                 className="input"
                 value={form.api_provider_id}
-                onChange={e => { set('api_provider_id', e.target.value); set('llm_model', '') }}
+                onChange={e => {
+                  const pid = e.target.value
+                  const prov = llmProviders.find(p => p.id === pid)
+                  set('api_provider_id', pid)
+                  set('llm_model', '')
+                  if (prov) set('llm_provider', prov.provider)
+                }}
               >
                 <option value="">Select provider…</option>
-                {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                {llmProviders.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.provider ? p.provider.charAt(0).toUpperCase() + p.provider.slice(1) : 'Unknown'})
+                  </option>
+                ))}
               </select>
             ) : (
               <div className="flex items-center gap-2">
@@ -142,6 +162,68 @@ export default function AgentModal({ onClose }) {
             )}
           </label>
 
+          {/* Skills */}
+          <div className="space-y-1 col-span-2">
+            <span className="text-xs font-medium text-gray-500">Skills</span>
+            <div className="flex flex-wrap gap-3 pt-1">
+              {[
+                { id: 'web_search', label: 'Web Search', desc: 'Search the internet' },
+                { id: 'web_fetch', label: 'Web Fetch', desc: 'Read web pages' },
+                { id: 'read_file', label: 'Read File', desc: 'Read local files' },
+                { id: 'write_file', label: 'Write File', desc: 'Create/edit files' },
+                { id: 'list_files', label: 'List Files', desc: 'Browse directories' },
+                { id: 'run_shell', label: 'Run Shell', desc: 'Execute commands' },
+              ].map(skill => (
+                <label key={skill.id} className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.skills.includes(skill.id)}
+                    onChange={e => {
+                      if (e.target.checked) {
+                        set('skills', [...form.skills, skill.id])
+                      } else {
+                        set('skills', form.skills.filter(s => s !== skill.id))
+                      }
+                    }}
+                    className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span className="text-xs text-gray-700">{skill.label}</span>
+                  <span className="text-[10px] text-gray-400">— {skill.desc}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* MCP servers (per-server access) */}
+          {mcpServers.length > 0 && (
+            <div className="space-y-1 col-span-2">
+              <span className="text-xs font-medium text-gray-500">MCP Tools</span>
+              <div className="flex flex-wrap gap-3 pt-1">
+                {mcpServers.map(srv => {
+                  const token = `mcp:${srv.id}`
+                  const toolCount = (srv.tools || []).length
+                  return (
+                    <label key={srv.id} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={form.skills.includes(token)}
+                        onChange={e => {
+                          if (e.target.checked) set('skills', [...form.skills, token])
+                          else set('skills', form.skills.filter(s => s !== token))
+                        }}
+                        className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span className="text-xs text-gray-700">{srv.name}</span>
+                      <span className="text-[10px] text-gray-400">
+                        — {srv.status === 'connected' ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : srv.status}
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
           <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Colour</span>
             <div className="flex gap-2 flex-wrap pt-1">
@@ -158,7 +240,10 @@ export default function AgentModal({ onClose }) {
           </label>
         </div>
 
-        <div className="flex gap-3 pt-2">
+          {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
+        </div>
+
+        <div className="flex gap-3 px-6 py-4 border-t border-gray-100 shrink-0">
           <button onClick={onClose} className="flex-1 border border-gray-200 rounded-xl py-2 text-sm hover:bg-gray-50">
             Cancel
           </button>
@@ -170,8 +255,6 @@ export default function AgentModal({ onClose }) {
             {saving ? 'Adding…' : 'Add Agent'}
           </button>
         </div>
-
-        {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
       </div>
 
       <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; background: white; } .input:focus { border-color: #6366f1; }`}</style>

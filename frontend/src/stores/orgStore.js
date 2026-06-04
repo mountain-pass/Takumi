@@ -112,6 +112,16 @@ export const useOrgStore = create((set, get) => ({
           ? s.tasks.map(t => t.id === payload.id ? payload : t)
           : [...s.tasks, payload]
       }))
+    } else if (type === 'task_completed') {
+      // CEO synthesized results — push to chat as a live message
+      const msg = {
+        id: `tc-${Date.now()}`,
+        role: 'assistant',
+        content: payload.message,
+        timestamp: new Date().toISOString(),
+        isTaskResult: true,
+      }
+      set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), msg] }))
     } else if (type === 'agent_added') {
       // Reload agents list
       get().fetchAgents()

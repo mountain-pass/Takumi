@@ -5,7 +5,7 @@ import React, { useEffect, useState } from 'react'
 import {
   MessageSquare,
   CalendarClock,
-  ShoppingBag,
+  Plug,
   GitBranch,
   Building2,
   KeyRound,
@@ -17,7 +17,7 @@ import {
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
-import AgentDetailPanel from './components/AgentDetailPanel'
+// AgentDetailPanel removed — agent details now shown in Office right pane
 import TopBar from './components/TopBar'
 
 // Views
@@ -36,7 +36,7 @@ import OrganisationView from './components/OrganisationView'
 const PRIMARY_NAV = [
   { id: 'chat',        icon: MessageSquare, label: 'Chat' },
   { id: 'cron',        icon: CalendarClock, label: 'Scheduled Jobs' },
-  { id: 'skills',      icon: ShoppingBag,   label: 'Skill Marketplace' },
+  { id: 'skills',      icon: Plug,          label: 'MCP Servers' },
   { id: 'workflows',   icon: GitBranch,     label: 'Workflows' },
 ]
 
@@ -99,7 +99,6 @@ export default function App() {
   const fetchOrg = useOrgStore(s => s.fetchOrg)
   const setupDone = useOrgStore(s => s.setupDone)
   const orgName = useOrgStore(s => s.orgName)
-  const selectedAgentId = useOrgStore(s => s.selectedAgentId)
   const pendingNav = useOrgStore(s => s.pendingNav)
   const clearNav = useOrgStore(s => s.clearNav)
 
@@ -180,15 +179,13 @@ export default function App() {
       </aside>
 
       {/* ── Main content ── */}
-      <div className={`flex-1 flex flex-col overflow-hidden transition-all ${selectedAgentId ? 'mr-80' : ''}`}>
+      <div className={`flex-1 flex flex-col overflow-hidden transition-all`}>
         <TopBar />
         <main className="flex-1 overflow-hidden">
           {VIEW_MAP[tab]}
         </main>
       </div>
 
-      {/* Agent detail panel (Office only) */}
-      {selectedAgentId && <AgentDetailPanel />}
 
     </div>
   )
