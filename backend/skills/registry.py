@@ -6,6 +6,8 @@ from __future__ import annotations
 from typing import Callable, Any
 
 from .web_search import web_search, web_fetch
+from .files import read_file, write_file, list_files
+from .shell import run_shell
 
 
 # Each skill: { name, description, parameters (for the LLM prompt), callable }
@@ -21,6 +23,30 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "description": "Fetch and read the text content of a web page given its URL.",
         "parameters": {"url": "The full URL to fetch", "max_chars": "(optional) Max characters to return, default 5000"},
         "callable": web_fetch,
+    },
+    "read_file": {
+        "name": "read_file",
+        "description": "Read the contents of a text file on the local filesystem.",
+        "parameters": {"path": "Absolute or relative file path", "max_chars": "(optional) Max characters to return"},
+        "callable": read_file,
+    },
+    "write_file": {
+        "name": "write_file",
+        "description": "Write text to a file (creates parent folders). Use to save output or create files.",
+        "parameters": {"path": "Destination file path", "content": "Text to write", "mode": "(optional) 'overwrite' (default) or 'append'"},
+        "callable": write_file,
+    },
+    "list_files": {
+        "name": "list_files",
+        "description": "List the files and folders in a directory.",
+        "parameters": {"path": "(optional) Directory path, default current directory"},
+        "callable": list_files,
+    },
+    "run_shell": {
+        "name": "run_shell",
+        "description": "Run a shell command and return its stdout/stderr and exit code. Use for builds, scripts, git, file ops, etc.",
+        "parameters": {"command": "The shell command to run", "timeout": "(optional) Seconds before timeout, default 60", "cwd": "(optional) Working directory"},
+        "callable": run_shell,
     },
 }
 
