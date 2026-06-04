@@ -332,6 +332,28 @@ async def delete_agent(agent_id: str) -> None:
     await _conn().commit()
 
 
+async def migrate_rename_ceo() -> None:
+    """One-time: rename the lead agent from the old 'CEO' default to 'Manager'.
+
+    Guarded by a setting flag so it only relabels the default and won't override
+    a name the user later chooses.
+    """
+    if await get_setting("_ceo_renamed") == "1":
+        return
+    await _conn().execute(
+        """UPDATE agents
+              SET name = 'Manager'
+            WHERE is_ceo = 1 AND name = 'CEO'""",
+    )
+    await _conn().execute(
+        """UPDATE agents
+              SET role = 'Manager'
+            WHERE is_ceo = 1 AND role = 'Chief Executive Officer'""",
+    )
+    await _conn().commit()
+    await set_setting("_ceo_renamed", "1")
+
+
 # ── MCP servers ───────────────────────────────────────────────────────────────
 
 def _row_to_mcp(r) -> dict:

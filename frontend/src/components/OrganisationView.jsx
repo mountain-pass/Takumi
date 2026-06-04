@@ -393,7 +393,7 @@ function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onP
     >
       {config.is_ceo && (
         <span className="absolute -top-2.5 left-3 text-[9px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-600 uppercase tracking-wide z-10">
-          CEO
+          Manager
         </span>
       )}
 
