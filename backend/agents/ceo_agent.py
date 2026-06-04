@@ -4,6 +4,7 @@ Receives tasks from the user, breaks them down, and delegates to specialist agen
 Can create/pause/cancel tasks for connected agents via structured actions in its responses.
 """
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -329,10 +330,15 @@ class CEOAgent(BaseAgent):
                 "The following delegated tasks just completed. Report their results to the "
                 f"user:\n{results_text}"
             )
-            synthesis = await self._adapter.complete(
-                system_prompt=synth_system,
-                messages=[{"role": "user", "content": synth_user}],
-                model=self.config.llm_model,
+            # Hard timeout so a hung LLM call can never leave the Manager stuck
+            # showing "Synthesizing results..." indefinitely.
+            synthesis = await asyncio.wait_for(
+                self._adapter.complete(
+                    system_prompt=synth_system,
+                    messages=[{"role": "user", "content": synth_user}],
+                    model=self.config.llm_model,
+                ),
+                timeout=120,
             )
             self.state.token_count += synthesis.input_tokens + synthesis.output_tokens
 
