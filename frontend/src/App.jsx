@@ -5,7 +5,7 @@ import React, { useEffect, useState } from 'react'
 import {
   MessageSquare,
   CalendarClock,
-  ShoppingBag,
+  Plug,
   GitBranch,
   Building2,
   KeyRound,
@@ -36,7 +36,7 @@ import OrganisationView from './components/OrganisationView'
 const PRIMARY_NAV = [
   { id: 'chat',        icon: MessageSquare, label: 'Chat' },
   { id: 'cron',        icon: CalendarClock, label: 'Scheduled Jobs' },
-  { id: 'skills',      icon: ShoppingBag,   label: 'Skill Marketplace' },
+  { id: 'skills',      icon: Plug,          label: 'MCP Servers' },
   { id: 'workflows',   icon: GitBranch,     label: 'Workflows' },
 ]
 
