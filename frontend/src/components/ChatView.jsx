@@ -484,7 +484,7 @@ function ChatBubble({ message }) {
   const attachments = message.attachments || []
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
       <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
         isUser
           ? 'bg-indigo-600 text-white rounded-br-md'
@@ -531,8 +531,20 @@ function ChatBubble({ message }) {
           </div>
         )}
       </div>
+      {message.created_at && (
+        <span className="text-[10px] text-gray-400 mt-1 px-1">{formatTimestamp(message.created_at)}</span>
+      )}
     </div>
   )
+}
+
+function formatTimestamp(ts) {
+  const d = new Date(ts)
+  if (isNaN(d)) return ''
+  const now = new Date()
+  const sameDay = d.toDateString() === now.toDateString()
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  return sameDay ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`
 }
 
 function MarkdownContent({ text }) {
