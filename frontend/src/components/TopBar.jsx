@@ -117,7 +117,7 @@ export default function TopBar() {
       id: '1',
       type: 'alert',
       title: 'Action required: Review agent response',
-      body: 'The CEO agent is waiting for your approval before proceeding.',
+      body: 'The Manager agent is waiting for your approval before proceeding.',
       action: 'Review now',
       time: 'Just now',
     },

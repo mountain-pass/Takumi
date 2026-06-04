@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI):
     runtime_settings.init(settings.data_dir, env_settings=settings)
     await database.init(settings.data_dir)
     await database.migrate_from_json(settings.data_dir)
+    await database.migrate_rename_ceo()
     # Restore persisted settings from SQLite into runtime state
     db_settings = await database.get_all_settings()
     if db_settings:

@@ -238,5 +238,5 @@ def vision_unsupported_message(provider: str, model: str) -> str:
         "please configure a vision-capable model — for example Claude (Anthropic), "
         "GPT-4o (OpenAI), Gemini, or an Ollama Cloud vision model such as "
         "`gemma3:27b-cloud` or `llama3.2-vision` (add the provider's API key under "
-        "**Settings → API**, then set it on the CEO agent)."
+        "**Settings → API**, then set it on the Manager agent)."
     )

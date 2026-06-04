@@ -270,7 +270,7 @@ export default function ChatView() {
               {sending && (
                 <div className="flex items-center gap-2 text-gray-400 text-sm px-4">
                   <Loader2 size={14} className="animate-spin" />
-                  CEO is thinking…
+                  Manager is thinking…
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -402,7 +402,7 @@ function InputBar({ inputRef, input, setInput, handleKeyDown, handleSend, sendin
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={onPaste}
-            placeholder={temporary ? 'Temporary chat — not saved to history' : 'Message CEO…'}
+            placeholder={temporary ? 'Temporary chat — not saved to history' : 'Message Manager…'}
             rows={1}
             className="flex-1 bg-transparent resize-none outline-none text-sm py-1.5 max-h-32 placeholder:text-gray-400"
             style={{ height: 'auto', minHeight: '24px' }}
@@ -437,7 +437,7 @@ function WelcomeScreen({ orgName, temporary, inputBar }) {
           What's next{orgName ? `, ${orgName}` : ''}?
         </h1>
         <p className="text-sm text-gray-400 max-w-md mx-auto">
-          Chat with your CEO agent. They'll coordinate with your team to get things done.
+          Chat with your Manager agent. They'll coordinate with your team to get things done.
         </p>
         {temporary && (
           <div className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-700 bg-amber-50 rounded-full border border-amber-200">
@@ -491,7 +491,7 @@ function ChatBubble({ message }) {
           : 'bg-gray-100 text-gray-800 rounded-bl-md'
       }`}>
         {!isUser && (
-          <span className="text-[10px] font-semibold text-indigo-500 uppercase tracking-wide block mb-1">CEO</span>
+          <span className="text-[10px] font-semibold text-indigo-500 uppercase tracking-wide block mb-1">Manager</span>
         )}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">

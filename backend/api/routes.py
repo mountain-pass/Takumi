@@ -139,7 +139,7 @@ async def delete_agent(agent_id: str):
     if not agent:
         raise HTTPException(404, "Agent not found")
     if agent.config.is_ceo:
-        raise HTTPException(400, "Cannot remove the CEO agent")
+        raise HTTPException(400, "Cannot remove the Manager agent")
     await orchestrator.remove_agent(agent_id)
     return {"ok": True}
 
@@ -694,7 +694,7 @@ async def chat_send(req: ChatSendRequest):
 
     ceo = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
     if not ceo:
-        raise HTTPException(400, "No CEO agent available")
+        raise HTTPException(400, "No Manager agent available")
 
     provider = ceo.config.llm_provider.value if hasattr(ceo.config.llm_provider, "value") else str(ceo.config.llm_provider)
     model = ceo.config.llm_model

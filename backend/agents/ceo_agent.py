@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CEO_SYSTEM_PROMPT = """You are the CEO of an AI organisation. You manage a team of specialist agents and delegate work to them.
+CEO_SYSTEM_PROMPT = """You are the Manager of an AI organisation. You manage a team of specialist agents and delegate work to them.
 
 ## Your capabilities
 
@@ -719,7 +719,7 @@ class CEOAgent(BaseAgent):
                     f"\n\nIMPORTANT — HANDOFF: When you finish, your output is a "
                     f"prerequisite for {downstream_name}'s task "
                     f"(\"{upstream_title}\" → \"{task.get('title','')}\"). "
-                    f"Report your complete findings back to the CEO; the CEO will "
+                    f"Report your complete findings back to the Manager; the Manager will "
                     f"forward them to {downstream_name} so they can continue."
                 )
                 upstream_instruction = other_task.get("instruction", "")
@@ -884,8 +884,8 @@ class CEOAgent(BaseAgent):
 
 def make_ceo_config() -> AgentConfig:
     return AgentConfig(
-        name="CEO",
-        role="Chief Executive Officer",
+        name="Manager",
+        role="Manager",
         description="Orchestrates the organisation: breaks down tasks, delegates to specialists, synthesises results.",
         system_prompt=CEO_SYSTEM_PROMPT,
         llm_provider=LLMProvider.ANTHROPIC,
