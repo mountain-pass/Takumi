@@ -55,6 +55,32 @@ def get_skill(name: str) -> dict | None:
     return SKILL_REGISTRY.get(name)
 
 
+def mcp_server_ids(skill_names: list[str]) -> list[str]:
+    """Extract MCP server ids an agent has been granted (tokens 'mcp:<id>')."""
+    return [n.split(":", 1)[1] for n in skill_names if n.startswith("mcp:") and ":" in n]
+
+
+def build_mcp_tools_prompt(skill_names: list[str]) -> str:
+    """Build the tools section for any MCP servers granted to this agent."""
+    from ..mcp_manager import mcp_manager
+    server_ids = mcp_server_ids(skill_names)
+    if not server_ids:
+        return ""
+    lines: list[str] = []
+    for sid in server_ids:
+        status = mcp_manager.status_for(sid)
+        tools = status.get("tools", [])
+        if not tools:
+            continue
+        name = status.get("slug", sid)
+        lines.append(f"\n#### MCP server: {name} ({status.get('status', '')})")
+        for t in tools:
+            lines.append(f'- **{t["full_name"]}**: {t["description"]}')
+    if not lines:
+        return ""
+    return "\n".join(["\n### MCP tools (call exactly like other tools, by full name):", *lines])
+
+
 def get_skills_for_agent(skill_names: list[str]) -> list[dict]:
     """Get skill definitions for skills an agent has access to."""
     return [SKILL_REGISTRY[n] for n in skill_names if n in SKILL_REGISTRY]
@@ -63,7 +89,8 @@ def get_skills_for_agent(skill_names: list[str]) -> list[dict]:
 def build_tools_prompt(skill_names: list[str]) -> str:
     """Build the tools section for an agent's system prompt."""
     skills = get_skills_for_agent(skill_names)
-    if not skills:
+    mcp_section = build_mcp_tools_prompt(skill_names)
+    if not skills and not mcp_section:
         return ""
     lines = ["\n\n## Available Tools"]
     lines.append("")
@@ -92,6 +119,8 @@ def build_tools_prompt(skill_names: list[str]) -> str:
         params = ", ".join(f'"{k}": {v}' for k, v in s["parameters"].items())
         lines.append(f'- **{s["name"]}**: {s["description"]}')
         lines.append(f'  Parameters: {{{params}}}')
+    if mcp_section:
+        lines.append(mcp_section)
     lines.append("")
     lines.append("### Search best practices:")
     lines.append("- Your training data is OUTDATED. For ANY factual information (dates, prices, valuations, news, company info, market data), you MUST use web_search first. NEVER answer from memory.")

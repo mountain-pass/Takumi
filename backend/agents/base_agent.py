@@ -421,7 +421,20 @@ class BaseAgent:
 
     async def _execute_tool(self, name: str, arguments: dict) -> str:
         """Execute a registered skill/tool and return its result."""
-        from ..skills.registry import get_skill
+        from ..skills.registry import get_skill, mcp_server_ids
+
+        # MCP tools are namespaced 'mcp__<slug>__<tool>'. Verify the agent has been
+        # granted the owning server, then route to the MCP manager.
+        if name.startswith("mcp__"):
+            from ..mcp_manager import mcp_manager
+            match = mcp_manager.find_tool(name)
+            if not match:
+                return f"Error: MCP tool '{name}' not found or its server is offline."
+            server_id, _ = match
+            if server_id not in mcp_server_ids(self.config.skills):
+                return f"Error: You don't have access to MCP tool '{name}'"
+            return await mcp_manager.call_tool(name, arguments)
+
         skill = get_skill(name)
         if not skill:
             return f"Error: Unknown tool '{name}'"

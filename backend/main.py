@@ -71,6 +71,12 @@ async def lifespan(app: FastAPI):
             runtime_settings.update(patch)
     orchestrator.set_ws_broadcast(manager.broadcast)
     await orchestrator.start()
+    # Connect to configured MCP servers (non-fatal if any fail).
+    try:
+        from .mcp_manager import mcp_manager
+        await mcp_manager.start()
+    except Exception as e:
+        logger.error("MCP manager failed to start: %s", e)
     # Restore canvas positions from DB into agent configs
     db_agents = await database.get_all_agents()
     pos_map = {a["id"]: (a.get("canvas_x", 0), a.get("canvas_y", 0)) for a in db_agents}
@@ -81,6 +87,11 @@ async def lifespan(app: FastAPI):
             agent.config.canvas_y = cy
     logger.info(f"Takumi backend running on {settings.host}:{settings.port}")
     yield
+    try:
+        from .mcp_manager import mcp_manager
+        await mcp_manager.stop()
+    except Exception:
+        pass
     await orchestrator.stop()
     await database.close()
 
