@@ -1089,3 +1089,70 @@ async def get_message_history(
     if from_agent and to_agent:
         return await database.get_agent_to_agent_messages(from_agent, to_agent, limit)
     return await database.get_messages(from_agent_id=from_agent, to_agent_id=to_agent, limit=limit)
+
+
+# ── MCP servers ───────────────────────────────────────────────────────────────
+
+class MCPServerBody(BaseModel):
+    name: str
+    transport: str = "stdio"            # 'stdio' | 'http' | 'sse'
+    command: str = ""
+    args: list[str] = []
+    env: dict[str, str] = {}
+    url: str = ""
+    headers: dict[str, str] = {}
+    enabled: bool = True
+
+
+def _mcp_public(s: dict) -> dict:
+    """Server record + live connection status/tools."""
+    from ..mcp_manager import mcp_manager
+    status = mcp_manager.status_for(s["id"])
+    return {**s, "status": status.get("status", "disconnected"),
+            "error": status.get("error", ""), "tools": status.get("tools", [])}
+
+
+@router.get("/mcp/servers")
+async def list_mcp_servers():
+    servers = await database.get_all_mcp_servers()
+    return [_mcp_public(s) for s in servers]
+
+
+@router.post("/mcp/servers", status_code=201)
+async def create_mcp_server(req: MCPServerBody):
+    import uuid
+    from ..mcp_manager import mcp_manager
+    record = {"id": str(uuid.uuid4()), **req.model_dump()}
+    await database.save_mcp_server(record)
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)
+
+
+@router.put("/mcp/servers/{server_id}")
+async def update_mcp_server(server_id: str, req: MCPServerBody):
+    from ..mcp_manager import mcp_manager
+    existing = await database.get_mcp_server(server_id)
+    if not existing:
+        raise HTTPException(404, "MCP server not found")
+    record = {"id": server_id, **req.model_dump()}
+    await database.save_mcp_server(record)
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)
+
+
+@router.delete("/mcp/servers/{server_id}")
+async def delete_mcp_server(server_id: str):
+    from ..mcp_manager import mcp_manager
+    await mcp_manager.remove(server_id)
+    await database.delete_mcp_server(server_id)
+    return {"ok": True}
+
+
+@router.post("/mcp/servers/{server_id}/refresh")
+async def refresh_mcp_server(server_id: str):
+    from ..mcp_manager import mcp_manager
+    record = await database.get_mcp_server(server_id)
+    if not record:
+        raise HTTPException(404, "MCP server not found")
+    await mcp_manager.refresh(record)
+    return _mcp_public(record)

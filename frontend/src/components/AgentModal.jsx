@@ -1,7 +1,7 @@
 /**
  * AgentModal — create a new agent or view agent details.
  */
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Pencil } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
@@ -27,6 +27,14 @@ export default function AgentModal({ onClose }) {
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [mcpServers, setMcpServers] = useState([])
+
+  useEffect(() => {
+    fetch('/api/mcp/servers')
+      .then(r => r.ok ? r.json() : [])
+      .then(setMcpServers)
+      .catch(() => {})
+  }, [])
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
@@ -184,6 +192,36 @@ export default function AgentModal({ onClose }) {
               ))}
             </div>
           </div>
+
+          {/* MCP servers (per-server access) */}
+          {mcpServers.length > 0 && (
+            <div className="space-y-1 col-span-2">
+              <span className="text-xs font-medium text-gray-500">MCP Tools</span>
+              <div className="flex flex-wrap gap-3 pt-1">
+                {mcpServers.map(srv => {
+                  const token = `mcp:${srv.id}`
+                  const toolCount = (srv.tools || []).length
+                  return (
+                    <label key={srv.id} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={form.skills.includes(token)}
+                        onChange={e => {
+                          if (e.target.checked) set('skills', [...form.skills, token])
+                          else set('skills', form.skills.filter(s => s !== token))
+                        }}
+                        className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span className="text-xs text-gray-700">{srv.name}</span>
+                      <span className="text-[10px] text-gray-400">
+                        — {srv.status === 'connected' ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : srv.status}
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
 
           <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Colour</span>

@@ -214,12 +214,31 @@ function ProviderModelPicker({ form, set }) {
   )
 }
 
+const BUILTIN_SKILLS = [
+  { id: 'web_search', label: 'Web Search' },
+  { id: 'web_fetch', label: 'Web Fetch' },
+  { id: 'read_file', label: 'Read File' },
+  { id: 'write_file', label: 'Write File' },
+  { id: 'list_files', label: 'List Files' },
+  { id: 'run_shell', label: 'Run Shell' },
+]
+
 function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [mcpServers, setMcpServers] = useState([])
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+
+  useEffect(() => { setForm({ ...config }) }, [config.id])
+  useEffect(() => {
+    fetch('/api/mcp/servers').then(r => r.ok ? r.json() : []).then(setMcpServers).catch(() => {})
+  }, [])
+
+  const skills = form.skills || []
+  const toggleSkill = (id, on) =>
+    set('skills', on ? [...skills, id] : skills.filter(s => s !== id))
 
   async function handleSave() {
     setSaving(true)
@@ -276,6 +295,43 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Provider & Model</span>
           <ProviderModelPicker form={form} set={set} />
         </div>
+        <div className="block space-y-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Skills</span>
+          <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-1">
+            {BUILTIN_SKILLS.map(s => (
+              <label key={s.id} className="flex items-center gap-1.5 cursor-pointer">
+                <input type="checkbox" checked={skills.includes(s.id)}
+                  onChange={e => toggleSkill(s.id, e.target.checked)}
+                  className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+                <span className="text-xs text-gray-700">{s.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {mcpServers.length > 0 && (
+          <div className="block space-y-1">
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">MCP Tools</span>
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-1">
+              {mcpServers.map(srv => {
+                const token = `mcp:${srv.id}`
+                const n = (srv.tools || []).length
+                return (
+                  <label key={srv.id} className="flex items-center gap-1.5 cursor-pointer">
+                    <input type="checkbox" checked={skills.includes(token)}
+                      onChange={e => toggleSkill(token, e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+                    <span className="text-xs text-gray-700">{srv.name}</span>
+                    <span className="text-[10px] text-gray-400">
+                      {srv.status === 'connected' ? `· ${n} tool${n === 1 ? '' : 's'}` : `· ${srv.status}`}
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
         <label className="block space-y-1">
           <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Avatar colour</span>
           <div className="flex gap-2 flex-wrap pt-1">

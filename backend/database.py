@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS agent_connections (
     UNIQUE(from_id, to_id)
 );
 
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    transport  TEXT NOT NULL DEFAULT 'stdio',   -- 'stdio' | 'http' | 'sse'
+    command    TEXT NOT NULL DEFAULT '',         -- stdio: executable
+    args       TEXT NOT NULL DEFAULT '[]',       -- stdio: JSON array
+    env        TEXT NOT NULL DEFAULT '{}',       -- stdio: JSON object
+    url        TEXT NOT NULL DEFAULT '',          -- http/sse: server URL
+    headers    TEXT NOT NULL DEFAULT '{}',        -- http/sse: JSON object
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id           TEXT PRIMARY KEY,
     title        TEXT NOT NULL DEFAULT 'New conversation',
@@ -316,6 +329,54 @@ async def get_all_agents() -> list[dict]:
 
 async def delete_agent(agent_id: str) -> None:
     await _conn().execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+    await _conn().commit()
+
+
+# ── MCP servers ───────────────────────────────────────────────────────────────
+
+def _row_to_mcp(r) -> dict:
+    d = dict(r)
+    d["args"] = json.loads(d.get("args") or "[]")
+    d["env"] = json.loads(d.get("env") or "{}")
+    d["headers"] = json.loads(d.get("headers") or "{}")
+    d["enabled"] = bool(d["enabled"])
+    return d
+
+
+async def get_all_mcp_servers() -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM mcp_servers ORDER BY created_at"
+    )).fetchall()
+    return [_row_to_mcp(r) for r in rows]
+
+
+async def get_mcp_server(server_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM mcp_servers WHERE id = ?", (server_id,)
+    )).fetchone()
+    return _row_to_mcp(row) if row else None
+
+
+async def save_mcp_server(s: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO mcp_servers(id, name, transport, command, args, env, url, headers, enabled)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             name=excluded.name, transport=excluded.transport, command=excluded.command,
+             args=excluded.args, env=excluded.env, url=excluded.url,
+             headers=excluded.headers, enabled=excluded.enabled""",
+        (
+            s["id"], s["name"], s.get("transport", "stdio"),
+            s.get("command", ""), json.dumps(s.get("args", [])),
+            json.dumps(s.get("env", {})), s.get("url", ""),
+            json.dumps(s.get("headers", {})), int(s.get("enabled", True)),
+        ),
+    )
+    await _conn().commit()
+
+
+async def delete_mcp_server(server_id: str) -> None:
+    await _conn().execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
     await _conn().commit()
 
 
