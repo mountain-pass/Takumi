@@ -126,6 +126,10 @@ class CEOAgent(BaseAgent):
         # Task ids already included in a synthesis pushed to the user, so we
         # don't re-synthesize the same results on every later task completion.
         self._reported_task_ids: set[str] = set()
+        # Only tasks that complete AFTER this point are eligible for synthesis.
+        # Without this, a restart (which clears _reported_task_ids) would re-report
+        # the entire historical backlog of already-completed tasks.
+        self._started_at = datetime.utcnow()
         # Guard against overlapping synthesis runs (which leave the CEO
         # appearing stuck in "Synthesizing results...").
         self._synthesizing: bool = False
@@ -233,6 +237,17 @@ class CEOAgent(BaseAgent):
 
         return "good"
 
+    def _completed_after_start(self, completed_at: str | None) -> bool:
+        """True if completed_at is after the Manager started this run."""
+        if not completed_at:
+            return False
+        try:
+            dt = datetime.fromisoformat(str(completed_at).replace("Z", ""))
+            return dt >= self._started_at
+        except Exception:
+            # Unparseable timestamp — treat as recent to avoid dropping real results.
+            return True
+
     async def _check_all_tasks_done(self, just_completed: dict, agent_name: str, result: str) -> None:
         """When a task completes, check if all CEO-assigned active tasks are done.
         If so, synthesize results and push to user's chat via WebSocket.
@@ -251,12 +266,15 @@ class CEOAgent(BaseAgent):
                 logger.info("[CEO] %d tasks still outstanding, waiting...", len(outstanding))
                 return
 
-            # All done — gather recently completed task results
+            # All done — gather task results completed during THIS run only.
+            # Tasks completed before the Manager started (an old backlog) are never
+            # re-reported, even after a restart that cleared _reported_task_ids.
             completed_tasks = [
                 t for t in all_tasks
                 if t.get("assigned_by") == self.config.id
                 and t["status"] == "completed"
                 and t.get("completed_at")
+                and self._completed_after_start(t.get("completed_at"))
             ]
 
             if not completed_tasks:
@@ -345,12 +363,12 @@ class CEOAgent(BaseAgent):
                     payload={
                         "message": display_content,
                         "conversation_id": conv_id,
-                        "task_count": len(completed_tasks),
+                        "task_count": len(new_completed),
                     },
                 ))
 
             await self._set_status(AgentStatus.IDLE, action=None)
-            logger.info("[CEO] Synthesized results from %d tasks and pushed to user", len(completed_tasks))
+            logger.info("[CEO] Synthesized results from %d task(s) and pushed to user", len(new_completed))
 
         except Exception as e:
             logger.error("[CEO] Error synthesizing results: %s", e, exc_info=True)
