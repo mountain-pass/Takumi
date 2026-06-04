@@ -160,6 +160,10 @@ export default function AgentModal({ onClose }) {
               {[
                 { id: 'web_search', label: 'Web Search', desc: 'Search the internet' },
                 { id: 'web_fetch', label: 'Web Fetch', desc: 'Read web pages' },
+                { id: 'read_file', label: 'Read File', desc: 'Read local files' },
+                { id: 'write_file', label: 'Write File', desc: 'Create/edit files' },
+                { id: 'list_files', label: 'List Files', desc: 'Browse directories' },
+                { id: 'run_shell', label: 'Run Shell', desc: 'Execute commands' },
               ].map(skill => (
                 <label key={skill.id} className="flex items-center gap-2 cursor-pointer">
                   <input
