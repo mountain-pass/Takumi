@@ -35,7 +35,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 
 ### When you receive a task:
 1. **Understand it.** Read the instruction carefully. If it's clear enough to act on, start working.
-2. **Execute it yourself.** Use your tools (web_search, web_fetch, etc.) to gather information, then synthesize.
+2. **Execute it yourself.** Use your tools (web_search, web_fetch, file/shell, and any MCP tools listed under "Available Tools") to gather information, then synthesize. If you have an MCP tool that matches the request (e.g. an `mcp__…__xero_…` tool for invoices/accounting, GitHub, a database), call it directly — do NOT claim you lack access or tell the user to check the system themselves.
 3. **Deliver results.** Write your findings/analysis as a clear, structured response.
 4. **If something fails**, report what you attempted and what went wrong — don't just say "error".
 5. **If the task is unclear**, reply with a specific clarification question — not a vague "what do you mean?"
@@ -48,7 +48,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - Be concise but thorough. Deliver the actual findings, not a description of your process.
 - NEVER respond with just an acknowledgment ("Sure!", "On it!", "I'll look into this"). Those waste time.
 - NEVER say you are "waiting for results" — your tools return results immediately.
-- If you used tools and got results, synthesize them into a proper answer.
+- If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
 - Cite your sources when presenting research findings (include URLs where possible).
 """
 
@@ -343,6 +343,11 @@ class BaseAgent:
 
     # ── LLM helpers ──────────────────────────────────────────────────────────
 
+    async def _effective_skills(self) -> list[str]:
+        """Skills this agent may actually use. Subclasses can narrow this
+        (e.g. the Manager hides tools owned by a connected specialist)."""
+        return self.config.skills
+
     async def _build_system_prompt(self) -> str:
         """Build the full system prompt with SOP, tools, and connections."""
         system = self.config.system_prompt
@@ -351,10 +356,11 @@ class BaseAgent:
         if not self.config.is_ceo:
             system += AGENT_WORK_SOP
 
-        # Add tools prompt if agent has skills
-        if self.config.skills:
+        # Add tools prompt for the skills this agent may actually use
+        skills = await self._effective_skills()
+        if skills:
             from ..skills.registry import build_tools_prompt
-            tools_section = build_tools_prompt(self.config.skills)
+            tools_section = build_tools_prompt(skills)
             if tools_section:
                 system += tools_section
 
@@ -423,6 +429,8 @@ class BaseAgent:
         """Execute a registered skill/tool and return its result."""
         from ..skills.registry import get_skill, mcp_server_ids
 
+        effective = await self._effective_skills()
+
         # MCP tools are namespaced 'mcp__<slug>__<tool>'. Verify the agent has been
         # granted the owning server, then route to the MCP manager.
         if name.startswith("mcp__"):
@@ -431,7 +439,12 @@ class BaseAgent:
             if not match:
                 return f"Error: MCP tool '{name}' not found or its server is offline."
             server_id, _ = match
-            if server_id not in mcp_server_ids(self.config.skills):
+            if server_id not in mcp_server_ids(effective):
+                # The Manager reaches here when a connected specialist owns this tool —
+                # steer it to delegate rather than doing the work itself.
+                if self.config.is_ceo:
+                    return (f"Do NOT run '{name}' yourself. One of your connected specialists "
+                            "owns this tool — delegate this task to them via a create_task action.")
                 return f"Error: You don't have access to MCP tool '{name}'"
             return await mcp_manager.call_tool(name, arguments)
 
@@ -439,7 +452,7 @@ class BaseAgent:
         if not skill:
             return f"Error: Unknown tool '{name}'"
 
-        if name not in self.config.skills:
+        if name not in effective:
             return f"Error: You don't have access to tool '{name}'"
 
         try:

@@ -4,6 +4,7 @@ Receives tasks from the user, breaks them down, and delegates to specialist agen
 Can create/pause/cancel tasks for connected agents via structured actions in its responses.
 """
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -89,16 +90,17 @@ Example for dependent work:
 
 ## Critical: Delegate FIRST — only do it yourself as a last resort
 
-You have web_search and web_fetch tools, but your PRIMARY job is to delegate work to your specialist agents. ALWAYS delegate research, analysis, and data tasks to the right specialist first.
+Your PRIMARY job is to delegate work to your specialist agents. Follow this order of preference for EVERY request — do not skip ahead:
 
-Only use your own tools if:
-- An agent's task FAILED and you need to step in to complete the work yourself
-- It's a quick factual check that doesn't warrant creating a full task
-- The request needs one of your CONNECTED TOOLS that no specialist has — for example
-  MCP tools such as Xero/accounting, GitHub, or a database. For these, call the tool
-  yourself directly (emit the tool_call JSON) and answer from the result. Do NOT tell
-  the user to go check the system themselves, and do NOT claim you lack access if you
-  have a matching tool listed under "Available Tools".
+1. **Find the right specialist and delegate.** Look at your connected agents (listed below) and their roles/skills. If ANY of them is a reasonable fit for the task — including agents that have the specific tool needed (e.g. a finance agent connected to an accounting/Xero MCP, a data analyst, a researcher) — create a task for that agent. This is the default; prefer it almost always.
+2. **Only take the task on yourself if delegation is not possible**, specifically when:
+   - There is NO connected agent suited to the task (no one has the right role, skills, or tools), OR
+   - You already delegated and the agent's task FAILED or returned an unusable result and you must step in, OR
+   - It is a trivial quick check (a single factual lookup) that does not warrant creating a full task.
+
+When you DO take it on yourself and the request needs one of your own connected tools (web_search/web_fetch, or an MCP tool such as Xero/accounting, GitHub, or a database), call the tool directly (emit the tool_call JSON) and answer from the result. Never tell the user to go check the system themselves, and never claim you lack access if you have a matching tool under "Available Tools".
+
+Before answering anything from your own knowledge or tools, ask yourself: "Is there a specialist who should do this instead?" If yes, delegate.
 
 Your training data is outdated. When answering ANY factual question (market data, news, prices, valuations, current events), you or your agents MUST use web_search — never answer from training data alone.
 
@@ -125,6 +127,10 @@ class CEOAgent(BaseAgent):
         # Task ids already included in a synthesis pushed to the user, so we
         # don't re-synthesize the same results on every later task completion.
         self._reported_task_ids: set[str] = set()
+        # Only tasks that complete AFTER this point are eligible for synthesis.
+        # Without this, a restart (which clears _reported_task_ids) would re-report
+        # the entire historical backlog of already-completed tasks.
+        self._started_at = datetime.utcnow()
         # Guard against overlapping synthesis runs (which leave the CEO
         # appearing stuck in "Synthesizing results...").
         self._synthesizing: bool = False
@@ -232,6 +238,17 @@ class CEOAgent(BaseAgent):
 
         return "good"
 
+    def _completed_after_start(self, completed_at: str | None) -> bool:
+        """True if completed_at is after the Manager started this run."""
+        if not completed_at:
+            return False
+        try:
+            dt = datetime.fromisoformat(str(completed_at).replace("Z", ""))
+            return dt >= self._started_at
+        except Exception:
+            # Unparseable timestamp — treat as recent to avoid dropping real results.
+            return True
+
     async def _check_all_tasks_done(self, just_completed: dict, agent_name: str, result: str) -> None:
         """When a task completes, check if all CEO-assigned active tasks are done.
         If so, synthesize results and push to user's chat via WebSocket.
@@ -250,12 +267,15 @@ class CEOAgent(BaseAgent):
                 logger.info("[CEO] %d tasks still outstanding, waiting...", len(outstanding))
                 return
 
-            # All done — gather recently completed task results
+            # All done — gather task results completed during THIS run only.
+            # Tasks completed before the Manager started (an old backlog) are never
+            # re-reported, even after a restart that cleared _reported_task_ids.
             completed_tasks = [
                 t for t in all_tasks
                 if t.get("assigned_by") == self.config.id
                 and t["status"] == "completed"
                 and t.get("completed_at")
+                and self._completed_after_start(t.get("completed_at"))
             ]
 
             if not completed_tasks:
@@ -281,26 +301,45 @@ class CEOAgent(BaseAgent):
             for t in completed_tasks:
                 self._reported_task_ids.add(t["id"])
 
-            # Build a summary from completed task results
+            # Build a summary from ONLY the newly-completed tasks for THIS round —
+            # never the full history. Pulling old, unrelated completed tasks (e.g. a
+            # previous research request) into the synthesis confuses the report.
             agents_by_id = {}
             if self._orchestrator:
                 agents_by_id = {a.config.id: a.config.name for a in self._orchestrator.get_agents()}
 
             results_text = ""
-            for t in completed_tasks[-5:]:  # Last 5 completed tasks
+            for t in new_completed[-5:]:
                 aname = agents_by_id.get(t["agent_id"], t["agent_id"])
                 task_result = t.get("result", "No result")
                 results_text += f"\n\n### {aname}: {t['title']}\n{task_result[:1500]}"
 
-            # Ask CEO to synthesize results for the user
+            # Synthesize in ISOLATION: a focused, single-shot call that does NOT
+            # include the Manager's long-term conversation memory (which may hold
+            # unrelated prior requests) and does NOT write back into it. This keeps
+            # the report grounded strictly in the results just produced.
             await self._set_status(AgentStatus.THINKING, action="Synthesizing results...")
-            self._add_to_conversation("user",
-                f"[System] The following tasks have been completed by your team. "
-                f"Synthesize the results into a clear, concise response for the user. "
-                f"Do NOT create any new tasks. Just summarize the findings.\n{results_text}"
+            synth_system = (
+                "You are the Manager reporting delegated task results back to the user. "
+                "Summarize ONLY the results below into a clear, concise answer. Use the "
+                "actual figures/findings provided. Do NOT create tasks, do NOT reference "
+                "any earlier or unrelated work, and do NOT mention previous research. If a "
+                "result is an error, say so plainly."
             )
-            synthesis = await self._llm_complete()
-            self._add_to_conversation("assistant", synthesis.content)
+            synth_user = (
+                "The following delegated tasks just completed. Report their results to the "
+                f"user:\n{results_text}"
+            )
+            # Hard timeout so a hung LLM call can never leave the Manager stuck
+            # showing "Synthesizing results..." indefinitely.
+            synthesis = await asyncio.wait_for(
+                self._adapter.complete(
+                    system_prompt=synth_system,
+                    messages=[{"role": "user", "content": synth_user}],
+                    model=self.config.llm_model,
+                ),
+                timeout=120,
+            )
             self.state.token_count += synthesis.input_tokens + synthesis.output_tokens
 
             # Save as a chat message and push via WebSocket
@@ -330,12 +369,12 @@ class CEOAgent(BaseAgent):
                     payload={
                         "message": display_content,
                         "conversation_id": conv_id,
-                        "task_count": len(completed_tasks),
+                        "task_count": len(new_completed),
                     },
                 ))
 
             await self._set_status(AgentStatus.IDLE, action=None)
-            logger.info("[CEO] Synthesized results from %d tasks and pushed to user", len(completed_tasks))
+            logger.info("[CEO] Synthesized results from %d task(s) and pushed to user", len(new_completed))
 
         except Exception as e:
             logger.error("[CEO] Error synthesizing results: %s", e, exc_info=True)
@@ -403,32 +442,11 @@ class CEOAgent(BaseAgent):
 
         try:
             all_tasks = await database.get_all_tasks(limit=50)
-            # Find tasks assigned by CEO that completed recently and haven't been reported
-            newly_completed = []
-            for t in all_tasks:
-                if (t.get("assigned_by") == self.config.id
-                    and t["status"] == "completed"
-                    and t["id"] not in self._reported_task_ids
-                    and t.get("completed_at")):
-                    newly_completed.append(t)
-                    self._reported_task_ids.add(t["id"])
-
-            if newly_completed:
-                # Store results in conversation so CEO can reference them
-                # when the user next asks
-                for t in newly_completed:
-                    agent_name = t["agent_id"]
-                    if self._orchestrator:
-                        a = next((a for a in self._orchestrator.get_agents() if a.config.id == t["agent_id"]), None)
-                        if a:
-                            agent_name = a.config.name
-                    self._add_to_conversation(
-                        "user",
-                        f"[System: Task completed] {agent_name} finished \"{t['title']}\".\n"
-                        f"Result: {(t.get('result') or 'No result recorded')[:1000]}"
-                    )
-                    logger.info("[CEO] Tracked completed task '%s' from %s for user reporting",
-                                t['title'], agent_name)
+            # NOTE: we deliberately do NOT inject completed-task results into the
+            # Manager's conversation memory here. Doing so accumulated every old,
+            # unrelated result (e.g. a previous research request) and bled it into
+            # later chats. Completed work is reported to the user via the synthesis
+            # push in _check_all_tasks_done, which is scoped to the current batch.
 
             # Check for stuck tasks (in_progress for >10 minutes)
             stuck = []
@@ -468,6 +486,37 @@ class CEOAgent(BaseAgent):
             f"## Your team\n{roster}\n\n"
             f"## Connections (who you can assign to)\n{connections}"
         )
+
+    async def _connected_mcp_server_ids(self) -> set[str]:
+        """MCP server ids granted to agents the Manager is connected to."""
+        if not self._orchestrator:
+            return set()
+        try:
+            conns = await database.get_all_connections()
+        except Exception:
+            return set()
+        out_ids = {c["to_id"] for c in conns if c["from_id"] == self.config.id}
+        owned: set[str] = set()
+        for a in self._orchestrator.get_agents():
+            if a.config.id in out_ids:
+                for s in a.config.skills:
+                    if s.startswith("mcp:") and ":" in s:
+                        owned.add(s.split(":", 1)[1])
+        return owned
+
+    async def _effective_skills(self) -> list[str]:
+        """Hide MCP tools that a connected specialist owns, so the Manager
+        delegates to them instead of running the tool itself. The grant is kept
+        only as a fallback when no connected agent has that server."""
+        delegatable = await self._connected_mcp_server_ids()
+        if not delegatable:
+            return self.config.skills
+        result = []
+        for s in self.config.skills:
+            if s.startswith("mcp:") and ":" in s and s.split(":", 1)[1] in delegatable:
+                continue  # owned by a specialist — delegate instead
+            result.append(s)
+        return result
 
     async def _complete_with_tools(
         self, msgs: list[dict], system: str, max_rounds: int = 6,
@@ -512,6 +561,7 @@ class CEOAgent(BaseAgent):
         image_parts: list | None = None,
         ephemeral: bool = False,
         history: list[dict] | None = None,
+        conversation_id: str | None = None,
     ) -> tuple[str, list[dict]]:
         """Chat with full org context. Returns (response_text, executed_actions).
 
@@ -557,19 +607,34 @@ class CEOAgent(BaseAgent):
             response = await self._complete_with_tools(msgs, system)
             return response.content, []
 
-        if image_parts:
-            # Multimodal: text block followed by image blocks.
-            self._add_to_conversation("user", user_content)
-        else:
-            self._add_to_conversation("user", text)
+        # Memory is scoped to THIS conversation only — load its own history from
+        # the DB rather than a shared in-memory blob, so an unrelated earlier chat
+        # (e.g. a research request) never bleeds into this one. The caller saves
+        # the current user message before calling us, so drop that trailing entry
+        # and use our richer user_content (which includes any attachment context).
+        msgs: list[dict] = []
+        if conversation_id:
+            try:
+                rows = await database.get_messages(
+                    conversation_id=conversation_id,
+                    limit=self.config.max_context_messages * 2,
+                )
+            except Exception:
+                rows = []
+            if rows and rows[-1].get("role") == "user":
+                rows = rows[:-1]
+            for m in rows:
+                if not m.get("content"):
+                    continue
+                role = "user" if m.get("role") == "user" else "assistant"
+                msgs.append({"role": role, "content": m["content"]})
+        msgs.append({"role": "user", "content": user_content})
 
-        # Run a tool loop on a working copy so the Manager can use its own tools
-        # (web/file/shell + granted MCP tools like Xero) directly. Only the final
-        # answer is persisted to conversation memory; intermediate tool chatter is not.
+        # Run a tool loop so the Manager can use its own tools (web/file/shell +
+        # granted MCP tools) directly. Persistence is handled by the caller (the
+        # chat endpoint saves both messages to this conversation).
         system = await self._build_system_prompt()
-        work_msgs = list(self._conversation[-self.config.max_context_messages:])
-        response = await self._complete_with_tools(work_msgs, system)
-        self._add_to_conversation("assistant", response.content)
+        response = await self._complete_with_tools(msgs, system)
 
         # Parse and execute actions
         actions = self._parse_actions(response.content)

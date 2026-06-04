@@ -847,7 +847,8 @@ async def chat_send(req: ChatSendRequest):
 
     try:
         response_content, executed_actions = await ceo.chat_with_context(
-            message_for_llm, image_parts=llm_image_parts
+            message_for_llm, image_parts=llm_image_parts,
+            conversation_id=req.conversation_id,
         )
     except Exception as e:
         logger.error(f"CEO LLM call failed: {e}", exc_info=True)
