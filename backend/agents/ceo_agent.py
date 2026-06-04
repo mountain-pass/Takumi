@@ -94,6 +94,11 @@ You have web_search and web_fetch tools, but your PRIMARY job is to delegate wor
 Only use your own tools if:
 - An agent's task FAILED and you need to step in to complete the work yourself
 - It's a quick factual check that doesn't warrant creating a full task
+- The request needs one of your CONNECTED TOOLS that no specialist has — for example
+  MCP tools such as Xero/accounting, GitHub, or a database. For these, call the tool
+  yourself directly (emit the tool_call JSON) and answer from the result. Do NOT tell
+  the user to go check the system themselves, and do NOT claim you lack access if you
+  have a matching tool listed under "Available Tools".
 
 Your training data is outdated. When answering ANY factual question (market data, news, prices, valuations, current events), you or your agents MUST use web_search — never answer from training data alone.
 
@@ -464,6 +469,43 @@ class CEOAgent(BaseAgent):
             f"## Connections (who you can assign to)\n{connections}"
         )
 
+    async def _complete_with_tools(
+        self, msgs: list[dict], system: str, max_rounds: int = 6,
+    ):
+        """Run a bounded tool-calling loop, returning the final LLMResponse.
+
+        Lets the Manager use its OWN tools (web_search/web_fetch, file/shell, and
+        any granted MCP tools such as Xero) directly within a chat turn, instead of
+        only being able to delegate. Intermediate tool calls are appended to `msgs`
+        but the returned response is the final plain-text answer.
+        """
+        last = None
+        for _ in range(max_rounds):
+            resp = await self._adapter.complete(
+                system_prompt=system, messages=msgs, model=self.config.llm_model,
+            )
+            last = resp
+            self.state.token_count += resp.input_tokens + resp.output_tokens
+            tool_call = self._parse_tool_call(resp.content)
+            if not tool_call:
+                return resp
+            name = tool_call.get("name", "")
+            args = tool_call.get("arguments", {}) or {}
+            await self._set_status(AgentStatus.WORKING, action=f"Using {name}…")
+            result = await self._execute_tool(name, args)
+            logger.info("[Manager] tool %s -> %s", name, str(result)[:120])
+            msgs.append({"role": "assistant", "content": resp.content})
+            msgs.append({"role": "user", "content": f"[Tool Result — {name}]:\n{result}"})
+        # Exhausted rounds — force a final synthesis.
+        msgs.append({"role": "user", "content":
+            "[System] You have used your tool calls. Write your FINAL answer to the "
+            "user now in plain text, using the tool results above. No tool calls, no JSON."})
+        resp = await self._adapter.complete(
+            system_prompt=system, messages=msgs, model=self.config.llm_model,
+        )
+        self.state.token_count += resp.input_tokens + resp.output_tokens
+        return resp
+
     async def chat_with_context(
         self,
         user_message: str,
@@ -512,9 +554,7 @@ class CEOAgent(BaseAgent):
                     msgs.append({"role": h["role"], "content": h["content"]})
             msgs.append({"role": "user", "content": user_content})
             system = await self._build_system_prompt()
-            response = await self._adapter.complete(
-                system_prompt=system, messages=msgs, model=self.config.llm_model,
-            )
+            response = await self._complete_with_tools(msgs, system)
             return response.content, []
 
         if image_parts:
@@ -522,10 +562,14 @@ class CEOAgent(BaseAgent):
             self._add_to_conversation("user", user_content)
         else:
             self._add_to_conversation("user", text)
-        # CEO delegates — does NOT use tools itself (specialists do the work)
-        response = await self._llm_complete()
+
+        # Run a tool loop on a working copy so the Manager can use its own tools
+        # (web/file/shell + granted MCP tools like Xero) directly. Only the final
+        # answer is persisted to conversation memory; intermediate tool chatter is not.
+        system = await self._build_system_prompt()
+        work_msgs = list(self._conversation[-self.config.max_context_messages:])
+        response = await self._complete_with_tools(work_msgs, system)
         self._add_to_conversation("assistant", response.content)
-        self.state.token_count += response.input_tokens + response.output_tokens
 
         # Parse and execute actions
         actions = self._parse_actions(response.content)
