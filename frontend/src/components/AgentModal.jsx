@@ -62,11 +62,12 @@ export default function AgentModal({ onClose }) {
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={onClose}>
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 space-y-4"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col"
         onClick={e => e.stopPropagation()}
       >
-        <h2 className="text-lg font-bold text-gray-900">Add Agent</h2>
+        <h2 className="text-lg font-bold text-gray-900 px-6 pt-6 pb-4 border-b border-gray-100 shrink-0">Add Agent</h2>
 
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
         <div className="grid grid-cols-2 gap-3">
           <label className="space-y-1 col-span-2">
             <span className="text-xs font-medium text-gray-500">Name *</span>
@@ -239,7 +240,10 @@ export default function AgentModal({ onClose }) {
           </label>
         </div>
 
-        <div className="flex gap-3 pt-2">
+          {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
+        </div>
+
+        <div className="flex gap-3 px-6 py-4 border-t border-gray-100 shrink-0">
           <button onClick={onClose} className="flex-1 border border-gray-200 rounded-xl py-2 text-sm hover:bg-gray-50">
             Cancel
           </button>
@@ -251,8 +255,6 @@ export default function AgentModal({ onClose }) {
             {saving ? 'Adding…' : 'Add Agent'}
           </button>
         </div>
-
-        {error && <p className="text-red-500 text-sm bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>}
       </div>
 
       <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; background: white; } .input:focus { border-color: #6366f1; }`}</style>
