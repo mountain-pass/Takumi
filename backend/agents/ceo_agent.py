@@ -637,13 +637,17 @@ class CEOAgent(BaseAgent):
         system = await self._build_system_prompt()
         response = await self._complete_with_tools(msgs, system)
 
+        # If the Manager produced a rich HTML deliverable inline, turn it into a
+        # viewable artifact instead of dumping raw markup into the chat.
+        response_text = await self._maybe_extract_html_artifact(response.content)
+
         # Parse and execute actions
-        actions = self._parse_actions(response.content)
+        actions = self._parse_actions(response_text)
         executed = []
         if actions:
             executed = await self._execute_actions(actions)
 
-        return response.content, executed
+        return response_text, executed
 
     async def handle_user_task(self, task: Task) -> str:
         """Entry point: user sends a task to the CEO via the task system."""

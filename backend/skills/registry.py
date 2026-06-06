@@ -126,12 +126,26 @@ def build_tools_prompt(skill_names: list[str]) -> str:
     lines.append("")
     lines.append("### Available tools:")
     lines.append("")
+    has_artifact = False
     for s in skills:
+        # create_artifact is NOT a JSON tool call — large HTML doesn't survive
+        # JSON escaping. It's handled via a fenced ```html block instead (below).
+        if s["name"] == "create_artifact":
+            has_artifact = True
+            continue
         params = ", ".join(f'"{k}": {v}' for k, v in s["parameters"].items())
         lines.append(f'- **{s["name"]}**: {s["description"]}')
         lines.append(f'  Parameters: {{{params}}}')
     if mcp_section:
         lines.append(mcp_section)
+    if has_artifact:
+        lines.append("")
+        lines.append("### Producing a rich HTML deliverable (dashboard / report / chart):")
+        lines.append("- Do NOT use a JSON tool call for this. Instead, write your FINAL answer with the "
+                     "complete standalone HTML document inside a single fenced ```html code block.")
+        lines.append("- It is saved automatically as a viewable artifact (the user gets a 'View' button).")
+        lines.append("- Inline CSS; you may use inline <script> and CDN libraries (e.g. Chart.js). Add a "
+                     "one-line note like \"I've prepared the dashboard.\" before or after the block.")
     lines.append("")
     lines.append("### Search best practices:")
     lines.append("- Your training data is OUTDATED. For ANY factual information (dates, prices, valuations, news, company info, market data), you MUST use web_search first. NEVER answer from memory.")
