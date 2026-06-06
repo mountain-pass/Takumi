@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Cap tool results re-fed into the work loop, to keep context (and latency) down.
+MAX_TOOL_RESULT_CHARS = 4000
+
 # ── Prompt fragments injected into every specialist agent ──────────────────
 
 AGENT_WORK_SOP = """
@@ -88,6 +91,10 @@ class BaseAgent:
         from .. import runtime_settings as _rt
         self._adapter = get_adapter(config.llm_provider, settings, _rt.get())
         self._conversation: list[dict] = []   # rolling window (agent's long-term memory)
+        # Rich-output artifacts produced during the current turn/task, and the
+        # context (conversation_id / task_id) to associate them with.
+        self._pending_artifacts: list[dict] = []
+        self._artifact_ctx: dict = {}
         self._task_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
         self._running = False
         self._on_status_change_cb = None  # injected by orchestrator
@@ -171,6 +178,10 @@ class BaseAgent:
             "action": "accepted",
             "detail": f"{self.config.name} accepted task",
         })
+
+        # Artifacts created during this task are linked to it.
+        self._artifact_ctx = {"task_id": task_id}
+        self._pending_artifacts = []
 
         # Add task context to our conversation memory
         self._add_to_conversation("user", f"[Task from {sender_name}]: {msg.content}")
@@ -259,16 +270,24 @@ class BaseAgent:
 
     # ── Work execution (internal tool loop) ─────────────────────────────────
 
-    async def _do_work_with_tools(self, task_content: str, max_rounds: int = 10) -> LLMResponse:
+    async def _do_work_with_tools(self, task_content: str, max_rounds: int | None = None) -> LLMResponse:
         """Execute work using tools. All tool calls happen INTERNALLY.
         Only the final synthesized result is returned.
 
         Uses an isolated work_messages list so intermediate tool calls
         don't leak into the agent's shared conversation or the message bus.
+
+        Honours the agent's autonomy boundaries: max_iterations (tool-call cycles)
+        and token_budget (hard per-task token cap).
         """
         system = await self._build_system_prompt()
         total_input = 0
         total_output = 0
+
+        # Autonomy boundaries
+        if max_rounds is None:
+            max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 10
+        token_budget = self.config.token_budget or 0
 
         # Start with the agent's existing conversation context
         # (includes prior messages for context) but tool rounds go into work_messages
@@ -290,16 +309,28 @@ class BaseAgent:
             total_input += response.input_tokens
             total_output += response.output_tokens
 
+            # Token budget — stop spending if the hard cap is exceeded.
+            if token_budget and (total_input + total_output) > token_budget:
+                logger.warning("[%s] Token budget %d exceeded (%d used) — forcing final answer",
+                               self.config.name, token_budget, total_input + total_output)
+                work_messages.append({"role": "user", "content":
+                    "[System] Token budget reached. Provide your best final answer now "
+                    "from what you have. Plain text only."})
+                final = await self._adapter.complete(
+                    system_prompt=system, messages=work_messages, model=self.config.llm_model)
+                return LLMResponse(content=final.content, input_tokens=total_input + final.input_tokens,
+                                   output_tokens=total_output + final.output_tokens, model=self.config.llm_model)
+
             # Check for tool call
             tool_call = self._parse_tool_call(response.content)
 
             if not tool_call:
-                # No tool call — this might be the final answer
-                if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 2:
-                    # LLM is confused — nudge it to synthesize (max 2 nudges)
+                # No tool call — this might be the final answer. Cap nudges at 1:
+                # extra nudges just burn slow LLM calls for little gain.
+                if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 1:
                     confused_nudges += 1
-                    logger.warning("[%s] Confused response at round %d (nudge %d/2), nudging",
-                                   self.config.name, round_num, confused_nudges)
+                    logger.warning("[%s] Confused response at round %d — nudging once",
+                                   self.config.name, round_num)
                     work_messages.append({"role": "assistant", "content": response.content})
                     work_messages.append({"role": "user", "content":
                         "[System] You already have all tool results above. "
@@ -318,6 +349,11 @@ class BaseAgent:
             await self._set_status(AgentStatus.WORKING, action=f"Using {tool_name}...")
             tool_result = await self._execute_tool(tool_name, tool_args)
             tools_used += 1
+
+            # Truncate large tool results before re-feeding them: smaller context =
+            # faster calls AND fewer "confused" responses from the model.
+            if isinstance(tool_result, str) and len(tool_result) > MAX_TOOL_RESULT_CHARS:
+                tool_result = tool_result[:MAX_TOOL_RESULT_CHARS] + "\n[...result truncated...]"
 
             # Add to WORK messages only (not to self._conversation)
             work_messages.append({"role": "assistant", "content": response.content})
@@ -351,6 +387,18 @@ class BaseAgent:
     async def _build_system_prompt(self) -> str:
         """Build the full system prompt with SOP, tools, and connections."""
         system = self.config.system_prompt
+
+        # Soul (personality) + persistent memory from the agent's folder files,
+        # so the agent stays in character and recalls learned context each run.
+        try:
+            from ..agent_folders import read_agent_context
+            ctx = read_agent_context(self.settings.data_dir, self.config.name)
+            if ctx.get("soul"):
+                system += f"\n\n## Your personality (soul)\nStay in character with this:\n{ctx['soul']}"
+            if ctx.get("memory"):
+                system += f"\n\n## Your memory\nRelevant context you've retained:\n{ctx['memory']}"
+        except Exception:
+            pass
 
         # Core work SOP for all non-CEO agents
         if not self.config.is_ceo:
@@ -431,6 +479,12 @@ class BaseAgent:
 
         effective = await self._effective_skills()
 
+        # create_artifact — store a rich HTML document for the side-panel viewer.
+        if name == "create_artifact":
+            if "create_artifact" not in effective:
+                return "Error: You don't have access to create_artifact"
+            return await self._save_artifact(arguments)
+
         # MCP tools are namespaced 'mcp__<slug>__<tool>'. Verify the agent has been
         # granted the owning server, then route to the MCP manager.
         if name.startswith("mcp__"):
@@ -462,6 +516,32 @@ class BaseAgent:
         except Exception as e:
             logger.error("[%s] Tool %s failed: %s", self.config.name, name, e)
             return f"Tool error: {e}"
+
+    async def _save_artifact(self, arguments: dict) -> str:
+        """Persist a rich HTML artifact and record it for the current turn."""
+        import uuid as _uuid
+        title = (arguments.get("title") or "Artifact").strip()[:120]
+        html = arguments.get("html") or ""
+        if not html.strip():
+            return "Error: create_artifact requires non-empty 'html'."
+        artifact_id = _uuid.uuid4().hex
+        try:
+            await database.save_artifact({
+                "id": artifact_id,
+                "conversation_id": self._artifact_ctx.get("conversation_id"),
+                "task_id": self._artifact_ctx.get("task_id"),
+                "agent_id": self.config.id,
+                "title": title,
+                "kind": "html",
+                "content": html,
+            })
+        except Exception as e:
+            logger.error("[%s] Failed to save artifact: %s", self.config.name, e)
+            return f"Error saving artifact: {e}"
+        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": "html"})
+        logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
+        return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
+                "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
 
     def _add_to_conversation(self, role: str, content: str) -> None:
         self._conversation.append({"role": role, "content": content})

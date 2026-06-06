@@ -14,6 +14,7 @@ import {
   Wifi,
   WifiOff,
   Settings,
+  Trash2,
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
@@ -91,6 +92,46 @@ function NavSection({ label, children }) {
   )
 }
 
+function ChatHistory({ active }) {
+  const conversations = useOrgStore(s => s.chatConversations)
+  const activeConvId = useOrgStore(s => s.activeConvId)
+  const loadChatConversations = useOrgStore(s => s.loadChatConversations)
+  const openConversation = useOrgStore(s => s.openConversation)
+
+  useEffect(() => { loadChatConversations() }, [])
+
+  async function remove(id, e) {
+    e.stopPropagation()
+    try { await fetch(`/api/conversations/${id}`, { method: 'DELETE' }) } catch {}
+    loadChatConversations()
+  }
+
+  return (
+    <div className="flex-1 min-h-0 flex flex-col mt-4">
+      <p className="px-3 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400">History</p>
+      <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
+        {conversations.length === 0 ? (
+          <p className="px-3 py-2 text-[11px] text-gray-400">No conversations yet</p>
+        ) : conversations.map(conv => (
+          <div key={conv.id}
+            onClick={() => openConversation(conv.id)}
+            className={`group flex items-center gap-2 px-3 py-1.5 rounded-lg cursor-pointer transition-colors ${
+              active === 'chat' && activeConvId === conv.id
+                ? 'bg-indigo-50 text-indigo-700' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
+            }`}>
+            <MessageSquare size={13} className="shrink-0 opacity-50" />
+            <span className="flex-1 truncate text-xs">{conv.title}</span>
+            <button onClick={e => remove(conv.id, e)}
+              className="opacity-0 group-hover:opacity-100 p-0.5 text-gray-400 hover:text-red-500 transition-all">
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -163,8 +204,8 @@ export default function App() {
           </div>
         </NavSection>
 
-        {/* Spacer */}
-        <div className="flex-1" />
+        {/* Chat history */}
+        <ChatHistory active={tab} />
 
         {/* Connection status */}
         <div className="px-2 space-y-2">

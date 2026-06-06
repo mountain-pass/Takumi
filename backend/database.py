@@ -94,6 +94,20 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS artifacts (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    task_id         TEXT,
+    agent_id        TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL DEFAULT 'Artifact',
+    kind            TEXT NOT NULL DEFAULT 'html',
+    content         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_conversation ON artifacts(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY,
     conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
@@ -166,6 +180,11 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE conversations ADD COLUMN is_temporary INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_tasks ADD COLUMN depends_on TEXT",
         "ALTER TABLE mcp_servers ADD COLUMN auth TEXT NOT NULL DEFAULT 'none'",
+        "ALTER TABLE agents ADD COLUMN personality TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agents ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 10",
+        "ALTER TABLE agents ADD COLUMN token_budget INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN hitl_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN hitl_triggers TEXT NOT NULL DEFAULT '[]'",
     ]:
         try:
             await _db.execute(migration)
@@ -297,18 +316,23 @@ async def delete_api_provider(provider_id: str) -> None:
 
 async def save_agent(agent: dict) -> None:
     skills = json.dumps(agent.get("skills", []))
+    hitl_triggers = json.dumps(agent.get("hitl_triggers", []))
     await _conn().execute(
         """INSERT INTO agents(id, name, role, description, system_prompt,
            llm_provider, llm_model, skills, is_ceo, avatar_color,
-           max_context_messages, canvas_x, canvas_y, api_provider_id)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           max_context_messages, canvas_x, canvas_y, api_provider_id,
+           personality, max_iterations, token_budget, hitl_enabled, hitl_triggers)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              name=excluded.name, role=excluded.role, description=excluded.description,
              system_prompt=excluded.system_prompt, llm_provider=excluded.llm_provider,
              llm_model=excluded.llm_model, skills=excluded.skills, is_ceo=excluded.is_ceo,
              avatar_color=excluded.avatar_color, max_context_messages=excluded.max_context_messages,
              canvas_x=excluded.canvas_x, canvas_y=excluded.canvas_y,
-             api_provider_id=excluded.api_provider_id""",
+             api_provider_id=excluded.api_provider_id,
+             personality=excluded.personality, max_iterations=excluded.max_iterations,
+             token_budget=excluded.token_budget, hitl_enabled=excluded.hitl_enabled,
+             hitl_triggers=excluded.hitl_triggers""",
         (
             agent["id"], agent["name"], agent.get("role", ""),
             agent.get("description", ""), agent.get("system_prompt", ""),
@@ -318,6 +342,9 @@ async def save_agent(agent: dict) -> None:
             agent.get("max_context_messages", 20),
             agent.get("canvas_x", 0), agent.get("canvas_y", 0),
             agent.get("api_provider_id"),
+            agent.get("personality", ""), agent.get("max_iterations", 10),
+            agent.get("token_budget", 0), int(agent.get("hitl_enabled", False)),
+            hitl_triggers,
         ),
     )
     await _conn().commit()
@@ -332,6 +359,8 @@ async def get_all_agents() -> list[dict]:
         d = dict(r)
         d["skills"] = json.loads(d["skills"])
         d["is_ceo"] = bool(d["is_ceo"])
+        d["hitl_enabled"] = bool(d.get("hitl_enabled", 0))
+        d["hitl_triggers"] = json.loads(d.get("hitl_triggers") or "[]")
         result.append(d)
     return result
 
@@ -444,6 +473,39 @@ async def set_mcp_oauth(server_id: str, *, tokens: str | None = None,
 async def clear_mcp_oauth(server_id: str) -> None:
     await _conn().execute("DELETE FROM mcp_oauth WHERE server_id = ?", (server_id,))
     await _conn().commit()
+
+
+# ── Artifacts (rich HTML output for the viewer pane) ──────────────────────────
+
+async def save_artifact(artifact: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO artifacts(id, conversation_id, task_id, agent_id, title, kind, content)
+           VALUES(?, ?, ?, ?, ?, ?, ?)""",
+        (
+            artifact["id"], artifact.get("conversation_id"), artifact.get("task_id"),
+            artifact.get("agent_id", ""), artifact.get("title", "Artifact"),
+            artifact.get("kind", "html"), artifact.get("content", ""),
+        ),
+    )
+    await _conn().commit()
+
+
+async def get_artifact(artifact_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
+    )).fetchone()
+    return dict(row) if row else None
+
+
+async def get_artifacts_for_tasks(task_ids: list[str]) -> list[dict]:
+    if not task_ids:
+        return []
+    placeholders = ",".join("?" * len(task_ids))
+    rows = await (await _conn().execute(
+        f"SELECT id, title, kind, agent_id, task_id FROM artifacts WHERE task_id IN ({placeholders}) ORDER BY created_at",
+        task_ids,
+    )).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Agent connections (canvas) ────────────────────────────────────────────────

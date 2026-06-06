@@ -46,7 +46,12 @@ class MiniMaxAdapter(BaseLLMAdapter):
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["messages"][0]["text"]
-            return LLMResponse(content=content, model=model)
+            usage = data.get("usage") or {}
+            return LLMResponse(
+                content=content, model=model,
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", usage.get("total_tokens", 0)) or 0,
+            )
 
     async def stream(self, system_prompt, messages, model, max_tokens=2048, temperature=0.7) -> AsyncIterator[str]:
         url = f"{self.BASE_URL}/text/chatcompletion_v2?GroupId={self._group_id}"

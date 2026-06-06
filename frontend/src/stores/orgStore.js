@@ -19,6 +19,29 @@ export const useOrgStore = create((set, get) => ({
   navigateTo(view) { set({ pendingNav: view }) },
   clearNav() { set({ pendingNav: null }) },
 
+  // ── Chat history (global sidebar) + artifact viewer ─────────────────────────
+  chatConversations: [],
+  activeConvId: null,
+  convNonce: 0,            // bumps to tell ChatView to (re)load the active conversation
+  artifact: null,          // { id, title } currently shown in the right viewer pane
+
+  async loadChatConversations() {
+    try {
+      const res = await fetch(`${API}/conversations`)
+      if (res.ok) set({ chatConversations: await res.json() })
+    } catch {}
+  },
+  // Open a conversation from the sidebar (switches to Chat and signals a load).
+  openConversation(id) {
+    set(s => ({ activeConvId: id, convNonce: s.convNonce + 1, pendingNav: 'chat' }))
+  },
+  newChat() {
+    set(s => ({ activeConvId: null, convNonce: s.convNonce + 1, pendingNav: 'chat' }))
+  },
+  setActiveConvId(id) { set({ activeConvId: id }) },
+  openArtifact(a) { set({ artifact: a }) },
+  closeArtifact() { set({ artifact: null }) },
+
   // ── Org / setup ────────────────────────────────────────────────────────────
   orgName: '',
   orgDescription: '',
@@ -100,6 +123,12 @@ export const useOrgStore = create((set, get) => ({
     const { type, payload } = event
     if (type === 'init') {
       set({ agents: payload.agents, tasks: payload.tasks, messages: payload.messages || [] })
+    } else if (type === 'heartbeat') {
+      // Periodic full-state snapshot — reconcile so a missed agent_status event
+      // can't leave an agent stuck showing "Thinking" until a manual refresh.
+      if (Array.isArray(payload.agents) && payload.agents.length) {
+        set({ agents: payload.agents })
+      }
     } else if (type === 'agent_status') {
       set(s => ({
         agents: s.agents.map(a => a.config.id === payload.config.id ? payload : a)
@@ -121,7 +150,9 @@ export const useOrgStore = create((set, get) => ({
         timestamp: new Date().toISOString(),
         isTaskResult: true,
       }
+      if (payload.artifacts && payload.artifacts.length) msg.artifacts = payload.artifacts
       set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), msg] }))
+      get().loadChatConversations()
     } else if (type === 'agent_added') {
       // Reload agents list
       get().fetchAgents()

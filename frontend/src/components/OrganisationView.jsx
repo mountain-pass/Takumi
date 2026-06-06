@@ -221,6 +221,7 @@ const BUILTIN_SKILLS = [
   { id: 'write_file', label: 'Write File' },
   { id: 'list_files', label: 'List Files' },
   { id: 'run_shell', label: 'Run Shell' },
+  { id: 'create_artifact', label: 'Create Artifact' },
 ]
 
 function EditPanel({ agent, onClose, onSave, onRemove }) {
@@ -229,9 +230,10 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [mcpServers, setMcpServers] = useState([])
+  const [tab, setTab] = useState('basic')
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
 
-  useEffect(() => { setForm({ ...config }) }, [config.id])
+  useEffect(() => { setForm({ ...config }); setTab('basic') }, [config.id])
   useEffect(() => {
     fetch('/api/mcp/servers').then(r => r.ok ? r.json() : []).then(setMcpServers).catch(() => {})
   }, [])
@@ -261,7 +263,20 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
         <button onClick={onClose} className="p-1.5 text-gray-400 hover:bg-gray-100 rounded-lg"><X size={15} /></button>
       </div>
 
+      {/* Tabs */}
+      <div className="flex gap-1 px-5 pt-3 border-b border-gray-100">
+        {[['basic', 'Basic'], ['advanced', 'Advanced']].map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)}
+            className={`px-3 py-2 text-xs font-medium rounded-t-lg -mb-px border-b-2 transition-colors ${
+              tab === id ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-400 hover:text-gray-600'
+            }`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
       <div className="flex-1 overflow-y-auto p-5 space-y-4">
+       {tab === 'basic' && <>
         {[['name','Name'],['role','Role'],['description','Description']].map(([k, label]) => (
           <label key={k} className="block space-y-1">
             <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">{label}</span>
@@ -309,6 +324,98 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
           </div>
         </div>
 
+        <label className="block space-y-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Avatar colour</span>
+          <div className="flex gap-2 flex-wrap pt-1">
+            {COLORS.map(c => (
+              <button key={c} type="button" onClick={() => set('avatar_color', c)}
+                className="w-6 h-6 rounded-full border-2 transition-all"
+                style={{ backgroundColor: c, borderColor: form.avatar_color === c ? '#111' : 'transparent' }} />
+            ))}
+          </div>
+        </label>
+       </>}
+
+       {tab === 'advanced' && <>
+        {/* Soul / personality */}
+        <div className="block space-y-1">
+          <AIPromptWizard
+            name={form.name}
+            role={form.role}
+            description={form.description}
+            currentPrompt={form.personality || ''}
+            mode="personality"
+            onAccept={p => set('personality', p)}
+            onError={setError}
+          >
+            {({ trigger, actions }) => (
+              <>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Personality (Soul)</span>
+                  {trigger}
+                </div>
+                <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y min-h-[100px]"
+                  rows={4} placeholder="Tone, values, quirks… e.g. 'Warm, concise, a little witty. Always explains the why.'"
+                  value={form.personality || ''} onChange={e => set('personality', e.target.value)} />
+                {actions}
+              </>
+            )}
+          </AIPromptWizard>
+          <p className="text-[10px] text-gray-400">Saved to the agent's <code>soul.md</code>; read back into its prompt each run.</p>
+        </div>
+
+        {/* Autonomy boundaries */}
+        <div className="space-y-2">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Autonomy Boundaries</span>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block space-y-1">
+              <span className="text-[11px] text-gray-600">Max Iterations</span>
+              <input type="number" min="1" max="50"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400"
+                value={form.max_iterations ?? 10} onChange={e => set('max_iterations', parseInt(e.target.value) || 1)} />
+              <span className="text-[10px] text-gray-400">Tool-call cycles before stopping.</span>
+            </label>
+            <label className="block space-y-1">
+              <span className="text-[11px] text-gray-600">Token Budget</span>
+              <input type="number" min="0" step="1000"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400"
+                value={form.token_budget ?? 0} onChange={e => set('token_budget', parseInt(e.target.value) || 0)} />
+              <span className="text-[10px] text-gray-400">Hard cap per task. 0 = unlimited.</span>
+            </label>
+          </div>
+        </div>
+
+        {/* Human-in-the-loop */}
+        <div className="space-y-2">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={!!form.hitl_enabled}
+              onChange={e => set('hitl_enabled', e.target.checked)}
+              className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Human-in-the-Loop</span>
+          </label>
+          {form.hitl_enabled && (
+            <div className="pl-5 space-y-1.5">
+              <span className="text-[11px] text-gray-600">Require approval before:</span>
+              <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                {['run_shell', 'write_file', 'mcp'].map(trig => {
+                  const list = form.hitl_triggers || []
+                  const label = { run_shell: 'Run Shell', write_file: 'Write File', mcp: 'MCP tool calls' }[trig]
+                  return (
+                    <label key={trig} className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={list.includes(trig)}
+                        onChange={e => set('hitl_triggers', e.target.checked ? [...list, trig] : list.filter(t => t !== trig))}
+                        className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+                      <span className="text-xs text-gray-700">{label}</span>
+                    </label>
+                  )
+                })}
+              </div>
+              <p className="text-[10px] text-amber-600">Approval pauses are coming soon — this preference is saved now.</p>
+            </div>
+          )}
+        </div>
+
+        {/* MCP tools (moved here) */}
         {mcpServers.length > 0 && (
           <div className="block space-y-1">
             <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">MCP Tools</span>
@@ -331,17 +438,7 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
             </div>
           </div>
         )}
-
-        <label className="block space-y-1">
-          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Avatar colour</span>
-          <div className="flex gap-2 flex-wrap pt-1">
-            {COLORS.map(c => (
-              <button key={c} type="button" onClick={() => set('avatar_color', c)}
-                className="w-6 h-6 rounded-full border-2 transition-all"
-                style={{ backgroundColor: c, borderColor: form.avatar_color === c ? '#111' : 'transparent' }} />
-            ))}
-          </div>
-        </label>
+       </>}
       </div>
 
       <div className="px-5 py-4 border-t border-gray-100 flex gap-3">

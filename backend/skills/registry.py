@@ -48,6 +48,17 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "parameters": {"command": "The shell command to run", "timeout": "(optional) Seconds before timeout, default 60", "cwd": "(optional) Working directory"},
         "callable": run_shell,
     },
+    "create_artifact": {
+        "name": "create_artifact",
+        "description": (
+            "Produce a rich, self-contained HTML document (dashboard, report, chart, table) that the user "
+            "views in a side panel. Use this for visual or content-rich deliverables instead of plain text. "
+            "The HTML must be a complete standalone document (inline CSS; you may use inline <script> and CDN "
+            "libraries like Chart.js). After calling it, tell the user you've created it and they can open it."
+        ),
+        "parameters": {"title": "Short title for the artifact", "html": "A complete standalone HTML document"},
+        "callable": None,  # execution is intercepted by the agent (needs conversation/task context)
+    },
 }
 
 

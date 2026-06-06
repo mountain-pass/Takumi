@@ -37,6 +37,37 @@ def ensure_agent_folder(data_dir: str, agent_name: str, agent_role: str = "",
     return d
 
 
+def write_soul(data_dir: str, agent_name: str, personality: str) -> None:
+    """Persist an agent's personality ('soul') to soul.md in its folder."""
+    d = agent_dir(data_dir, agent_name)
+    d.mkdir(parents=True, exist_ok=True)
+    body = (personality or "").strip()
+    content = f"# Soul — {agent_name}\n\n"
+    content += body if body else "Core identity, values, and personality traits."
+    content += "\n"
+    (d / "soul.md").write_text(content)
+
+
+def _read_md_body(path: Path) -> str:
+    """Read a markdown file and strip the leading '# ...' title line."""
+    if not path.exists():
+        return ""
+    text = path.read_text().strip()
+    lines = text.split("\n")
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def read_agent_context(data_dir: str, agent_name: str) -> dict:
+    """Return the agent's soul + memory text for injecting into its prompt."""
+    d = agent_dir(data_dir, agent_name)
+    return {
+        "soul": _read_md_body(d / "soul.md"),
+        "memory": _read_md_body(d / "memory.md"),
+    }
+
+
 def remove_agent_folder(data_dir: str, agent_name: str) -> None:
     d = agent_dir(data_dir, agent_name)
     if d.exists():

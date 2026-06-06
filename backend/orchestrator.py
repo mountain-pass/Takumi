@@ -185,6 +185,9 @@ class Orchestrator:
         agent.set_status_callback(self._on_agent_status_change)
         self._agents[config.id] = agent
         ensure_agent_folder(self.settings.data_dir, config.name, config.role, config.description, config.system_prompt)
+        if getattr(config, "personality", ""):
+            from .agent_folders import write_soul
+            write_soul(self.settings.data_dir, config.name, config.personality)
         await agent.start()
         return agent
 
@@ -233,6 +236,10 @@ class Orchestrator:
                 payload={
                     "agent_count": len(self._agents),
                     "timestamp": datetime.utcnow().isoformat(),
+                    # Full state snapshot so the UI self-heals if it missed an
+                    # agent_status event (e.g. a brief WS hiccup left an agent
+                    # stuck showing "Thinking").
+                    "agents": self.get_agent_states(),
                 },
             ))
 

@@ -308,43 +308,27 @@ class CEOAgent(BaseAgent):
             if self._orchestrator:
                 agents_by_id = {a.config.id: a.config.name for a in self._orchestrator.get_agents()}
 
-            results_text = ""
-            for t in new_completed[-5:]:
-                aname = agents_by_id.get(t["agent_id"], t["agent_id"])
-                task_result = t.get("result", "No result")
-                results_text += f"\n\n### {aname}: {t['title']}\n{task_result[:1500]}"
-
-            # Synthesize in ISOLATION: a focused, single-shot call that does NOT
-            # include the Manager's long-term conversation memory (which may hold
-            # unrelated prior requests) and does NOT write back into it. This keeps
-            # the report grounded strictly in the results just produced.
-            await self._set_status(AgentStatus.THINKING, action="Synthesizing results...")
-            synth_system = (
-                "You are the Manager reporting delegated task results back to the user. "
-                "Summarize ONLY the results below into a clear, concise answer. Use the "
-                "actual figures/findings provided. Do NOT create tasks, do NOT reference "
-                "any earlier or unrelated work, and do NOT mention previous research. If a "
-                "result is an error, say so plainly."
-            )
-            synth_user = (
-                "The following delegated tasks just completed. Report their results to the "
-                f"user:\n{results_text}"
-            )
-            # Hard timeout so a hung LLM call can never leave the Manager stuck
-            # showing "Synthesizing results..." indefinitely.
-            synthesis = await asyncio.wait_for(
-                self._adapter.complete(
-                    system_prompt=synth_system,
-                    messages=[{"role": "user", "content": synth_user}],
-                    model=self.config.llm_model,
-                ),
-                timeout=120,
-            )
-            self.state.token_count += synthesis.input_tokens + synthesis.output_tokens
-
-            # Save as a chat message and push via WebSocket
+            # The Manager PRESENTS the specialists' work — it does NOT redo or
+            # re-summarize it (that just adds a slow LLM call and risks mangling
+            # the real figures). Forward each completed result directly. This makes
+            # reporting near-instant.
             from ..api.routes import _strip_ceo_json
-            display_content = _strip_ceo_json(synthesis.content)
+            await self._set_status(AgentStatus.THINKING, action="Presenting results...")
+            if len(new_completed) == 1:
+                display_content = (_strip_ceo_json(new_completed[0].get("result") or "")).strip() \
+                    or "The task completed but didn't return any content."
+            else:
+                parts = []
+                for t in new_completed:
+                    aname = agents_by_id.get(t["agent_id"], t["agent_id"])
+                    body = (_strip_ceo_json(t.get("result") or "")).strip() or "(no content)"
+                    parts.append(f"## {aname} — {t['title']}\n\n{body}")
+                display_content = "\n\n---\n\n".join(parts)
+
+            # Collect any rich artifacts the specialists produced for these tasks,
+            # so the user gets a "View" button in the synthesized reply.
+            artifacts = await database.get_artifacts_for_tasks([t["id"] for t in new_completed])
+            artifact_meta = [{"id": a["id"], "title": a["title"], "kind": a["kind"]} for a in artifacts]
 
             # Find the most recent conversation to save to
             conversations = await database.get_conversations(limit=1)
@@ -357,8 +341,9 @@ class CEOAgent(BaseAgent):
                     "conversation_id": conv_id,
                     "from_agent_id": self.config.id,
                     "to_agent_id": "user",
-                    "content": synthesis.content,
+                    "content": display_content,
                     "role": "assistant",
+                    "metadata": {"artifacts": artifact_meta} if artifact_meta else {},
                 })
 
             # Broadcast to WebSocket so frontend picks it up
@@ -370,14 +355,15 @@ class CEOAgent(BaseAgent):
                         "message": display_content,
                         "conversation_id": conv_id,
                         "task_count": len(new_completed),
+                        "artifacts": artifact_meta,
                     },
                 ))
 
             await self._set_status(AgentStatus.IDLE, action=None)
-            logger.info("[CEO] Synthesized results from %d task(s) and pushed to user", len(new_completed))
+            logger.info("[CEO] Presented %d completed task result(s) to user", len(new_completed))
 
         except Exception as e:
-            logger.error("[CEO] Error synthesizing results: %s", e, exc_info=True)
+            logger.error("[CEO] Error presenting results: %s", e, exc_info=True)
             await self._set_status(AgentStatus.IDLE, action=None)
         finally:
             if acquired:
@@ -519,7 +505,7 @@ class CEOAgent(BaseAgent):
         return result
 
     async def _complete_with_tools(
-        self, msgs: list[dict], system: str, max_rounds: int = 6,
+        self, msgs: list[dict], system: str, max_rounds: int | None = None,
     ):
         """Run a bounded tool-calling loop, returning the final LLMResponse.
 
@@ -528,6 +514,8 @@ class CEOAgent(BaseAgent):
         only being able to delegate. Intermediate tool calls are appended to `msgs`
         but the returned response is the final plain-text answer.
         """
+        if max_rounds is None:
+            max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 6
         last = None
         for _ in range(max_rounds):
             resp = await self._adapter.complete(
@@ -573,6 +561,10 @@ class CEOAgent(BaseAgent):
         delegated, and the only context is the in-screen `history` provided by
         the caller. This keeps temporary chats fully private and transient.
         """
+        # Artifacts created in this turn link to the active conversation.
+        self._artifact_ctx = {"conversation_id": conversation_id}
+        self._pending_artifacts = []
+
         # Build full context
         roster = self._build_agent_roster()
         connections = await self._build_connection_map_async()
@@ -995,11 +987,11 @@ def make_ceo_config() -> AgentConfig:
     return AgentConfig(
         name="Manager",
         role="Manager",
-        description="Orchestrates the organisation: breaks down tasks, delegates to specialists, synthesises results.",
+        description="Orchestrates the organisation: breaks down tasks, delegates to specialists, and presents their results back to you.",
         system_prompt=CEO_SYSTEM_PROMPT,
         llm_provider=LLMProvider.ANTHROPIC,
         llm_model="claude-sonnet-4-6",
-        skills=["web_search", "web_fetch"],  # fallback if agents fail
+        skills=["web_search", "web_fetch", "create_artifact"],  # fallback if agents fail
         is_ceo=True,
         avatar_color="#DC2626",
         max_context_messages=30,
