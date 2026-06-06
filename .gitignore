@@ -34,3 +34,8 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Stray local files
+*.docx
+__pycache__/
+*.pyc
