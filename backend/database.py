@@ -94,6 +94,20 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS artifacts (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    task_id         TEXT,
+    agent_id        TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL DEFAULT 'Artifact',
+    kind            TEXT NOT NULL DEFAULT 'html',
+    content         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_conversation ON artifacts(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+
 CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY,
     conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
@@ -459,6 +473,39 @@ async def set_mcp_oauth(server_id: str, *, tokens: str | None = None,
 async def clear_mcp_oauth(server_id: str) -> None:
     await _conn().execute("DELETE FROM mcp_oauth WHERE server_id = ?", (server_id,))
     await _conn().commit()
+
+
+# ── Artifacts (rich HTML output for the viewer pane) ──────────────────────────
+
+async def save_artifact(artifact: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO artifacts(id, conversation_id, task_id, agent_id, title, kind, content)
+           VALUES(?, ?, ?, ?, ?, ?, ?)""",
+        (
+            artifact["id"], artifact.get("conversation_id"), artifact.get("task_id"),
+            artifact.get("agent_id", ""), artifact.get("title", "Artifact"),
+            artifact.get("kind", "html"), artifact.get("content", ""),
+        ),
+    )
+    await _conn().commit()
+
+
+async def get_artifact(artifact_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
+    )).fetchone()
+    return dict(row) if row else None
+
+
+async def get_artifacts_for_tasks(task_ids: list[str]) -> list[dict]:
+    if not task_ids:
+        return []
+    placeholders = ",".join("?" * len(task_ids))
+    rows = await (await _conn().execute(
+        f"SELECT id, title, kind, agent_id, task_id FROM artifacts WHERE task_id IN ({placeholders}) ORDER BY created_at",
+        task_ids,
+    )).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Agent connections (canvas) ────────────────────────────────────────────────

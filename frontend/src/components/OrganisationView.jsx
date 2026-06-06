@@ -221,6 +221,7 @@ const BUILTIN_SKILLS = [
   { id: 'write_file', label: 'Write File' },
   { id: 'list_files', label: 'List Files' },
   { id: 'run_shell', label: 'Run Shell' },
+  { id: 'create_artifact', label: 'Create Artifact' },
 ]
 
 function EditPanel({ agent, onClose, onSave, onRemove }) {

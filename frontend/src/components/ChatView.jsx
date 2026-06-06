@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import {
   Send, Plus, Loader2, MessageSquare, PanelRightOpen, PanelRightClose,
   Trash2, Clock, Sparkles, ToggleLeft, ToggleRight, Paperclip, X, FileText,
+  ExternalLink, LayoutDashboard,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -14,20 +15,30 @@ const apiFetch = (url, opts) => fetch(url, opts).then(async r => {
 export default function ChatView() {
   const orgName = useOrgStore(s => s.orgName)
   const pendingChatMessages = useOrgStore(s => s.pendingChatMessages || [])
+  // Chat history + artifact viewer live in the global store (sidebar drives them).
+  const activeConvId = useOrgStore(s => s.activeConvId)
+  const setActiveConvId = useOrgStore(s => s.setActiveConvId)
+  const convNonce = useOrgStore(s => s.convNonce)
+  const loadConversations = useOrgStore(s => s.loadChatConversations)
+  const artifact = useOrgStore(s => s.artifact)
+  const closeArtifact = useOrgStore(s => s.closeArtifact)
 
-  const [conversations, setConversations] = useState([])
-  const [activeConvId, setActiveConvId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState([])  // {id, name, mime_type, kind, data, preview}
   const [sending, setSending] = useState(false)
-  const [showHistory, setShowHistory] = useState(false)
   const [temporary, setTemporary] = useState(false)
 
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
 
   useEffect(() => { loadConversations() }, [])
+
+  // React to sidebar-driven conversation changes (open / new chat).
+  useEffect(() => {
+    if (activeConvId) { setTemporary(false); loadMessages(activeConvId) }
+    else { setMessages([]); setInput(''); setAttachments([]) }
+  }, [convNonce])
 
   // Pick up task-completed messages pushed via WebSocket
   useEffect(() => {
@@ -38,24 +49,14 @@ export default function ChatView() {
     }
   }, [pendingChatMessages])
 
-  async function loadConversations() {
-    try {
-      const data = await apiFetch(`${API}/conversations`)
-      setConversations(data)
-    } catch {}
-  }
-
   async function loadMessages(convId) {
     try {
       const data = await apiFetch(`${API}/conversations/${convId}/messages`)
-      // Hydrate actions from metadata for history messages
+      // Hydrate actions/attachments/artifacts from metadata for history messages
       for (const msg of data) {
-        if (msg.metadata?.actions) {
-          msg.actions = msg.metadata.actions
-        }
-        if (msg.metadata?.attachments) {
-          msg.attachments = msg.metadata.attachments
-        }
+        if (msg.metadata?.actions) msg.actions = msg.metadata.actions
+        if (msg.metadata?.attachments) msg.attachments = msg.metadata.attachments
+        if (msg.metadata?.artifacts) msg.artifacts = msg.metadata.artifacts
       }
       setMessages(data)
     } catch {}
@@ -79,12 +80,6 @@ export default function ChatView() {
     setInput('')
     setAttachments([])
     setTimeout(() => inputRef.current?.focus(), 100)
-  }
-
-  async function openConversation(conv) {
-    setActiveConvId(conv.id)
-    setTemporary(false)
-    await loadMessages(conv.id)
   }
 
   async function deleteConversation(convId, e) {
@@ -171,6 +166,7 @@ export default function ChatView() {
         from_agent_id: resp.from_agent_id,
         action_summaries: resp.action_summaries || [],
         actions: resp.actions || [],
+        artifacts: resp.artifacts || [],
         created_at: new Date().toISOString(),
       }])
 
@@ -229,13 +225,6 @@ export default function ChatView() {
                 ? <><ToggleRight size={14} /> Temporary Chat</>
                 : <><ToggleLeft size={14} /> Temporary Chat</>
               }
-            </button>
-            <button
-              onClick={() => setShowHistory(h => !h)}
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-              title={showHistory ? 'Hide history' : 'Show history'}
-            >
-              {showHistory ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}
             </button>
           </div>
         </div>
@@ -297,50 +286,60 @@ export default function ChatView() {
         )}
       </div>
 
-      {/* History sidebar */}
-      {showHistory && (
-        <div className="w-72 border-l border-gray-100 flex flex-col bg-gray-50/50 shrink-0">
-          <div className="px-4 py-3 border-b border-gray-100">
-            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">History</h3>
+      {/* Artifact viewer (resizable) */}
+      {artifact && <ArtifactPane artifact={artifact} onClose={closeArtifact} />}
+    </div>
+  )
+}
+
+function ArtifactPane({ artifact, onClose }) {
+  const [width, setWidth] = useState(() => Math.min(720, Math.round(window.innerWidth * 0.42)))
+  const draggingRef = useRef(false)
+
+  useEffect(() => {
+    function onMove(e) {
+      if (!draggingRef.current) return
+      const w = window.innerWidth - e.clientX
+      setWidth(Math.max(320, Math.min(w, window.innerWidth - 360)))
+    }
+    function onUp() { draggingRef.current = false; document.body.style.cursor = '' }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+  }, [])
+
+  return (
+    <div className="relative flex shrink-0" style={{ width }}>
+      {/* Drag handle */}
+      <div
+        onMouseDown={() => { draggingRef.current = true; document.body.style.cursor = 'col-resize' }}
+        className="w-1.5 cursor-col-resize bg-transparent hover:bg-indigo-200 transition-colors"
+        title="Drag to resize"
+      />
+      <div className="flex-1 flex flex-col border-l border-gray-200 bg-white min-w-0">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-gray-800 truncate">{artifact.title}</p>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Artifact</p>
           </div>
-          <div className="flex-1 overflow-y-auto">
-            {conversations.length === 0 ? (
-              <div className="px-4 py-8 text-center">
-                <Clock size={20} className="mx-auto text-gray-300 mb-2" />
-                <p className="text-xs text-gray-400">No conversations yet</p>
-              </div>
-            ) : (
-              <div className="py-1">
-                {conversations.map(conv => (
-                  <div
-                    key={conv.id}
-                    onClick={() => openConversation(conv)}
-                    className={`group flex items-center gap-2 px-4 py-2.5 cursor-pointer transition-colors ${
-                      activeConvId === conv.id
-                        ? 'bg-indigo-50 text-indigo-700'
-                        : 'hover:bg-gray-100 text-gray-700'
-                    }`}
-                  >
-                    <MessageSquare size={14} className="shrink-0 opacity-40" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm truncate">{conv.title}</p>
-                      <p className="text-[10px] text-gray-400">
-                        {new Date(conv.updated_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                      </p>
-                    </div>
-                    <button
-                      onClick={e => deleteConversation(conv.id, e)}
-                      className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-500 transition-all"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
+          <div className="flex items-center gap-1">
+            <a href={`${API}/artifacts/${artifact.id}/raw`} target="_blank" rel="noreferrer"
+              className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-gray-100 rounded-lg" title="Open in new tab">
+              <ExternalLink size={15} />
+            </a>
+            <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg" title="Close">
+              <X size={16} />
+            </button>
           </div>
         </div>
-      )}
+        <iframe
+          key={artifact.id}
+          src={`${API}/artifacts/${artifact.id}/raw`}
+          title={artifact.title}
+          sandbox="allow-scripts allow-popups allow-forms"
+          className="flex-1 w-full border-0 bg-white"
+        />
+      </div>
     </div>
   )
 }
@@ -482,6 +481,8 @@ function ChatBubble({ message }) {
   const actions = message.actions || []
   const summaries = message.action_summaries || []
   const attachments = message.attachments || []
+  const artifacts = message.artifacts || []
+  const openArtifact = useOrgStore(s => s.openArtifact)
 
   return (
     <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
@@ -520,6 +521,17 @@ function ChatBubble({ message }) {
         ) : (
           <div className="prose-sm">
             <MarkdownContent text={message.content} />
+          </div>
+        )}
+        {/* Artifact view buttons */}
+        {artifacts.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-gray-200/60 flex flex-wrap gap-1.5">
+            {artifacts.map(a => (
+              <button key={a.id} onClick={() => openArtifact(a)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors">
+                <LayoutDashboard size={13} /> View: {a.title}
+              </button>
+            ))}
           </div>
         )}
         {/* Action chips — clickable to expand */}

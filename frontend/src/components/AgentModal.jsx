@@ -173,6 +173,7 @@ export default function AgentModal({ onClose }) {
                 { id: 'write_file', label: 'Write File', desc: 'Create/edit files' },
                 { id: 'list_files', label: 'List Files', desc: 'Browse directories' },
                 { id: 'run_shell', label: 'Run Shell', desc: 'Execute commands' },
+                { id: 'create_artifact', label: 'Create Artifact', desc: 'Rich HTML output' },
               ].map(skill => (
                 <label key={skill.id} className="flex items-center gap-2 cursor-pointer">
                   <input

@@ -346,6 +346,11 @@ class CEOAgent(BaseAgent):
             from ..api.routes import _strip_ceo_json
             display_content = _strip_ceo_json(synthesis.content)
 
+            # Collect any rich artifacts the specialists produced for these tasks,
+            # so the user gets a "View" button in the synthesized reply.
+            artifacts = await database.get_artifacts_for_tasks([t["id"] for t in new_completed])
+            artifact_meta = [{"id": a["id"], "title": a["title"], "kind": a["kind"]} for a in artifacts]
+
             # Find the most recent conversation to save to
             conversations = await database.get_conversations(limit=1)
             conv_id = conversations[0]["id"] if conversations else None
@@ -359,6 +364,7 @@ class CEOAgent(BaseAgent):
                     "to_agent_id": "user",
                     "content": synthesis.content,
                     "role": "assistant",
+                    "metadata": {"artifacts": artifact_meta} if artifact_meta else {},
                 })
 
             # Broadcast to WebSocket so frontend picks it up
@@ -370,6 +376,7 @@ class CEOAgent(BaseAgent):
                         "message": display_content,
                         "conversation_id": conv_id,
                         "task_count": len(new_completed),
+                        "artifacts": artifact_meta,
                     },
                 ))
 
@@ -575,6 +582,10 @@ class CEOAgent(BaseAgent):
         delegated, and the only context is the in-screen `history` provided by
         the caller. This keeps temporary chats fully private and transient.
         """
+        # Artifacts created in this turn link to the active conversation.
+        self._artifact_ctx = {"conversation_id": conversation_id}
+        self._pending_artifacts = []
+
         # Build full context
         roster = self._build_agent_roster()
         connections = await self._build_connection_map_async()
@@ -1001,7 +1012,7 @@ def make_ceo_config() -> AgentConfig:
         system_prompt=CEO_SYSTEM_PROMPT,
         llm_provider=LLMProvider.ANTHROPIC,
         llm_model="claude-sonnet-4-6",
-        skills=["web_search", "web_fetch"],  # fallback if agents fail
+        skills=["web_search", "web_fetch", "create_artifact"],  # fallback if agents fail
         is_ceo=True,
         avatar_color="#DC2626",
         max_context_messages=30,

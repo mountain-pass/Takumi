@@ -88,6 +88,10 @@ class BaseAgent:
         from .. import runtime_settings as _rt
         self._adapter = get_adapter(config.llm_provider, settings, _rt.get())
         self._conversation: list[dict] = []   # rolling window (agent's long-term memory)
+        # Rich-output artifacts produced during the current turn/task, and the
+        # context (conversation_id / task_id) to associate them with.
+        self._pending_artifacts: list[dict] = []
+        self._artifact_ctx: dict = {}
         self._task_queue: asyncio.Queue[AgentMessage] = asyncio.Queue()
         self._running = False
         self._on_status_change_cb = None  # injected by orchestrator
@@ -171,6 +175,10 @@ class BaseAgent:
             "action": "accepted",
             "detail": f"{self.config.name} accepted task",
         })
+
+        # Artifacts created during this task are linked to it.
+        self._artifact_ctx = {"task_id": task_id}
+        self._pending_artifacts = []
 
         # Add task context to our conversation memory
         self._add_to_conversation("user", f"[Task from {sender_name}]: {msg.content}")
@@ -463,6 +471,12 @@ class BaseAgent:
 
         effective = await self._effective_skills()
 
+        # create_artifact — store a rich HTML document for the side-panel viewer.
+        if name == "create_artifact":
+            if "create_artifact" not in effective:
+                return "Error: You don't have access to create_artifact"
+            return await self._save_artifact(arguments)
+
         # MCP tools are namespaced 'mcp__<slug>__<tool>'. Verify the agent has been
         # granted the owning server, then route to the MCP manager.
         if name.startswith("mcp__"):
@@ -494,6 +508,32 @@ class BaseAgent:
         except Exception as e:
             logger.error("[%s] Tool %s failed: %s", self.config.name, name, e)
             return f"Tool error: {e}"
+
+    async def _save_artifact(self, arguments: dict) -> str:
+        """Persist a rich HTML artifact and record it for the current turn."""
+        import uuid as _uuid
+        title = (arguments.get("title") or "Artifact").strip()[:120]
+        html = arguments.get("html") or ""
+        if not html.strip():
+            return "Error: create_artifact requires non-empty 'html'."
+        artifact_id = _uuid.uuid4().hex
+        try:
+            await database.save_artifact({
+                "id": artifact_id,
+                "conversation_id": self._artifact_ctx.get("conversation_id"),
+                "task_id": self._artifact_ctx.get("task_id"),
+                "agent_id": self.config.id,
+                "title": title,
+                "kind": "html",
+                "content": html,
+            })
+        except Exception as e:
+            logger.error("[%s] Failed to save artifact: %s", self.config.name, e)
+            return f"Error saving artifact: {e}"
+        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": "html"})
+        logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
+        return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
+                "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
 
     def _add_to_conversation(self, role: str, content: str) -> None:
         self._conversation.append({"role": role, "content": content})

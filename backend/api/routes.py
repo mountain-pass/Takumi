@@ -883,7 +883,15 @@ async def chat_send(req: ChatSendRequest):
         logger.error(f"CEO LLM call failed: {e}", exc_info=True)
         raise HTTPException(502, f"CEO LLM call failed: {e}")
 
+    # Artifacts (rich HTML) the Manager produced this turn → side-panel viewer.
+    artifacts = list(getattr(ceo, "_pending_artifacts", []) or [])
+
     assistant_msg_id = str(uuid.uuid4())
+    msg_metadata = {}
+    if executed_actions:
+        msg_metadata["actions"] = executed_actions
+    if artifacts:
+        msg_metadata["artifacts"] = artifacts
     await database.save_message({
         "id": assistant_msg_id,
         "conversation_id": req.conversation_id,
@@ -891,7 +899,7 @@ async def chat_send(req: ChatSendRequest):
         "to_agent_id": "user",
         "content": response_content,
         "role": "assistant",
-        "metadata": {"actions": executed_actions} if executed_actions else {},
+        "metadata": msg_metadata,
     })
 
     if not req.is_temporary:
@@ -928,6 +936,7 @@ async def chat_send(req: ChatSendRequest):
         "role": "assistant",
         "actions": executed_actions,
         "action_summaries": action_summaries,
+        "artifacts": artifacts,
     }
 
 
@@ -946,6 +955,32 @@ async def get_upload(conversation_id: str, filename: str):
     if not os.path.isfile(path):
         raise HTTPException(404, "File not found")
     return FileResponse(path)
+
+
+# ── Artifacts (rich HTML viewer) ──────────────────────────────────────────────
+
+@router.get("/artifacts/{artifact_id}")
+async def get_artifact_meta(artifact_id: str):
+    a = await database.get_artifact(artifact_id)
+    if not a:
+        raise HTTPException(404, "Artifact not found")
+    return {
+        "id": a["id"], "title": a["title"], "kind": a["kind"],
+        "agent_id": a["agent_id"], "created_at": a["created_at"],
+        "content": a["content"],
+    }
+
+
+@router.get("/artifacts/{artifact_id}/raw")
+async def get_artifact_raw(artifact_id: str):
+    """Serve the artifact HTML to render inside a sandboxed iframe."""
+    from fastapi.responses import HTMLResponse, PlainTextResponse
+    a = await database.get_artifact(artifact_id)
+    if not a:
+        raise HTTPException(404, "Artifact not found")
+    if a["kind"] == "html":
+        return HTMLResponse(a["content"])
+    return PlainTextResponse(a["content"])
 
 
 # ── API Providers ────────────────────────────────────────────────────────────
