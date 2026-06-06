@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Cap tool results re-fed into the work loop, to keep context (and latency) down.
+MAX_TOOL_RESULT_CHARS = 4000
+
 # ── Prompt fragments injected into every specialist agent ──────────────────
 
 AGENT_WORK_SOP = """
@@ -322,12 +325,12 @@ class BaseAgent:
             tool_call = self._parse_tool_call(response.content)
 
             if not tool_call:
-                # No tool call — this might be the final answer
-                if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 2:
-                    # LLM is confused — nudge it to synthesize (max 2 nudges)
+                # No tool call — this might be the final answer. Cap nudges at 1:
+                # extra nudges just burn slow LLM calls for little gain.
+                if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 1:
                     confused_nudges += 1
-                    logger.warning("[%s] Confused response at round %d (nudge %d/2), nudging",
-                                   self.config.name, round_num, confused_nudges)
+                    logger.warning("[%s] Confused response at round %d — nudging once",
+                                   self.config.name, round_num)
                     work_messages.append({"role": "assistant", "content": response.content})
                     work_messages.append({"role": "user", "content":
                         "[System] You already have all tool results above. "
@@ -346,6 +349,11 @@ class BaseAgent:
             await self._set_status(AgentStatus.WORKING, action=f"Using {tool_name}...")
             tool_result = await self._execute_tool(tool_name, tool_args)
             tools_used += 1
+
+            # Truncate large tool results before re-feeding them: smaller context =
+            # faster calls AND fewer "confused" responses from the model.
+            if isinstance(tool_result, str) and len(tool_result) > MAX_TOOL_RESULT_CHARS:
+                tool_result = tool_result[:MAX_TOOL_RESULT_CHARS] + "\n[...result truncated...]"
 
             # Add to WORK messages only (not to self._conversation)
             work_messages.append({"role": "assistant", "content": response.content})
