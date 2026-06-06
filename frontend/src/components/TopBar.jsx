@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { Bell, BellDot, X, AlertCircle, Info, CheckCircle, ChevronRight } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
-import { useAgentTasks } from '../hooks/useApi'
 
 // ── Agent status pill ─────────────────────────────────────────────────────────
 
@@ -25,14 +24,12 @@ function StatusDot({ status }) {
   )
 }
 
-function AgentStatusPills({ agents, agentsWithActiveTasks = new Set() }) {
-  // Group by effective status (account for active tasks)
+function AgentStatusPills({ agents }) {
+  // Use each agent's actual status (kept accurate by the 5s heartbeat). We do NOT
+  // infer "working" from open tasks — a single stale task would otherwise pin an
+  // idle agent as busy forever.
   const counts = agents.reduce((acc, a) => {
-    let s = a.status || 'idle'
-    // If agent has active tasks but status is idle, show as working
-    if (s === 'idle' && agentsWithActiveTasks.has(a.config?.id)) {
-      s = 'working'
-    }
+    const s = a.status || 'idle'
     acc[s] = (acc[s] || 0) + 1
     return acc
   }, {})
@@ -107,10 +104,6 @@ function NotificationPanel({ notifications, onDismiss, onClear }) {
 
 export default function TopBar() {
   const agents = useOrgStore(s => s.agents)
-  const { data: allTasks = [] } = useAgentTasks()
-  const agentsWithActiveTasks = new Set(
-    allTasks.filter(t => t.status === 'in_progress' || t.status === 'pending').map(t => t.agent_id)
-  )
   const [open, setOpen] = useState(false)
   const [notifications, setNotifications] = useState([
     {
@@ -152,7 +145,7 @@ export default function TopBar() {
 
       {/* Right side */}
       <div className="flex items-center gap-3 ml-auto" ref={ref}>
-      <AgentStatusPills agents={agents} agentsWithActiveTasks={agentsWithActiveTasks} />
+      <AgentStatusPills agents={agents} />
 
         {/* Notification bell */}
         <div className="relative">

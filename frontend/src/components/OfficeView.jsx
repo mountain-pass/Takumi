@@ -12,6 +12,19 @@ import AgentDesk from './AgentDesk'
 import { useOrgStore } from '../stores/orgStore'
 import { useAgentTasks, useCreateTask, useUpdateTask, useDeleteTask } from '../hooks/useApi'
 
+// Tokens in plain English (no locale-specific grouping like "万").
+const fmtTokens = (n) => (n || 0).toLocaleString('en-US')
+
+// Parse a backend timestamp (UTC; SQLite "YYYY-MM-DD HH:MM:SS" has no zone) into
+// a local Date so "today" is computed in the browser's timezone.
+function parseUtcTs(ts) {
+  if (!ts) return null
+  let s = String(ts).trim()
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s)) s = s.replace(' ', 'T') + 'Z'
+  const d = new Date(s)
+  return isNaN(d) ? null : d
+}
+
 const STATUS_ICON = {
   pending: <Clock size={13} className="text-amber-500" />,
   in_progress: <Play size={13} className="text-blue-500" />,
@@ -87,8 +100,23 @@ export default function OfficeView() {
   // Sorted: CEO first
   const sorted = agents.slice().sort((a, b) => (b.config.is_ceo ? 1 : 0) - (a.config.is_ceo ? 1 : 0))
 
-  // Token stats
-  const totalTokens = agents.reduce((sum, a) => sum + (a.token_count || 0), 0)
+  // ── Token stats: computed from tasks, scoped to TODAY in the browser's
+  //    timezone, broken down per agent. ────────────────────────────────────────
+  const todayStr = new Date().toDateString()
+  const todayByAgent = {}
+  let todayTotal = 0
+  allTasksRaw.forEach(t => {
+    const d = parseUtcTs(t.completed_at || t.last_run_at || t.created_at)
+    if (d && d.toDateString() === todayStr) {
+      const tk = t.token_count || 0
+      todayByAgent[t.agent_id] = (todayByAgent[t.agent_id] || 0) + tk
+      todayTotal += tk
+    }
+  })
+  const todayAgentRows = Object.entries(todayByAgent)
+    .map(([id, tok]) => ({ id, name: agentMap[id]?.config?.name || 'Unknown', tok }))
+    .sort((a, b) => b.tok - a.tok)
+
   const activeCount = tasks.filter(t => ['pending', 'in_progress'].includes(t.status)).length
   const completedCount = tasks.filter(t => t.status === 'completed').length
 
@@ -199,7 +227,7 @@ export default function OfficeView() {
                 <div className="flex items-center gap-3">
                   <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide">Stats</span>
                   <span className="text-xs font-semibold text-gray-600">
-                    {activeCount} active · {completedCount} done · {totalTokens.toLocaleString()} tokens
+                    {activeCount} active · {completedCount} done · {fmtTokens(todayTotal)} tokens today
                   </span>
                 </div>
                 <svg className={`w-3.5 h-3.5 text-gray-400 transition-transform ${statsOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -210,13 +238,27 @@ export default function OfficeView() {
               {statsOpen && (
                 <>
                   <div className="px-4 py-3 border-b border-gray-100 bg-gray-50/50">
-                    <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center justify-between mb-1">
                       <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide">Today's Tokens</span>
-                      <span className="text-[10px] text-gray-300">☕</span>
+                      <span className="text-[10px] text-gray-300">(your timezone)</span>
                     </div>
-                    <div className="text-lg font-bold text-gray-800">
-                      {totalTokens > 10000 ? `${(totalTokens / 10000).toFixed(1)}万` : totalTokens.toLocaleString()}
-                    </div>
+                    <div className="text-lg font-bold text-gray-800">{fmtTokens(todayTotal)}</div>
+                    {/* Per-agent breakdown for today */}
+                    {todayAgentRows.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                        {todayAgentRows.map(r => (
+                          <div key={r.id} className="flex items-center justify-between text-[11px]">
+                            <span className="text-gray-500">{r.name}</span>
+                            <span className="text-gray-700 font-medium tabular-nums">
+                              {fmtTokens(r.tok)}
+                              <span className="text-gray-400 ml-1">
+                                ({todayTotal ? Math.round((r.tok / todayTotal) * 100) : 0}%)
+                              </span>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="grid grid-cols-3 border-b border-gray-100">
                     <TaskStat value={activeCount} label="In Progress" color="text-green-600" />
@@ -460,7 +502,7 @@ function TaskRow({ task, agentMap }) {
               </span>
             </div>
             <span className="text-[10px] text-gray-400 truncate">
-              {task.token_count ? `${task.token_count.toLocaleString()} tokens` : agentName}
+              {task.token_count ? `${fmtTokens(task.token_count)} tokens` : agentName}
             </span>
           </div>
         </div>
@@ -493,6 +535,20 @@ function TaskRow({ task, agentMap }) {
       {/* Expanded detail */}
       {expanded && (
         <div className="mt-2 space-y-2" onClick={e => e.stopPropagation()}>
+          {/* Who did it + token cost */}
+          <div className="flex items-center justify-between bg-white rounded-lg p-2 border border-gray-100">
+            <div className="flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[9px] font-bold"
+                style={{ backgroundColor: agent?.config?.avatar_color || '#6b7280' }}>
+                {agentName[0]}
+              </span>
+              <span className="text-[11px] text-gray-700">{agentName}</span>
+            </div>
+            <span className="text-[11px] font-semibold text-gray-700 tabular-nums">
+              {fmtTokens(task.token_count || 0)} tokens
+            </span>
+          </div>
+
           {/* Instruction */}
           {task.instruction && (
             <div>
@@ -521,7 +577,7 @@ function TaskRow({ task, agentMap }) {
 
           {/* Metadata row */}
           <div className="flex items-center gap-3 text-[10px] text-gray-400">
-            {task.token_count > 0 && <span>{task.token_count.toLocaleString()} tokens</span>}
+            {task.token_count > 0 && <span>{fmtTokens(task.token_count)} tokens</span>}
             {task.run_count > 0 && <span>{task.run_count} run{task.run_count > 1 ? 's' : ''}</span>}
             {task.schedule_human && <span>{task.schedule_human}</span>}
             <span className="ml-auto">{task.created_at ? formatTime(task.created_at) : ''}</span>
