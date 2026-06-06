@@ -600,7 +600,7 @@ class BaseAgent:
             title = tm.group(1).strip()[:120]
         await self._save_artifact({"title": title, "html": html})
         note = f"I've prepared **{title}** — open it in the viewer panel."
-        cleaned = cleaned.strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return f"{cleaned}\n\n{note}" if cleaned else note
 
     def _add_to_conversation(self, role: str, content: str) -> None:
