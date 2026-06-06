@@ -32,11 +32,12 @@ export const useOrgStore = create((set, get) => ({
     } catch {}
   },
   // Open a conversation from the sidebar (switches to Chat and signals a load).
+  // Closing the artifact viewer too — it belongs to the chat we're leaving.
   openConversation(id) {
-    set(s => ({ activeConvId: id, convNonce: s.convNonce + 1, pendingNav: 'chat' }))
+    set(s => ({ activeConvId: id, convNonce: s.convNonce + 1, pendingNav: 'chat', artifact: null }))
   },
   newChat() {
-    set(s => ({ activeConvId: null, convNonce: s.convNonce + 1, pendingNav: 'chat' }))
+    set(s => ({ activeConvId: null, convNonce: s.convNonce + 1, pendingNav: 'chat', artifact: null }))
   },
   setActiveConvId(id) { set({ activeConvId: id }) },
   openArtifact(a) { set({ artifact: a }) },

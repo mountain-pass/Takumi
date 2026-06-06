@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Cap tool results re-fed into the work loop, to keep context (and latency) down.
 MAX_TOOL_RESULT_CHARS = 4000
 
+# Token ceiling for agent generations. Needs to be large enough for a full HTML
+# dashboard/report artifact (the 2048 default truncated them mid-document).
+AGENT_MAX_TOKENS = 8000
+
 # ── Prompt fragments injected into every specialist agent ──────────────────
 
 AGENT_WORK_SOP = """
@@ -50,8 +54,10 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - Stay on topic. Only address what was asked.
 - Be concise but thorough. Deliver the actual findings, not a description of your process.
 - NEVER respond with just an acknowledgment ("Sure!", "On it!", "I'll look into this"). Those waste time.
+- **Deliver and stop.** When your task is done, produce the deliverable and finish. Do NOT thank, critique, congratulate, or start a back-and-forth conversation with another agent about their work. You communicate only by completing tasks — not by chatting. If you hand work to another agent, the task already states the expected outcome; you do not need to follow up unless the result comes back wrong.
 - NEVER say you are "waiting for results" — your tools return results immediately.
 - If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
+- If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It is saved automatically as a viewable artifact (a "View" button appears for the user) — this works for every agent. Do NOT wrap the HTML in a JSON tool call, and never paste raw HTML outside a ```html block. Keep your text reply to a one-line note like "I've prepared the dashboard."
 - Cite your sources when presenting research findings (include URLs where possible).
 """
 
@@ -145,19 +151,21 @@ class BaseAgent:
 
         try:
             if msg.task_id:
-                await self._execute_task(msg, sender_name)
-            else:
-                # Non-task direct message — process but do NOT reply (prevents chatter)
-                self._add_to_conversation("user", f"[From {sender_name}]: {msg.content}")
-                await self._set_status(AgentStatus.WORKING, action="Processing...")
-                if self.config.skills:
-                    response = await self._do_work_with_tools(msg.content)
+                # Only run a task that is actually assigned to me and still runnable.
+                # A message carrying a task_id I don't own (or that's already done) is
+                # a completion/notification from a peer — IGNORE it. Otherwise agents
+                # re-execute each other's results and spiral into endless chatter.
+                task = await database.get_task(msg.task_id)
+                if (task and task.get("agent_id") == self.config.id
+                        and task.get("status") in ("pending", "in_progress")):
+                    await self._execute_task(msg, sender_name)
                 else:
-                    response = await self._llm_complete()
-                self._add_to_conversation("assistant", response.content)
-                self.state.token_count += response.input_tokens + response.output_tokens
-                self.state.messages_processed += 1
-                logger.debug("[%s] Processed direct message from %s (no reply)", self.config.name, sender_name)
+                    logger.debug("[%s] Ignoring task message %s from %s (not my open task)",
+                                 self.config.name, msg.task_id[:8], sender_name)
+            else:
+                # Non-task chatter from a peer — ignore. Agents communicate through
+                # tasks, not free-form back-and-forth.
+                logger.debug("[%s] Ignoring non-task message from %s", self.config.name, sender_name)
         except Exception as e:
             if msg.task_id:
                 # Report failure back to assignor
@@ -197,6 +205,12 @@ class BaseAgent:
         final_result = response.content
         tokens = response.input_tokens + response.output_tokens
 
+        # Salvage rich HTML deliverables: if the agent produced a fenced ```html
+        # block (or a create_artifact tool_call that failed to parse due to the
+        # large HTML), turn it into a viewable artifact instead of dumping raw
+        # markup into the chat.
+        final_result = await self._maybe_extract_html_artifact(final_result)
+
         # Add result to our conversation memory
         self._add_to_conversation("assistant", final_result)
         self.state.token_count += tokens
@@ -226,25 +240,22 @@ class BaseAgent:
         except Exception as e:
             logger.error("[%s] Failed to update task %s: %s", self.config.name, task_id[:8], e)
 
-        # Send result back to assignor
-        logger.info("[%s] Task %s completed, sending result (%d chars) to %s",
-                    self.config.name, task_id[:8], len(final_result), sender_name)
-        reply = AgentMessage(
-            from_agent=self.config.id,
-            to_agent=msg.from_agent,
-            content=final_result,
-            task_id=task_id,
-        )
-        await self.bus.publish(reply)
+        # Hand the result to the SYSTEM (orchestrator) — the SINGLE place task
+        # completion is handled. The orchestrator validates it, routes it straight
+        # to any dependent agent, and presents the plan when done. We deliberately
+        # do NOT send a free-form message to the assignor: agents communicate only
+        # through the task system, never by chatting.
+        logger.info("[%s] Task %s completed (%d chars) — handing to orchestrator",
+                    self.config.name, task_id[:8], len(final_result))
+        if self._orchestrator and task_id:
+            try:
+                await self._orchestrator.on_task_completed(task_id, final_result, self.config.id)
+            except Exception as e:
+                logger.error("[%s] on_task_completed failed for %s: %s", self.config.name, task_id[:8], e)
 
     async def _report_task_failure(self, msg: AgentMessage, error: str) -> None:
-        """Report a task failure: update DB and notify assignor."""
+        """Record a task failure and let the SYSTEM handle it (no peer chatter)."""
         try:
-            await database.update_task(msg.task_id, {
-                "status": "failed",
-                "result": f"Agent error: {error}",
-                "completed_at": datetime.utcnow().isoformat(),
-            })
             await database.create_task_log({
                 "id": str(uuid.uuid4()),
                 "task_id": msg.task_id,
@@ -254,15 +265,11 @@ class BaseAgent:
             })
         except Exception:
             pass
-
-        # Notify assignor about the failure
-        reply = AgentMessage(
-            from_agent=self.config.id,
-            to_agent=msg.from_agent,
-            content=f"[Task Failed] Error: {error}",
-            task_id=msg.task_id,
-        )
-        await self.bus.publish(reply)
+        if self._orchestrator and msg.task_id:
+            try:
+                await self._orchestrator.on_task_failed(msg.task_id, error, self.config.id)
+            except Exception as e:
+                logger.error("[%s] on_task_failed failed for %s: %s", self.config.name, msg.task_id[:8], e)
 
     async def _on_idle_tick(self) -> None:
         """Override in subclasses for proactive behaviour."""
@@ -305,6 +312,7 @@ class BaseAgent:
                 system_prompt=system,
                 messages=work_messages,
                 model=self.config.llm_model,
+                max_tokens=AGENT_MAX_TOKENS,
             )
             total_input += response.input_tokens
             total_output += response.output_tokens
@@ -317,7 +325,8 @@ class BaseAgent:
                     "[System] Token budget reached. Provide your best final answer now "
                     "from what you have. Plain text only."})
                 final = await self._adapter.complete(
-                    system_prompt=system, messages=work_messages, model=self.config.llm_model)
+                    system_prompt=system, messages=work_messages, model=self.config.llm_model,
+                    max_tokens=AGENT_MAX_TOKENS)
                 return LLMResponse(content=final.content, input_tokens=total_input + final.input_tokens,
                                    output_tokens=total_output + final.output_tokens, model=self.config.llm_model)
 
@@ -370,6 +379,7 @@ class BaseAgent:
             system_prompt=system,
             messages=work_messages,
             model=self.config.llm_model,
+            max_tokens=AGENT_MAX_TOKENS,
         )
         total_input += summary.input_tokens
         total_output += summary.output_tokens
@@ -428,6 +438,7 @@ class BaseAgent:
             system_prompt=system,
             messages=messages,
             model=self.config.llm_model,
+            max_tokens=AGENT_MAX_TOKENS,
         )
 
     def _is_confused_response(self, content: str) -> bool:
@@ -542,6 +553,44 @@ class BaseAgent:
         logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
         return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
                 "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
+
+    async def _maybe_extract_html_artifact(self, text: str) -> str:
+        """If the result embeds a full HTML document (a fenced ```html block — the
+        closing fence is optional since models often drop it on long blocks — or a
+        raw <html> document), save it as an artifact and replace it with a short
+        note, instead of dumping raw markup into the chat. Applies to EVERY agent
+        — never let raw HTML reach the user, regardless of which agent built it."""
+        if not text:
+            return text
+        html = None
+        cleaned = text
+        # 1) Fenced ```html block; closing fence optional.
+        m = re.search(r"```html\b", text, re.IGNORECASE)
+        if m:
+            rest = text[m.end():]
+            close = re.search(r"```", rest)
+            body = rest[:close.start()] if close else rest
+            after = rest[close.end():] if close else ""
+            if "<" in body:
+                html = body.strip()
+                cleaned = (text[:m.start()] + after).strip()
+        # 2) A raw <html>…</html> document anywhere in the text.
+        if html is None:
+            hm = re.search(r"(<!DOCTYPE html\b.*?</html\s*>|<html\b.*?</html\s*>)", text,
+                           re.DOTALL | re.IGNORECASE)
+            if hm:
+                html = hm.group(1).strip()
+                cleaned = (text[:hm.start()] + text[hm.end():]).strip()
+        if not html or len(html) < 80:
+            return text
+        title = "Report"
+        tm = re.search(r"<title>(.*?)</title>", html, re.DOTALL | re.IGNORECASE)
+        if tm and tm.group(1).strip():
+            title = tm.group(1).strip()[:120]
+        await self._save_artifact({"title": title, "html": html})
+        note = f"I've prepared **{title}** — open it in the viewer panel."
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return f"{cleaned}\n\n{note}" if cleaned else note
 
     def _add_to_conversation(self, role: str, content: str) -> None:
         self._conversation.append({"role": role, "content": content})
