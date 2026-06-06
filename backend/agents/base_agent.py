@@ -54,6 +54,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - Stay on topic. Only address what was asked.
 - Be concise but thorough. Deliver the actual findings, not a description of your process.
 - NEVER respond with just an acknowledgment ("Sure!", "On it!", "I'll look into this"). Those waste time.
+- **Deliver and stop.** When your task is done, produce the deliverable and finish. Do NOT thank, critique, congratulate, or start a back-and-forth conversation with another agent about their work. You communicate only by completing tasks — not by chatting. If you hand work to another agent, the task already states the expected outcome; you do not need to follow up unless the result comes back wrong.
 - NEVER say you are "waiting for results" — your tools return results immediately.
 - If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
 - If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable AND you have the `create_artifact` capability, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It will be saved automatically as a viewable artifact (a "View" button appears for the user). Do NOT wrap the HTML in a JSON tool call — a plain ```html block is more reliable for large documents. Include a one-line note like "I've prepared the dashboard."
@@ -150,19 +151,21 @@ class BaseAgent:
 
         try:
             if msg.task_id:
-                await self._execute_task(msg, sender_name)
-            else:
-                # Non-task direct message — process but do NOT reply (prevents chatter)
-                self._add_to_conversation("user", f"[From {sender_name}]: {msg.content}")
-                await self._set_status(AgentStatus.WORKING, action="Processing...")
-                if self.config.skills:
-                    response = await self._do_work_with_tools(msg.content)
+                # Only run a task that is actually assigned to me and still runnable.
+                # A message carrying a task_id I don't own (or that's already done) is
+                # a completion/notification from a peer — IGNORE it. Otherwise agents
+                # re-execute each other's results and spiral into endless chatter.
+                task = await database.get_task(msg.task_id)
+                if (task and task.get("agent_id") == self.config.id
+                        and task.get("status") in ("pending", "in_progress")):
+                    await self._execute_task(msg, sender_name)
                 else:
-                    response = await self._llm_complete()
-                self._add_to_conversation("assistant", response.content)
-                self.state.token_count += response.input_tokens + response.output_tokens
-                self.state.messages_processed += 1
-                logger.debug("[%s] Processed direct message from %s (no reply)", self.config.name, sender_name)
+                    logger.debug("[%s] Ignoring task message %s from %s (not my open task)",
+                                 self.config.name, msg.task_id[:8], sender_name)
+            else:
+                # Non-task chatter from a peer — ignore. Agents communicate through
+                # tasks, not free-form back-and-forth.
+                logger.debug("[%s] Ignoring non-task message from %s", self.config.name, sender_name)
         except Exception as e:
             if msg.task_id:
                 # Report failure back to assignor
