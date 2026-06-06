@@ -187,6 +187,33 @@ class Orchestrator:
         await self._handoff_to_dependents(task, result, from_agent_id)
         await self._present_if_plan_complete(task)
 
+    async def on_task_failed(self, task_id: str, error: str, from_agent_id: str) -> None:
+        """A task errored. Record it, fail any tasks that depended on it (their
+        prerequisite is gone), and present whatever the plan produced."""
+        from datetime import datetime as _dt
+        task = await database.get_task(task_id)
+        if not task:
+            return
+        now = _dt.utcnow().isoformat()
+        await database.update_task(task_id, {
+            "status": "failed", "result": f"Agent error: {error}"[:2000], "completed_at": now,
+        })
+        logger.warning("[orchestrator] Task '%s' failed: %s", task.get("title", "")[:40], str(error)[:120])
+        # Cascade: tasks blocked on this one can never run.
+        title = (task.get("title") or "").lower()
+        try:
+            for bt in await database.get_all_tasks(limit=100):
+                dep = (bt.get("depends_on") or "").lower()
+                if bt.get("status") == "blocked" and dep and (dep in title or title in dep):
+                    await database.update_task(bt["id"], {
+                        "status": "failed",
+                        "result": f"Skipped — prerequisite '{task.get('title','')}' failed.",
+                        "completed_at": now,
+                    })
+        except Exception:
+            pass
+        await self._present_if_plan_complete(task)
+
     async def _handoff_to_dependents(self, task: dict, result: str, from_agent_id: str) -> None:
         """Pass a completed task's output DIRECTLY into each dependent task's
         agent (Scarlett → Niss), recording it as structured context input."""

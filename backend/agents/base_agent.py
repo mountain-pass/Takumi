@@ -57,7 +57,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - **Deliver and stop.** When your task is done, produce the deliverable and finish. Do NOT thank, critique, congratulate, or start a back-and-forth conversation with another agent about their work. You communicate only by completing tasks — not by chatting. If you hand work to another agent, the task already states the expected outcome; you do not need to follow up unless the result comes back wrong.
 - NEVER say you are "waiting for results" — your tools return results immediately.
 - If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
-- If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable AND you have the `create_artifact` capability, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It will be saved automatically as a viewable artifact (a "View" button appears for the user). Do NOT wrap the HTML in a JSON tool call — a plain ```html block is more reliable for large documents. Include a one-line note like "I've prepared the dashboard."
+- If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It is saved automatically as a viewable artifact (a "View" button appears for the user) — this works for every agent. Do NOT wrap the HTML in a JSON tool call, and never paste raw HTML outside a ```html block. Keep your text reply to a one-line note like "I've prepared the dashboard."
 - Cite your sources when presenting research findings (include URLs where possible).
 """
 
@@ -240,19 +240,13 @@ class BaseAgent:
         except Exception as e:
             logger.error("[%s] Failed to update task %s: %s", self.config.name, task_id[:8], e)
 
-        # Send result back to assignor (for the activity feed / record).
-        logger.info("[%s] Task %s completed, sending result (%d chars) to %s",
-                    self.config.name, task_id[:8], len(final_result), sender_name)
-        await self.bus.publish(AgentMessage(
-            from_agent=self.config.id,
-            to_agent=msg.from_agent,
-            content=final_result,
-            task_id=task_id,
-        ))
-
-        # Notify the SYSTEM (orchestrator) so it can validate the result, hand it
-        # straight to any dependent agent, and present the plan when it's done.
-        # This is the single, explicit place where task completion is handled.
+        # Hand the result to the SYSTEM (orchestrator) — the SINGLE place task
+        # completion is handled. The orchestrator validates it, routes it straight
+        # to any dependent agent, and presents the plan when done. We deliberately
+        # do NOT send a free-form message to the assignor: agents communicate only
+        # through the task system, never by chatting.
+        logger.info("[%s] Task %s completed (%d chars) — handing to orchestrator",
+                    self.config.name, task_id[:8], len(final_result))
         if self._orchestrator and task_id:
             try:
                 await self._orchestrator.on_task_completed(task_id, final_result, self.config.id)
@@ -260,13 +254,8 @@ class BaseAgent:
                 logger.error("[%s] on_task_completed failed for %s: %s", self.config.name, task_id[:8], e)
 
     async def _report_task_failure(self, msg: AgentMessage, error: str) -> None:
-        """Report a task failure: update DB and notify assignor."""
+        """Record a task failure and let the SYSTEM handle it (no peer chatter)."""
         try:
-            await database.update_task(msg.task_id, {
-                "status": "failed",
-                "result": f"Agent error: {error}",
-                "completed_at": datetime.utcnow().isoformat(),
-            })
             await database.create_task_log({
                 "id": str(uuid.uuid4()),
                 "task_id": msg.task_id,
@@ -276,15 +265,11 @@ class BaseAgent:
             })
         except Exception:
             pass
-
-        # Notify assignor about the failure
-        reply = AgentMessage(
-            from_agent=self.config.id,
-            to_agent=msg.from_agent,
-            content=f"[Task Failed] Error: {error}",
-            task_id=msg.task_id,
-        )
-        await self.bus.publish(reply)
+        if self._orchestrator and msg.task_id:
+            try:
+                await self._orchestrator.on_task_failed(msg.task_id, error, self.config.id)
+            except Exception as e:
+                logger.error("[%s] on_task_failed failed for %s: %s", self.config.name, msg.task_id[:8], e)
 
     async def _on_idle_tick(self) -> None:
         """Override in subclasses for proactive behaviour."""
@@ -573,8 +558,9 @@ class BaseAgent:
         """If the result embeds a full HTML document (a fenced ```html block — the
         closing fence is optional since models often drop it on long blocks — or a
         raw <html> document), save it as an artifact and replace it with a short
-        note, instead of dumping raw markup into the chat."""
-        if not text or "create_artifact" not in self.config.skills:
+        note, instead of dumping raw markup into the chat. Applies to EVERY agent
+        — never let raw HTML reach the user, regardless of which agent built it."""
+        if not text:
             return text
         html = None
         cleaned = text
