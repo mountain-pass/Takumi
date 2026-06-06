@@ -40,6 +40,28 @@ export default function ChatView() {
     else { setMessages([]); setInput(''); setAttachments([]) }
   }, [convNonce])
 
+  // Auto-refresh fallback: poll the open conversation so new agent results appear
+  // even if a WebSocket event was missed (e.g. multi-agent jobs, reconnects).
+  useEffect(() => {
+    if (!activeConvId || temporary) return
+    const id = setInterval(async () => {
+      try {
+        const data = await apiFetch(`${API}/conversations/${activeConvId}/messages`)
+        setMessages(prev => {
+          if (!Array.isArray(data) || data.length <= prev.length) return prev
+          for (const m of data) {
+            if (m.metadata?.actions) m.actions = m.metadata.actions
+            if (m.metadata?.attachments) m.attachments = m.metadata.attachments
+            if (m.metadata?.artifacts) m.artifacts = m.metadata.artifacts
+          }
+          setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 80)
+          return data
+        })
+      } catch {}
+    }, 4000)
+    return () => clearInterval(id)
+  }, [activeConvId, temporary])
+
   // Pick up task-completed messages pushed via WebSocket
   useEffect(() => {
     if (pendingChatMessages.length > 0) {

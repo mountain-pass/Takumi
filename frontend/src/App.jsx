@@ -156,9 +156,15 @@ export default function App() {
     else setTab(id)
   }
 
+  const fetchAgents = useOrgStore(s => s.fetchAgents)
+
   useEffect(() => {
     fetchOrg()
     connect()
+    // Poll agent status as a fallback so the top-bar status self-heals even if a
+    // WebSocket heartbeat is missed (e.g. after a reconnect).
+    const id = setInterval(() => fetchAgents(), 8000)
+    return () => clearInterval(id)
   }, [])
 
   useEffect(() => {
