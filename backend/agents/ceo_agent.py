@@ -525,10 +525,12 @@ class CEOAgent(BaseAgent):
         """
         if max_rounds is None:
             max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 6
+        from .base_agent import AGENT_MAX_TOKENS
         last = None
         for _ in range(max_rounds):
             resp = await self._adapter.complete(
                 system_prompt=system, messages=msgs, model=self.config.llm_model,
+                max_tokens=AGENT_MAX_TOKENS,
             )
             last = resp
             self.state.token_count += resp.input_tokens + resp.output_tokens
@@ -548,6 +550,7 @@ class CEOAgent(BaseAgent):
             "user now in plain text, using the tool results above. No tool calls, no JSON."})
         resp = await self._adapter.complete(
             system_prompt=system, messages=msgs, model=self.config.llm_model,
+            max_tokens=AGENT_MAX_TOKENS,
         )
         self.state.token_count += resp.input_tokens + resp.output_tokens
         return resp

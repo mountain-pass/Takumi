@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Cap tool results re-fed into the work loop, to keep context (and latency) down.
 MAX_TOOL_RESULT_CHARS = 4000
 
+# Token ceiling for agent generations. Needs to be large enough for a full HTML
+# dashboard/report artifact (the 2048 default truncated them mid-document).
+AGENT_MAX_TOKENS = 8000
+
 # ── Prompt fragments injected into every specialist agent ──────────────────
 
 AGENT_WORK_SOP = """
@@ -312,6 +316,7 @@ class BaseAgent:
                 system_prompt=system,
                 messages=work_messages,
                 model=self.config.llm_model,
+                max_tokens=AGENT_MAX_TOKENS,
             )
             total_input += response.input_tokens
             total_output += response.output_tokens
@@ -324,7 +329,8 @@ class BaseAgent:
                     "[System] Token budget reached. Provide your best final answer now "
                     "from what you have. Plain text only."})
                 final = await self._adapter.complete(
-                    system_prompt=system, messages=work_messages, model=self.config.llm_model)
+                    system_prompt=system, messages=work_messages, model=self.config.llm_model,
+                    max_tokens=AGENT_MAX_TOKENS)
                 return LLMResponse(content=final.content, input_tokens=total_input + final.input_tokens,
                                    output_tokens=total_output + final.output_tokens, model=self.config.llm_model)
 
@@ -377,6 +383,7 @@ class BaseAgent:
             system_prompt=system,
             messages=work_messages,
             model=self.config.llm_model,
+            max_tokens=AGENT_MAX_TOKENS,
         )
         total_input += summary.input_tokens
         total_output += summary.output_tokens
@@ -435,6 +442,7 @@ class BaseAgent:
             system_prompt=system,
             messages=messages,
             model=self.config.llm_model,
+            max_tokens=AGENT_MAX_TOKENS,
         )
 
     def _is_confused_response(self, content: str) -> bool:
