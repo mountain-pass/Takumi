@@ -69,10 +69,16 @@ class OllamaAdapter(BaseLLMAdapter):
 
             if self._cloud:
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                usage = data.get("usage") or {}
+                in_tok = usage.get("prompt_tokens", 0) or 0
+                out_tok = usage.get("completion_tokens", 0) or 0
             else:
                 content = data.get("message", {}).get("content", "")
+                in_tok = data.get("prompt_eval_count", 0) or 0
+                out_tok = data.get("eval_count", 0) or 0
 
-            return LLMResponse(content=content, model=model)
+            return LLMResponse(content=content, model=model,
+                               input_tokens=in_tok, output_tokens=out_tok)
 
     async def stream(self, system_prompt, messages, model, max_tokens=2048, temperature=0.7) -> AsyncIterator[str]:
         msgs = self._build_messages(system_prompt, messages)
