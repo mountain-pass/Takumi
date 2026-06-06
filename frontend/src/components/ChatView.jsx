@@ -253,9 +253,17 @@ export default function ChatView() {
             />
           ) : (
             <div className="max-w-3xl mx-auto px-4 py-6 space-y-4">
-              {messages.map(msg => (
-                <ChatBubble key={msg.id} message={msg} />
-              ))}
+              {messages.map((msg, i) => {
+                const d = parseTs(msg.created_at)
+                const prevD = i > 0 ? parseTs(messages[i - 1].created_at) : null
+                const showDivider = d && (!prevD || d.toDateString() !== prevD.toDateString())
+                return (
+                  <React.Fragment key={msg.id}>
+                    {showDivider && <DateDivider date={d} />}
+                    <ChatBubble message={msg} />
+                  </React.Fragment>
+                )
+              })}
               {sending && (
                 <div className="flex items-center gap-2 text-gray-400 text-sm px-4">
                   <Loader2 size={14} className="animate-spin" />
@@ -550,13 +558,44 @@ function ChatBubble({ message }) {
   )
 }
 
+// Parse a timestamp into a Date in the browser's LOCAL time. Backend timestamps
+// come as UTC; SQLite's "YYYY-MM-DD HH:MM:SS" has no zone (JS would treat it as
+// local), so we normalize naive timestamps to UTC before converting.
+function parseTs(ts) {
+  if (!ts) return null
+  let s = String(ts).trim()
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s)) {
+    s = s.replace(' ', 'T') + 'Z'   // mark as UTC
+  }
+  const d = new Date(s)
+  return isNaN(d) ? null : d
+}
+
 function formatTimestamp(ts) {
-  const d = new Date(ts)
-  if (isNaN(d)) return ''
+  const d = parseTs(ts)
+  if (!d) return ''
+  // Always local time (browser timezone), seconds included to gauge durations.
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function formatDateDivider(d) {
   const now = new Date()
-  const sameDay = d.toDateString() === now.toDateString()
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  return sameDay ? time : `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`
+  const today = now.toDateString()
+  const yesterday = new Date(now.getTime() - 86400000).toDateString()
+  const ds = d.toDateString()
+  if (ds === today) return 'Today'
+  if (ds === yesterday) return 'Yesterday'
+  return d.toLocaleDateString([], { weekday: 'short', month: 'long', day: 'numeric', year: 'numeric' })
+}
+
+function DateDivider({ date }) {
+  return (
+    <div className="flex items-center gap-3 my-2 px-1">
+      <div className="flex-1 h-px bg-gray-200" />
+      <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wide">{formatDateDivider(date)}</span>
+      <div className="flex-1 h-px bg-gray-200" />
+    </div>
+  )
 }
 
 function MarkdownContent({ text }) {
