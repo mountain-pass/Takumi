@@ -100,9 +100,13 @@ function ChatHistory({ active }) {
 
   useEffect(() => { loadChatConversations() }, [])
 
+  const newChat = useOrgStore(s => s.newChat)
+
   async function remove(id, e) {
     e.stopPropagation()
     try { await fetch(`/api/conversations/${id}`, { method: 'DELETE' }) } catch {}
+    // If the deleted conversation is the one on screen, clear it.
+    if (activeConvId === id) newChat()
     loadChatConversations()
   }
 
@@ -142,8 +146,15 @@ export default function App() {
   const orgName = useOrgStore(s => s.orgName)
   const pendingNav = useOrgStore(s => s.pendingNav)
   const clearNav = useOrgStore(s => s.clearNav)
+  const newChat = useOrgStore(s => s.newChat)
 
   const [tab, setTab] = useState('chat')
+
+  // Clicking "Chat" always opens a fresh chat (no stale conversation bleeding in).
+  function handleNav(id) {
+    if (id === 'chat') newChat()
+    else setTab(id)
+  }
 
   useEffect(() => {
     fetchOrg()
@@ -182,7 +193,7 @@ export default function App() {
         {/* Primary nav */}
         <div className="px-2 space-y-0.5">
           {PRIMARY_NAV.map(item => (
-            <NavItem key={item.id} item={item} active={tab === item.id} onClick={setTab} />
+            <NavItem key={item.id} item={item} active={tab === item.id} onClick={handleNav} />
           ))}
         </div>
 
