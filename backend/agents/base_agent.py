@@ -52,6 +52,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - NEVER respond with just an acknowledgment ("Sure!", "On it!", "I'll look into this"). Those waste time.
 - NEVER say you are "waiting for results" — your tools return results immediately.
 - If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
+- If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable AND you have the `create_artifact` capability, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It will be saved automatically as a viewable artifact (a "View" button appears for the user). Do NOT wrap the HTML in a JSON tool call — a plain ```html block is more reliable for large documents. Include a one-line note like "I've prepared the dashboard."
 - Cite your sources when presenting research findings (include URLs where possible).
 """
 
@@ -196,6 +197,12 @@ class BaseAgent:
 
         final_result = response.content
         tokens = response.input_tokens + response.output_tokens
+
+        # Salvage rich HTML deliverables: if the agent produced a fenced ```html
+        # block (or a create_artifact tool_call that failed to parse due to the
+        # large HTML), turn it into a viewable artifact instead of dumping raw
+        # markup into the chat.
+        final_result = await self._maybe_extract_html_artifact(final_result)
 
         # Add result to our conversation memory
         self._add_to_conversation("assistant", final_result)
@@ -542,6 +549,38 @@ class BaseAgent:
         logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
         return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
                 "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
+
+    async def _maybe_extract_html_artifact(self, text: str) -> str:
+        """If the result embeds a full HTML document (fenced ```html block, or a
+        malformed create_artifact tool_call), save it as an artifact and replace
+        it with a short note. Avoids dumping raw markup and survives the fragile
+        JSON-escaping of large HTML in tool calls."""
+        if not text or "create_artifact" not in self.config.skills:
+            return text
+        html = None
+        title = "Report"
+        # 1) Fenced ```html block (the reliable path).
+        m = re.search(r"```html\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if m and "<" in m.group(1):
+            html = m.group(1).strip()
+            cleaned = (text[:m.start()] + text[m.end():]).strip()
+        else:
+            # 2) A create_artifact tool_call whose JSON was too broken to parse —
+            #    pull the html value out leniently from the raw text.
+            if '"name": "create_artifact"' in text or '"create_artifact"' in text:
+                hm = re.search(r'<!DOCTYPE html.*?</html\s*>', text, re.DOTALL | re.IGNORECASE) \
+                    or re.search(r'<html.*?</html\s*>', text, re.DOTALL | re.IGNORECASE)
+                if hm:
+                    html = hm.group(0)
+                    cleaned = ""
+        if not html:
+            return text
+        tm = re.search(r"<title>(.*?)</title>", html, re.DOTALL | re.IGNORECASE)
+        if tm and tm.group(1).strip():
+            title = tm.group(1).strip()[:120]
+        await self._save_artifact({"title": title, "html": html})
+        note = f"I've prepared **{title}** — open it in the viewer panel."
+        return (cleaned + "\n\n" + note).strip() if cleaned else note
 
     def _add_to_conversation(self, role: str, content: str) -> None:
         self._conversation.append({"role": role, "content": content})

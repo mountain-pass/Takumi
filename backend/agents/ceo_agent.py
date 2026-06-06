@@ -73,10 +73,12 @@ If no actions are needed, just respond normally without any JSON block.
 
 ## Multi-agent coordination
 
-When a request requires multiple agents, think about the **workflow**:
+When a request requires multiple agents, think about the **workflow** and create ALL the steps NOW, in a single actions array:
 
 - **Parallel tasks**: If agents can work independently (e.g. "research X" + "research Y"), create separate tasks — no hand-off needed.
-- **Sequential/dependent tasks**: If Agent B needs Agent A's output, tell Agent A explicitly in the instruction: "Once complete, your results will be passed to [Agent B name] for [next step]." Then create Agent B's task with instruction: "Wait for research results from [Agent A name] on [topic], then [do your part]." Use `depends_on` field with Agent A's task title so the system knows the ordering.
+- **Sequential/dependent tasks**: If Agent B needs Agent A's output (e.g. one agent gathers data, another formats it into a report/HTML), create BOTH tasks right now. Give Agent B's task a `depends_on` field set to Agent A's task title — the system will automatically run B once A finishes and pass A's output to B.
+
+**CRITICAL — plan the whole workflow upfront.** If you tell the user you'll "hand the results to [Agent] to produce X", you MUST create that follow-up task in the SAME actions array with `depends_on`. NEVER promise a hand-off you don't create — there is no later step where you re-decide; the system only ever runs the tasks you create now. After a task completes you do NOT get another turn to delegate, so chain everything in one go.
 
 Example for dependent work:
 ```json
@@ -307,6 +309,13 @@ class CEOAgent(BaseAgent):
             agents_by_id = {}
             if self._orchestrator:
                 agents_by_id = {a.config.id: a.config.name for a in self._orchestrator.get_agents()}
+
+            # In a dependency chain, intermediate results (an agent whose output
+            # only feeds another task) are inputs, not deliverables — present only
+            # the terminal output(s), not the raw upstream data.
+            upstream_titles = {t.get("depends_on") for t in new_completed if t.get("depends_on")}
+            terminal = [t for t in new_completed if t.get("title") not in upstream_titles]
+            new_completed = terminal or new_completed
 
             # The Manager PRESENTS the specialists' work — it does NOT redo or
             # re-summarize it (that just adds a slow LLM call and risks mangling
@@ -832,6 +841,21 @@ class CEOAgent(BaseAgent):
                     task.get("title", ""), downstream_name, upstream_title,
                 )
                 break  # one upstream dependency is enough
+
+        # Cycle/deadlock guard: a task may only depend on one created EARLIER in
+        # this batch. Drop any depends_on that points to a same-batch task at a
+        # later index (which is what creates A↔B deadlocks where both are blocked).
+        title_index = {}
+        for i, a in enumerate(creates):
+            t = a.get("title", "")
+            if t and t not in title_index:
+                title_index[t] = i
+        for i, a in enumerate(creates):
+            dep = a.get("depends_on")
+            if dep and dep in title_index and title_index[dep] >= i:
+                logger.warning("[CEO] Dropping forward/circular dependency: '%s' depended on later task '%s'",
+                               a.get("title", ""), dep)
+                a["depends_on"] = None
 
         return actions
 

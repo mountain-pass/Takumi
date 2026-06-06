@@ -59,6 +59,21 @@ class Orchestrator:
             ceo = make_ceo_config()
             await database.save_agent(ceo.model_dump(mode="json"))
             configs = [ceo]
+        elif await database.get_setting("_ceo_prompt_v2") != "1":
+            # One-time: upgrade the lead agent from the legacy delegate prompt
+            # (uses the deprecated "delegate" array, no depends_on / multi-step
+            # workflow support) to the current actions-based prompt. Detect the
+            # legacy default specifically, and never run again (flag-guarded), so a
+            # user's custom prompt is never clobbered.
+            from .agents.ceo_agent import CEO_SYSTEM_PROMPT
+            for cfg in configs:
+                sp = cfg.system_prompt or ""
+                is_legacy = cfg.is_ceo and '"delegate"' in sp and '"actions"' not in sp
+                if is_legacy:
+                    cfg.system_prompt = CEO_SYSTEM_PROMPT
+                    await database.save_agent(cfg.model_dump(mode="json"))
+                    logger.info("[orchestrator] Upgraded '%s' from legacy delegate prompt to current CEO prompt", cfg.name)
+            await database.set_setting("_ceo_prompt_v2", "1")
 
         for cfg in configs:
             await self._spawn_agent(cfg)
