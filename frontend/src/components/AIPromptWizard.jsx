@@ -3,7 +3,7 @@
 import React, { useState } from 'react'
 import { Sparkles, RotateCcw, Check, Loader2 } from 'lucide-react'
 
-export default function AIPromptWizard({ name, role, description, currentPrompt, onAccept, onError, children }) {
+export default function AIPromptWizard({ name, role, description, currentPrompt, onAccept, onError, children, mode = 'system_prompt' }) {
   const [loading, setLoading] = useState(false)
   const [hasDraft, setHasDraft] = useState(false)
   const [original, setOriginal] = useState(null)
@@ -28,6 +28,7 @@ export default function AIPromptWizard({ name, role, description, currentPrompt,
           agent_role: role,
           agent_description: description || '',
           current_prompt: currentPrompt || '',
+          mode,
         }),
       })
       if (!res.ok) {

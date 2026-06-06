@@ -60,6 +60,13 @@ class AgentConfig(BaseModel):
     canvas_y: float = 0
     api_provider_id: Optional[str] = None
 
+    # ── Advanced: soul + autonomy boundaries ──────────────────────────────────
+    personality: str = ""            # the agent's "soul" — mirrored to soul.md
+    max_iterations: int = 10         # max tool-call cycles per task (0 = default)
+    token_budget: int = 0            # hard token cap per task (0 = unlimited)
+    hitl_enabled: bool = False       # human-in-the-loop master switch (enforced later)
+    hitl_triggers: list[str] = Field(default_factory=list)  # e.g. ["run_shell", "write_file"]
+
 
 class AgentState(BaseModel):
     config: AgentConfig

@@ -166,6 +166,11 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE conversations ADD COLUMN is_temporary INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_tasks ADD COLUMN depends_on TEXT",
         "ALTER TABLE mcp_servers ADD COLUMN auth TEXT NOT NULL DEFAULT 'none'",
+        "ALTER TABLE agents ADD COLUMN personality TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agents ADD COLUMN max_iterations INTEGER NOT NULL DEFAULT 10",
+        "ALTER TABLE agents ADD COLUMN token_budget INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN hitl_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN hitl_triggers TEXT NOT NULL DEFAULT '[]'",
     ]:
         try:
             await _db.execute(migration)
@@ -297,18 +302,23 @@ async def delete_api_provider(provider_id: str) -> None:
 
 async def save_agent(agent: dict) -> None:
     skills = json.dumps(agent.get("skills", []))
+    hitl_triggers = json.dumps(agent.get("hitl_triggers", []))
     await _conn().execute(
         """INSERT INTO agents(id, name, role, description, system_prompt,
            llm_provider, llm_model, skills, is_ceo, avatar_color,
-           max_context_messages, canvas_x, canvas_y, api_provider_id)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           max_context_messages, canvas_x, canvas_y, api_provider_id,
+           personality, max_iterations, token_budget, hitl_enabled, hitl_triggers)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              name=excluded.name, role=excluded.role, description=excluded.description,
              system_prompt=excluded.system_prompt, llm_provider=excluded.llm_provider,
              llm_model=excluded.llm_model, skills=excluded.skills, is_ceo=excluded.is_ceo,
              avatar_color=excluded.avatar_color, max_context_messages=excluded.max_context_messages,
              canvas_x=excluded.canvas_x, canvas_y=excluded.canvas_y,
-             api_provider_id=excluded.api_provider_id""",
+             api_provider_id=excluded.api_provider_id,
+             personality=excluded.personality, max_iterations=excluded.max_iterations,
+             token_budget=excluded.token_budget, hitl_enabled=excluded.hitl_enabled,
+             hitl_triggers=excluded.hitl_triggers""",
         (
             agent["id"], agent["name"], agent.get("role", ""),
             agent.get("description", ""), agent.get("system_prompt", ""),
@@ -318,6 +328,9 @@ async def save_agent(agent: dict) -> None:
             agent.get("max_context_messages", 20),
             agent.get("canvas_x", 0), agent.get("canvas_y", 0),
             agent.get("api_provider_id"),
+            agent.get("personality", ""), agent.get("max_iterations", 10),
+            agent.get("token_budget", 0), int(agent.get("hitl_enabled", False)),
+            hitl_triggers,
         ),
     )
     await _conn().commit()
@@ -332,6 +345,8 @@ async def get_all_agents() -> list[dict]:
         d = dict(r)
         d["skills"] = json.loads(d["skills"])
         d["is_ceo"] = bool(d["is_ceo"])
+        d["hitl_enabled"] = bool(d.get("hitl_enabled", 0))
+        d["hitl_triggers"] = json.loads(d.get("hitl_triggers") or "[]")
         result.append(d)
     return result
 

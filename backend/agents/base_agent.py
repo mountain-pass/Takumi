@@ -259,16 +259,24 @@ class BaseAgent:
 
     # ── Work execution (internal tool loop) ─────────────────────────────────
 
-    async def _do_work_with_tools(self, task_content: str, max_rounds: int = 10) -> LLMResponse:
+    async def _do_work_with_tools(self, task_content: str, max_rounds: int | None = None) -> LLMResponse:
         """Execute work using tools. All tool calls happen INTERNALLY.
         Only the final synthesized result is returned.
 
         Uses an isolated work_messages list so intermediate tool calls
         don't leak into the agent's shared conversation or the message bus.
+
+        Honours the agent's autonomy boundaries: max_iterations (tool-call cycles)
+        and token_budget (hard per-task token cap).
         """
         system = await self._build_system_prompt()
         total_input = 0
         total_output = 0
+
+        # Autonomy boundaries
+        if max_rounds is None:
+            max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 10
+        token_budget = self.config.token_budget or 0
 
         # Start with the agent's existing conversation context
         # (includes prior messages for context) but tool rounds go into work_messages
@@ -289,6 +297,18 @@ class BaseAgent:
             )
             total_input += response.input_tokens
             total_output += response.output_tokens
+
+            # Token budget — stop spending if the hard cap is exceeded.
+            if token_budget and (total_input + total_output) > token_budget:
+                logger.warning("[%s] Token budget %d exceeded (%d used) — forcing final answer",
+                               self.config.name, token_budget, total_input + total_output)
+                work_messages.append({"role": "user", "content":
+                    "[System] Token budget reached. Provide your best final answer now "
+                    "from what you have. Plain text only."})
+                final = await self._adapter.complete(
+                    system_prompt=system, messages=work_messages, model=self.config.llm_model)
+                return LLMResponse(content=final.content, input_tokens=total_input + final.input_tokens,
+                                   output_tokens=total_output + final.output_tokens, model=self.config.llm_model)
 
             # Check for tool call
             tool_call = self._parse_tool_call(response.content)
@@ -351,6 +371,18 @@ class BaseAgent:
     async def _build_system_prompt(self) -> str:
         """Build the full system prompt with SOP, tools, and connections."""
         system = self.config.system_prompt
+
+        # Soul (personality) + persistent memory from the agent's folder files,
+        # so the agent stays in character and recalls learned context each run.
+        try:
+            from ..agent_folders import read_agent_context
+            ctx = read_agent_context(self.settings.data_dir, self.config.name)
+            if ctx.get("soul"):
+                system += f"\n\n## Your personality (soul)\nStay in character with this:\n{ctx['soul']}"
+            if ctx.get("memory"):
+                system += f"\n\n## Your memory\nRelevant context you've retained:\n{ctx['memory']}"
+        except Exception:
+            pass
 
         # Core work SOP for all non-CEO agents
         if not self.config.is_ceo:

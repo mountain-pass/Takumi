@@ -519,7 +519,7 @@ class CEOAgent(BaseAgent):
         return result
 
     async def _complete_with_tools(
-        self, msgs: list[dict], system: str, max_rounds: int = 6,
+        self, msgs: list[dict], system: str, max_rounds: int | None = None,
     ):
         """Run a bounded tool-calling loop, returning the final LLMResponse.
 
@@ -528,6 +528,8 @@ class CEOAgent(BaseAgent):
         only being able to delegate. Intermediate tool calls are appended to `msgs`
         but the returned response is the final plain-text answer.
         """
+        if max_rounds is None:
+            max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 6
         last = None
         for _ in range(max_rounds):
             resp = await self._adapter.complete(

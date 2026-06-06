@@ -87,6 +87,12 @@ class CreateAgentRequest(BaseModel):
     skills: list[str] = []
     avatar_color: str = "#4F46E5"
     max_context_messages: int = 20
+    # Advanced
+    personality: str = ""
+    max_iterations: int = 10
+    token_budget: int = 0
+    hitl_enabled: bool = False
+    hitl_triggers: list[str] = []
 
 
 class UpdateAgentRequest(BaseModel):
@@ -99,6 +105,12 @@ class UpdateAgentRequest(BaseModel):
     skills: list[str] | None = None
     avatar_color: str | None = None
     api_provider_id: str | None = None
+    # Advanced
+    personality: str | None = None
+    max_iterations: int | None = None
+    token_budget: int | None = None
+    hitl_enabled: bool | None = None
+    hitl_triggers: list[str] | None = None
 
 
 class SubmitTaskRequest(BaseModel):
@@ -494,6 +506,7 @@ class PromptEnhanceRequest(BaseModel):
     agent_role: str
     agent_description: str = ""
     current_prompt: str = ""
+    mode: str = "system_prompt"   # 'system_prompt' | 'personality'
 
 
 @router.post("/prompt-enhance")
@@ -511,23 +524,39 @@ async def enhance_prompt(req: PromptEnhanceRequest):
         adapter = get_adapter(provider, get_settings(), rt)
         model = rt.get("llm_model") or _default_model(provider_str)
 
-        meta = (
-            "You are an expert at crafting system prompts for AI agents in a multi-agent organisation. "
-            "Given the agent's name, role, and description, write a comprehensive system prompt that covers:\n"
-            "1. **Identity & Expertise** — who the agent is, their domain knowledge, and professional background\n"
-            "2. **Core Responsibilities** — specific tasks and duties this agent handles\n"
-            "3. **Behavioural Guidelines** — communication style, tone, and how they interact with other agents and users\n"
-            "4. **Decision-Making Principles** — how they prioritise, what they escalate, and when they ask for help\n"
-            "5. **Output Standards** — quality expectations, formats, and deliverables they produce\n\n"
-            "Write the prompt in second person (\"You are...\"). Be specific and actionable, not generic. "
-            "Tailor every detail to the role described. Return ONLY the system prompt text, no preamble or explanation."
-        )
-        user_msg = (
-            f"Agent name: {req.agent_name}\n"
-            f"Role: {req.agent_role}\n"
-            f"Description: {req.agent_description}\n"
-            + (f"\nCurrent prompt (improve and expand on this):\n{req.current_prompt}" if req.current_prompt else "")
-        )
+        if req.mode == "personality":
+            meta = (
+                "You are an expert at crafting the PERSONALITY ('soul') of an AI agent — its character, "
+                "not its job. Given the agent's name, role, and description, write a vivid personality "
+                "profile covering: tone of voice, temperament, values, communication quirks, and how it "
+                "makes the people it works with feel. Keep it to a few tight sentences or short bullets. "
+                "Write in second person (\"You are...\"). Do NOT describe responsibilities, tasks, or tools — "
+                "only character and tone. Return ONLY the personality text, no preamble."
+            )
+            user_msg = (
+                f"Agent name: {req.agent_name}\n"
+                f"Role: {req.agent_role}\n"
+                f"Description: {req.agent_description}\n"
+                + (f"\nCurrent personality (refine this):\n{req.current_prompt}" if req.current_prompt else "")
+            )
+        else:
+            meta = (
+                "You are an expert at crafting system prompts for AI agents in a multi-agent organisation. "
+                "Given the agent's name, role, and description, write a comprehensive system prompt that covers:\n"
+                "1. **Identity & Expertise** — who the agent is, their domain knowledge, and professional background\n"
+                "2. **Core Responsibilities** — specific tasks and duties this agent handles\n"
+                "3. **Behavioural Guidelines** — communication style, tone, and how they interact with other agents and users\n"
+                "4. **Decision-Making Principles** — how they prioritise, what they escalate, and when they ask for help\n"
+                "5. **Output Standards** — quality expectations, formats, and deliverables they produce\n\n"
+                "Write the prompt in second person (\"You are...\"). Be specific and actionable, not generic. "
+                "Tailor every detail to the role described. Return ONLY the system prompt text, no preamble or explanation."
+            )
+            user_msg = (
+                f"Agent name: {req.agent_name}\n"
+                f"Role: {req.agent_role}\n"
+                f"Description: {req.agent_description}\n"
+                + (f"\nCurrent prompt (improve and expand on this):\n{req.current_prompt}" if req.current_prompt else "")
+            )
 
         resp = await adapter.complete(
             system_prompt=meta,
