@@ -141,73 +141,12 @@ class CEOAgent(BaseAgent):
         self._orchestrator = orchestrator
 
     async def _handle_message(self, msg: AgentMessage) -> None:
-        """Override: CEO receives agent replies — marks task done, unblocks dependents,
-        and synthesizes results back to user when all tasks complete.
-        """
-        sender_name = msg.from_agent
-        if self._orchestrator:
-            sender = next((a for a in self._orchestrator.get_agents() if a.config.id == msg.from_agent), None)
-            if sender:
-                sender_name = sender.config.name
-
-        logger.info("[CEO] Received reply from %s (task=%s): %s",
-                    sender_name, msg.task_id and msg.task_id[:8], msg.content[:80])
-
-        if not msg.task_id:
-            return  # Ignore non-task messages
-
-        try:
-            task = await database.get_task(msg.task_id)
-            if not task or task["status"] not in ("in_progress",):
-                return
-
-            # Evaluate whether the result is actually useful
-            result_quality = self._evaluate_result(msg.content, task)
-
-            if result_quality == "empty":
-                # Agent returned garbage — mark failed, log it
-                await database.update_task(msg.task_id, {
-                    "status": "failed",
-                    "result": f"Agent returned no useful result: {msg.content[:200]}",
-                    "completed_at": datetime.utcnow().isoformat(),
-                })
-                await database.create_task_log({
-                    "id": str(uuid.uuid4()),
-                    "task_id": msg.task_id,
-                    "agent_id": msg.from_agent,
-                    "action": "failed",
-                    "detail": f"Empty/confused result: {msg.content[:200]}",
-                })
-                logger.warning("[CEO] Task '%s' from %s returned empty result, marked failed",
-                               task.get("title", "")[:40], sender_name)
-                return
-
-            # Result looks valid — mark completed
-            await database.update_task(msg.task_id, {
-                "status": "completed",
-                "result": msg.content[:2000],
-                "completed_at": datetime.utcnow().isoformat(),
-                "last_run_at": datetime.utcnow().isoformat(),
-                "run_count": task.get("run_count", 0) + 1,
-            })
-            await database.create_task_log({
-                "id": str(uuid.uuid4()),
-                "task_id": msg.task_id,
-                "agent_id": msg.from_agent,
-                "action": "completed",
-                "detail": msg.content[:500],
-            })
-            logger.info("[CEO] Marked task '%s' as completed (quality: %s)",
-                        task.get("title", "")[:40], result_quality)
-
-            # Unblock any tasks that depend on this one
-            await self._unblock_dependents(task, msg.content)
-
-            # Check if ALL CEO-assigned tasks are now done — if so, synthesize for user
-            await self._check_all_tasks_done(task, sender_name, msg.content)
-
-        except Exception as e:
-            logger.error("[CEO] Failed to handle agent reply: %s", e, exc_info=True)
+        """The Manager receives an agent reply for awareness only. Task completion,
+        dependency hand-off, and presenting results are now driven at the SYSTEM
+        level by the orchestrator (orchestrator.on_task_completed), so there is no
+        per-reply orchestration to do here."""
+        if msg.task_id:
+            logger.debug("[CEO] Saw reply for task %s from %s", msg.task_id[:8], msg.from_agent)
 
     def _evaluate_result(self, content: str, task: dict) -> str:
         """Evaluate if an agent's result is useful. Returns 'good', 'short', or 'empty'."""
@@ -251,61 +190,32 @@ class CEOAgent(BaseAgent):
             # Unparseable timestamp — treat as recent to avoid dropping real results.
             return True
 
-    async def _check_all_tasks_done(self, just_completed: dict, agent_name: str, result: str) -> None:
-        """When a task completes, check if all CEO-assigned active tasks are done.
-        If so, synthesize results and push to user's chat via WebSocket.
+    async def present_results(self, completed_tasks: list[dict], conv_id: str | None) -> None:
+        """Present a finished plan's terminal deliverable(s) to the user.
+
+        Called by the orchestrator once every task in a plan is complete. The
+        Manager does NOT redo the work — it forwards the specialists' output, only
+        the terminal results (intermediate inputs in a chain are skipped).
         """
         acquired = False
         try:
-            all_tasks = await database.get_all_tasks(limit=100)
-            # Find tasks assigned by CEO that are still pending/in_progress/blocked
-            outstanding = [
-                t for t in all_tasks
-                if t.get("assigned_by") == self.config.id
-                and t["status"] in ("pending", "in_progress", "blocked")
-            ]
-
-            if outstanding:
-                logger.info("[CEO] %d tasks still outstanding, waiting...", len(outstanding))
-                return
-
-            # All done — gather task results completed during THIS run only.
-            # Tasks completed before the Manager started (an old backlog) are never
-            # re-reported, even after a restart that cleared _reported_task_ids.
-            completed_tasks = [
-                t for t in all_tasks
-                if t.get("assigned_by") == self.config.id
-                and t["status"] == "completed"
-                and t.get("completed_at")
+            # Only present tasks we completed during this run and haven't reported.
+            new_completed = [
+                t for t in completed_tasks
+                if t.get("status") == "completed"
+                and t["id"] not in self._reported_task_ids
                 and self._completed_after_start(t.get("completed_at"))
             ]
-
-            if not completed_tasks:
-                return
-
-            # Only synthesize if there are NEWLY completed tasks we haven't
-            # already reported. Otherwise every later task completion (duplicate
-            # agent replies, routine tasks, etc.) would re-trigger synthesis of
-            # the same old results — the endless "Synthesizing results..." loop.
-            new_completed = [t for t in completed_tasks if t["id"] not in self._reported_task_ids]
             if not new_completed:
                 return
-
-            # Prevent overlapping synthesis runs from leaving the CEO stuck in
-            # the THINKING state.
             if self._synthesizing:
                 return
             self._synthesizing = True
             acquired = True
 
-            # Mark these as reported up-front so concurrent completions don't
-            # queue a second synthesis of the same batch.
-            for t in completed_tasks:
+            for t in new_completed:
                 self._reported_task_ids.add(t["id"])
 
-            # Build a summary from ONLY the newly-completed tasks for THIS round —
-            # never the full history. Pulling old, unrelated completed tasks (e.g. a
-            # previous research request) into the synthesis confuses the report.
             agents_by_id = {}
             if self._orchestrator:
                 agents_by_id = {a.config.id: a.config.name for a in self._orchestrator.get_agents()}
@@ -339,9 +249,10 @@ class CEOAgent(BaseAgent):
             artifacts = await database.get_artifacts_for_tasks([t["id"] for t in new_completed])
             artifact_meta = [{"id": a["id"], "title": a["title"], "kind": a["kind"]} for a in artifacts]
 
-            # Find the most recent conversation to save to
-            conversations = await database.get_conversations(limit=1)
-            conv_id = conversations[0]["id"] if conversations else None
+            # Save to the plan's own conversation (fall back to most recent).
+            if not conv_id:
+                conversations = await database.get_conversations(limit=1)
+                conv_id = conversations[0]["id"] if conversations else None
 
             if conv_id:
                 msg_id = str(uuid.uuid4())
@@ -576,6 +487,10 @@ class CEOAgent(BaseAgent):
         # Artifacts created in this turn link to the active conversation.
         self._artifact_ctx = {"conversation_id": conversation_id}
         self._pending_artifacts = []
+        # The user's objective + conversation, so tasks created this turn record
+        # which plan they belong to (used for system-level orchestration).
+        self._active_conversation_id = conversation_id
+        self._active_objective = user_message
 
         # Build full context
         roster = self._build_agent_roster()
@@ -930,6 +845,9 @@ class CEOAgent(BaseAgent):
             "schedule_human": action.get("schedule_human"),
             "depends_on": depends_on,
             "next_run_at": next_run_at or datetime.utcnow().isoformat(),
+            # Plan membership + the overall objective this task serves.
+            "conversation_id": getattr(self, "_active_conversation_id", None),
+            "context": {"objective": getattr(self, "_active_objective", "")[:600], "inputs": []},
         }
         await database.create_task(task)
 

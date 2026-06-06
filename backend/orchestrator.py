@@ -144,6 +144,115 @@ class Orchestrator:
     def get_agent_states(self) -> list[dict]:
         return [a.state.model_dump(mode="json") for a in self._agents.values()]
 
+    # ── Task graph orchestration (system-level) ────────────────────────────────
+
+    def _agent_name(self, agent_id: str) -> str:
+        a = self._agents.get(agent_id)
+        return a.config.name if a else agent_id
+
+    async def on_task_completed(self, task_id: str, result: str, from_agent_id: str) -> None:
+        """A specialist finished a task. The SYSTEM (not the Manager's LLM) now:
+          1. validates + records the result,
+          2. hands its output directly to any dependent task's agent (agent→agent),
+          3. when the whole plan is done, asks the Manager to present it to the user.
+
+        This is the explicit 'rule of engagement': check the task graph, then act.
+        """
+        from datetime import datetime as _dt
+        task = await database.get_task(task_id)
+        if not task or task["status"] != "in_progress":
+            return
+
+        quality = self._ceo._evaluate_result(result, task) if self._ceo else "good"
+        now = _dt.utcnow().isoformat()
+        if quality == "empty":
+            await database.update_task(task_id, {
+                "status": "failed",
+                "result": f"Agent returned no useful result: {result[:200]}",
+                "completed_at": now,
+            })
+            logger.warning("[orchestrator] Task '%s' returned empty result — failed", task.get("title", "")[:40])
+            return
+
+        await database.update_task(task_id, {
+            "status": "completed", "result": result[:2000], "completed_at": now,
+            "last_run_at": now, "run_count": task.get("run_count", 0) + 1,
+        })
+        await database.create_task_log({
+            "id": __import__("uuid").uuid4().hex, "task_id": task_id,
+            "agent_id": from_agent_id, "action": "completed", "detail": result[:500],
+        })
+        logger.info("[orchestrator] Task '%s' completed by %s", task.get("title", "")[:40], self._agent_name(from_agent_id))
+
+        await self._handoff_to_dependents(task, result, from_agent_id)
+        await self._present_if_plan_complete(task)
+
+    async def _handoff_to_dependents(self, task: dict, result: str, from_agent_id: str) -> None:
+        """Pass a completed task's output DIRECTLY into each dependent task's
+        agent (Scarlett → Niss), recording it as structured context input."""
+        import json as _json
+        from .models import AgentMessage
+        from datetime import datetime as _dt
+        title = (task.get("title") or "").lower()
+        from_name = self._agent_name(from_agent_id)
+        try:
+            all_tasks = await database.get_all_tasks(limit=100)
+        except Exception:
+            return
+        for bt in all_tasks:
+            dep = (bt.get("depends_on") or "").lower()
+            if bt.get("status") != "blocked" or not dep:
+                continue
+            if not (dep in title or title in dep):
+                continue
+            # Record the upstream output as a named context input for this agent.
+            try:
+                ctx = _json.loads(bt.get("context") or "{}")
+            except Exception:
+                ctx = {}
+            ctx.setdefault("inputs", []).append({
+                "from": from_name, "task": task.get("title", ""), "output": result[:4000],
+            })
+            objective = ctx.get("objective", "")
+            inputs_block = "\n\n".join(
+                f"### Input from {i['from']} — \"{i['task']}\"\n{i['output']}" for i in ctx["inputs"]
+            )
+            enriched = (
+                f"{bt['instruction']}\n\n"
+                f"--- TASK CONTEXT ---\n"
+                + (f"Overall objective: {objective}\n\n" if objective else "")
+                + f"You have received the following input(s) to work from:\n\n{inputs_block}"
+            )
+            now = _dt.utcnow().isoformat()
+            await database.update_task(bt["id"], {
+                "status": "pending", "instruction": enriched, "context": ctx, "next_run_at": now,
+            })
+            # Dispatch straight to the downstream agent — FROM the upstream agent,
+            # so it is a genuine agent-to-agent hand-off, not a Manager round-trip.
+            await self.bus.publish(AgentMessage(
+                from_agent=from_agent_id, to_agent=bt["agent_id"],
+                content=f"[Task: {bt['title']}]\n\n{enriched}", task_id=bt["id"],
+            ))
+            await database.update_task(bt["id"], {"status": "in_progress", "started_at": now})
+            logger.info("[orchestrator] Handed '%s' output directly to %s for '%s'",
+                        from_name, self._agent_name(bt["agent_id"]), bt["title"][:40])
+
+    async def _present_if_plan_complete(self, task: dict) -> None:
+        """When every task in the plan (conversation) is finished, ask the Manager
+        to present the terminal deliverable(s) to the user."""
+        if not self._ceo:
+            return
+        conv_id = task.get("conversation_id")
+        if conv_id:
+            plan = await database.get_tasks_for_conversation(conv_id)
+        else:
+            plan = [task]
+        if any(t.get("status") in ("pending", "in_progress", "blocked") for t in plan):
+            return  # plan still running
+        completed = [t for t in plan if t.get("status") == "completed"]
+        if completed:
+            await self._ceo.present_results(completed, conv_id)
+
     # ── Task routing ──────────────────────────────────────────────────────────
 
     async def submit_task(self, title: str, description: str) -> Task:

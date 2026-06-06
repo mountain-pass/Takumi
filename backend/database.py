@@ -185,6 +185,7 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agents ADD COLUMN token_budget INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN hitl_enabled INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN hitl_triggers TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE agent_tasks ADD COLUMN context TEXT NOT NULL DEFAULT '{}'",
     ]:
         try:
             await _db.execute(migration)
@@ -677,8 +678,8 @@ async def create_task(task: dict) -> dict:
         """INSERT INTO agent_tasks(
             id, agent_id, assigned_by, title, instruction, task_type,
             priority, status, schedule_cron, schedule_human, next_run_at,
-            parent_task_id, conversation_id, depends_on
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            parent_task_id, conversation_id, depends_on, context
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task["id"], task["agent_id"], task.get("assigned_by", "user"),
             task["title"], task.get("instruction", ""),
@@ -687,6 +688,7 @@ async def create_task(task: dict) -> dict:
             task.get("schedule_human"), task.get("next_run_at"),
             task.get("parent_task_id"), task.get("conversation_id"),
             task.get("depends_on"),
+            json.dumps(task.get("context", {})) if not isinstance(task.get("context"), str) else task.get("context", "{}"),
         ),
     )
     await _conn().commit()
@@ -744,22 +746,35 @@ async def update_task(task_id: str, updates: dict) -> dict | None:
         return None
     current = dict(row)
     current.update({k: v for k, v in updates.items() if v is not None})
+    ctx = current.get("context", "{}")
+    if not isinstance(ctx, str):
+        ctx = json.dumps(ctx)
     await _conn().execute(
         """UPDATE agent_tasks SET
             title=?, instruction=?, task_type=?, priority=?, status=?,
             schedule_cron=?, schedule_human=?, next_run_at=?, last_run_at=?,
-            result=?, token_count=?, run_count=?, started_at=?, completed_at=?
+            result=?, token_count=?, run_count=?, started_at=?, completed_at=?,
+            context=?
         WHERE id=?""",
         (
             current["title"], current["instruction"], current["task_type"],
             current["priority"], current["status"], current["schedule_cron"],
             current["schedule_human"], current["next_run_at"], current["last_run_at"],
             current["result"], current["token_count"], current["run_count"],
-            current["started_at"], current["completed_at"], task_id,
+            current["started_at"], current["completed_at"], ctx, task_id,
         ),
     )
     await _conn().commit()
     return current
+
+
+async def get_tasks_for_conversation(conversation_id: str) -> list[dict]:
+    """All tasks belonging to one chat conversation (a 'plan')."""
+    rows = await (await _conn().execute(
+        "SELECT * FROM agent_tasks WHERE conversation_id = ? ORDER BY created_at",
+        (conversation_id,),
+    )).fetchall()
+    return [dict(r) for r in rows]
 
 
 async def delete_task(task_id: str) -> None:

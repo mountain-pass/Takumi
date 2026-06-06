@@ -237,16 +237,24 @@ class BaseAgent:
         except Exception as e:
             logger.error("[%s] Failed to update task %s: %s", self.config.name, task_id[:8], e)
 
-        # Send result back to assignor
+        # Send result back to assignor (for the activity feed / record).
         logger.info("[%s] Task %s completed, sending result (%d chars) to %s",
                     self.config.name, task_id[:8], len(final_result), sender_name)
-        reply = AgentMessage(
+        await self.bus.publish(AgentMessage(
             from_agent=self.config.id,
             to_agent=msg.from_agent,
             content=final_result,
             task_id=task_id,
-        )
-        await self.bus.publish(reply)
+        ))
+
+        # Notify the SYSTEM (orchestrator) so it can validate the result, hand it
+        # straight to any dependent agent, and present the plan when it's done.
+        # This is the single, explicit place where task completion is handled.
+        if self._orchestrator and task_id:
+            try:
+                await self._orchestrator.on_task_completed(task_id, final_result, self.config.id)
+            except Exception as e:
+                logger.error("[%s] on_task_completed failed for %s: %s", self.config.name, task_id[:8], e)
 
     async def _report_task_failure(self, msg: AgentMessage, error: str) -> None:
         """Report a task failure: update DB and notify assignor."""
