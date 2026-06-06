@@ -551,36 +551,41 @@ class BaseAgent:
                 "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
 
     async def _maybe_extract_html_artifact(self, text: str) -> str:
-        """If the result embeds a full HTML document (fenced ```html block, or a
-        malformed create_artifact tool_call), save it as an artifact and replace
-        it with a short note. Avoids dumping raw markup and survives the fragile
-        JSON-escaping of large HTML in tool calls."""
+        """If the result embeds a full HTML document (a fenced ```html block — the
+        closing fence is optional since models often drop it on long blocks — or a
+        raw <html> document), save it as an artifact and replace it with a short
+        note, instead of dumping raw markup into the chat."""
         if not text or "create_artifact" not in self.config.skills:
             return text
         html = None
-        title = "Report"
-        # 1) Fenced ```html block (the reliable path).
-        m = re.search(r"```html\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-        if m and "<" in m.group(1):
-            html = m.group(1).strip()
-            cleaned = (text[:m.start()] + text[m.end():]).strip()
-        else:
-            # 2) A create_artifact tool_call whose JSON was too broken to parse —
-            #    pull the html value out leniently from the raw text.
-            if '"name": "create_artifact"' in text or '"create_artifact"' in text:
-                hm = re.search(r'<!DOCTYPE html.*?</html\s*>', text, re.DOTALL | re.IGNORECASE) \
-                    or re.search(r'<html.*?</html\s*>', text, re.DOTALL | re.IGNORECASE)
-                if hm:
-                    html = hm.group(0)
-                    cleaned = ""
-        if not html:
+        cleaned = text
+        # 1) Fenced ```html block; closing fence optional.
+        m = re.search(r"```html\b", text, re.IGNORECASE)
+        if m:
+            rest = text[m.end():]
+            close = re.search(r"```", rest)
+            body = rest[:close.start()] if close else rest
+            after = rest[close.end():] if close else ""
+            if "<" in body:
+                html = body.strip()
+                cleaned = (text[:m.start()] + after).strip()
+        # 2) A raw <html>…</html> document anywhere in the text.
+        if html is None:
+            hm = re.search(r"(<!DOCTYPE html\b.*?</html\s*>|<html\b.*?</html\s*>)", text,
+                           re.DOTALL | re.IGNORECASE)
+            if hm:
+                html = hm.group(1).strip()
+                cleaned = (text[:hm.start()] + text[hm.end():]).strip()
+        if not html or len(html) < 80:
             return text
+        title = "Report"
         tm = re.search(r"<title>(.*?)</title>", html, re.DOTALL | re.IGNORECASE)
         if tm and tm.group(1).strip():
             title = tm.group(1).strip()[:120]
         await self._save_artifact({"title": title, "html": html})
         note = f"I've prepared **{title}** — open it in the viewer panel."
-        return (cleaned + "\n\n" + note).strip() if cleaned else note
+        cleaned = cleaned.strip()
+        return f"{cleaned}\n\n{note}" if cleaned else note
 
     def _add_to_conversation(self, role: str, content: str) -> None:
         self._conversation.append({"role": role, "content": content})
