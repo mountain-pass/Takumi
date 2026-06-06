@@ -100,6 +100,12 @@ export const useOrgStore = create((set, get) => ({
     const { type, payload } = event
     if (type === 'init') {
       set({ agents: payload.agents, tasks: payload.tasks, messages: payload.messages || [] })
+    } else if (type === 'heartbeat') {
+      // Periodic full-state snapshot — reconcile so a missed agent_status event
+      // can't leave an agent stuck showing "Thinking" until a manual refresh.
+      if (Array.isArray(payload.agents) && payload.agents.length) {
+        set({ agents: payload.agents })
+      }
     } else if (type === 'agent_status') {
       set(s => ({
         agents: s.agents.map(a => a.config.id === payload.config.id ? payload : a)
