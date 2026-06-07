@@ -91,6 +91,17 @@ class Orchestrator:
         for agent in list(self._agents.values()):
             await agent.stop()
 
+    async def reload_agents(self) -> None:
+        """Tear down running agents and respawn from the DB (used after a restore)."""
+        for agent in list(self._agents.values()):
+            await agent.stop()
+        self._agents.clear()
+        self._ceo = None
+        agent_rows = await database.get_all_agents()
+        for cfg in [_agent_config_from_row(r) for r in agent_rows]:
+            await self._spawn_agent(cfg)
+        logger.info("[orchestrator] Reloaded %d agents from DB", len(self._agents))
+
     # ── Agent management ──────────────────────────────────────────────────────
 
     async def add_agent(self, config: AgentConfig) -> BaseAgent:

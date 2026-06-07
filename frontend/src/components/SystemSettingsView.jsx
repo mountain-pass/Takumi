@@ -2,7 +2,7 @@
  * SystemSettingsView — manage system LLM provider, org name, and onboarding settings.
  */
 import React, { useState, useEffect } from 'react'
-import { Settings, CheckCircle, Loader2, Save, Trash2, AlertTriangle } from 'lucide-react'
+import { Settings, CheckCircle, Loader2, Save, Trash2, AlertTriangle, Download, Upload } from 'lucide-react'
 import { useOrg, useOllamaModels, useSaveOrg, useSaveLLMSettings, useTestLLM } from '../hooks/useApi'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -244,6 +244,11 @@ export default function SystemSettingsView() {
 
         <hr className="border-gray-200" />
 
+        {/* Backup & Restore */}
+        <BackupRestore />
+
+        <hr className="border-gray-200" />
+
         {/* Danger zone */}
         <div className="space-y-4">
           <h2 className="text-sm font-semibold text-red-600 uppercase tracking-wide">Danger Zone</h2>
@@ -295,6 +300,71 @@ export default function SystemSettingsView() {
             )}
           </div>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Backup & Restore ──────────────────────────────────────────────────────────
+function BackupRestore() {
+  const [restoring, setRestoring] = React.useState(false)
+  const [msg, setMsg] = React.useState(null)   // { ok, text }
+  const fileRef = React.useRef(null)
+
+  function download() {
+    // Hit the endpoint directly so the browser saves the zip.
+    window.location.href = '/api/backup'
+  }
+
+  async function onFile(e) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (!confirm('Restore from this backup? It will REPLACE the current agents, connections, providers/keys, and MCP servers.')) return
+    setRestoring(true); setMsg(null)
+    try {
+      const body = new FormData()
+      body.append('file', file)
+      const res = await fetch('/api/restore', { method: 'POST', body })
+      if (!res.ok) throw new Error(await res.text())
+      const d = await res.json()
+      const n = d.imported?.agents ?? 0
+      setMsg({ ok: true, text: `Restored ${n} agents, ${d.agent_files} files, and all settings. Reloading…` })
+      setTimeout(() => window.location.reload(), 1500)
+    } catch (err) {
+      setMsg({ ok: false, text: `Restore failed: ${err.message}` })
+    } finally {
+      setRestoring(false)
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Backup &amp; Restore</h2>
+      <div className="border border-gray-200 rounded-xl p-4 space-y-3">
+        <p className="text-xs text-gray-500">
+          Export your whole organisation — agents and their files (agent.md, soul.md, memory.md),
+          the connections between them, API providers &amp; keys, and MCP servers — into a single zip.
+          Restore it on a fresh machine to recreate everything.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={download}
+            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium transition-colors">
+            <Download size={14} /> Download backup (.zip)
+          </button>
+          <button onClick={() => fileRef.current?.click()} disabled={restoring}
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-xl text-sm font-medium transition-colors disabled:opacity-50">
+            {restoring ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+            {restoring ? 'Restoring…' : 'Restore from backup'}
+          </button>
+          <input ref={fileRef} type="file" accept=".zip" className="hidden" onChange={onFile} />
+        </div>
+        {msg && (
+          <p className={`text-xs ${msg.ok ? 'text-green-600' : 'text-red-600'}`}>{msg.text}</p>
+        )}
+        <p className="text-[11px] text-amber-600">
+          ⚠️ The backup contains your API keys in plain text — store it securely. Restoring replaces existing config.
+        </p>
       </div>
     </div>
   )
