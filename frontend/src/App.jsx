@@ -15,6 +15,8 @@ import {
   WifiOff,
   Settings,
   Trash2,
+  Moon,
+  Sun,
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
@@ -149,6 +151,16 @@ export default function App() {
   const newChat = useOrgStore(s => s.newChat)
 
   const [tab, setTab] = useState('chat')
+  const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'))
+
+  function toggleTheme() {
+    setDark(d => {
+      const next = !d
+      document.documentElement.classList.toggle('dark', next)
+      localStorage.setItem('takumi-theme', next ? 'dark' : 'light')
+      return next
+    })
+  }
 
   // Clicking "Chat" always opens a fresh chat (no stale conversation bleeding in).
   function handleNav(id) {
@@ -224,8 +236,16 @@ export default function App() {
         {/* Chat history */}
         <ChatHistory active={tab} />
 
-        {/* Connection status */}
+        {/* Theme toggle + connection status */}
         <div className="px-2 space-y-2">
+          <button
+            onClick={toggleTheme}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors"
+            title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {dark ? <Sun size={13} className="shrink-0" /> : <Moon size={13} className="shrink-0" />}
+            {dark ? 'Light mode' : 'Dark mode'}
+          </button>
           <div className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium
             ${connected ? 'text-green-600 bg-green-50' : 'text-red-500 bg-red-50'}`}>
             {connected
