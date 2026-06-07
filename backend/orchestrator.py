@@ -165,7 +165,14 @@ class Orchestrator:
 
         quality = self._ceo._evaluate_result(result, task) if self._ceo else "good"
         now = _dt.utcnow().isoformat()
-        if quality == "empty":
+        # A task that produced an artifact (image / video / dashboard) is a real
+        # deliverable even if its text reply is short — don't fail it as "empty".
+        produced_artifact = False
+        try:
+            produced_artifact = bool(await database.get_artifacts_for_tasks([task_id]))
+        except Exception:
+            pass
+        if quality == "empty" and not produced_artifact:
             await database.update_task(task_id, {
                 "status": "failed",
                 "result": f"Agent returned no useful result: {result[:200]}",
