@@ -560,14 +560,14 @@ class BaseAgent:
                     arguments.get("image_url", ""), arguments.get("question", ""))
             if kind == "image":
                 art = await model_tools.generate_image(cfg, self.settings, arguments.get("prompt", ""))
-                await self._save_artifact({"title": art["title"], "html": art["html"]})
-                return (f"Image generated and saved as an artifact ('{art['title']}'). "
-                        "Tell the user it's ready in the viewer — do not describe the raw image data.")
+                await self._save_artifact({"title": art["title"], "kind": "image", "content": art["src"]})
+                return (f"Image generated ('{art['title']}'). It is shown inline in the chat. "
+                        "Tell the user the image is ready — do not describe the raw image data.")
             if kind == "video":
                 art = await model_tools.generate_video(cfg, self.settings, arguments.get("prompt", ""))
-                await self._save_artifact({"title": art["title"], "html": art["html"]})
-                return (f"Video generated and saved as an artifact ('{art['title']}'). "
-                        "Tell the user it's ready in the viewer.")
+                await self._save_artifact({"title": art["title"], "kind": "video", "content": art["src"]})
+                return (f"Video generated ('{art['title']}'). It is shown inline in the chat. "
+                        "Tell the user the video is ready.")
             # text
             return await model_tools.run_text(cfg, self.settings, arguments.get("prompt", ""))
         except Exception as e:
@@ -575,12 +575,13 @@ class BaseAgent:
             return f"Specialist model error: {e}"
 
     async def _save_artifact(self, arguments: dict) -> str:
-        """Persist a rich HTML artifact and record it for the current turn."""
+        """Persist an artifact (html / image / video) and record it for this turn."""
         import uuid as _uuid
         title = (arguments.get("title") or "Artifact").strip()[:120]
-        html = arguments.get("html") or ""
-        if not html.strip():
-            return "Error: create_artifact requires non-empty 'html'."
+        kind = (arguments.get("kind") or "html").lower()
+        content = arguments.get("content") or arguments.get("html") or ""
+        if not str(content).strip():
+            return f"Error: artifact requires non-empty content ({kind})."
         artifact_id = _uuid.uuid4().hex
         try:
             await database.save_artifact({
@@ -589,16 +590,15 @@ class BaseAgent:
                 "task_id": self._artifact_ctx.get("task_id"),
                 "agent_id": self.config.id,
                 "title": title,
-                "kind": "html",
-                "content": html,
+                "kind": kind,
+                "content": content,
             })
         except Exception as e:
             logger.error("[%s] Failed to save artifact: %s", self.config.name, e)
             return f"Error saving artifact: {e}"
-        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": "html"})
-        logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
-        return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
-                "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
+        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": kind})
+        logger.info("[%s] Created %s artifact '%s'", self.config.name, kind, title)
+        return f"Artifact '{title}' created (id={artifact_id})."
 
     async def _maybe_extract_html_artifact(self, text: str) -> str:
         """If the result embeds a full HTML document (a fenced ```html block — the

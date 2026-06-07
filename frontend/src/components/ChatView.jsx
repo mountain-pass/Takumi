@@ -513,6 +513,7 @@ function ChatBubble({ message }) {
   const attachments = message.attachments || []
   const artifacts = message.artifacts || []
   const openArtifact = useOrgStore(s => s.openArtifact)
+  const [lightbox, setLightbox] = useState(null)
 
   return (
     <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
@@ -553,15 +554,47 @@ function ChatBubble({ message }) {
             <MarkdownContent text={message.content} />
           </div>
         )}
-        {/* Artifact view buttons */}
+        {/* Artifacts: images/videos render inline; everything else gets a View button */}
         {artifacts.length > 0 && (
-          <div className="mt-2 pt-2 border-t border-gray-200/60 flex flex-wrap gap-1.5">
-            {artifacts.map(a => (
-              <button key={a.id} onClick={() => openArtifact(a)}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors">
-                <LayoutDashboard size={13} /> View: {a.title}
-              </button>
-            ))}
+          <div className="mt-2 pt-2 border-t border-gray-200/60 space-y-2">
+            {artifacts.map(a => {
+              const raw = `${API}/artifacts/${a.id}/raw`
+              if (a.kind === 'image') {
+                return (
+                  <div key={a.id} className="space-y-1">
+                    <img src={raw} alt={a.title}
+                      onClick={() => setLightbox(raw)}
+                      className="max-w-full max-h-80 rounded-lg border border-black/10 cursor-zoom-in object-contain" />
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <button onClick={() => setLightbox(raw)} className="text-indigo-600 hover:text-indigo-700 font-medium">Expand</button>
+                      <a href={raw} download={`${a.title || 'image'}.png`} className="text-indigo-600 hover:text-indigo-700 font-medium">Download</a>
+                    </div>
+                  </div>
+                )
+              }
+              if (a.kind === 'video') {
+                return (
+                  <div key={a.id} className="space-y-1">
+                    <video src={raw} controls className="max-w-full max-h-80 rounded-lg border border-black/10" />
+                    <a href={raw} download className="text-[11px] text-indigo-600 hover:text-indigo-700 font-medium">Download</a>
+                  </div>
+                )
+              }
+              return (
+                <button key={a.id} onClick={() => openArtifact(a)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors">
+                  <LayoutDashboard size={13} /> View: {a.title}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        {lightbox && (
+          <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-6" onClick={() => setLightbox(null)}>
+            <img src={lightbox} alt="" className="max-w-full max-h-full object-contain" onClick={e => e.stopPropagation()} />
+            <button onClick={() => setLightbox(null)} className="absolute top-4 right-4 text-white/80 hover:text-white"><X size={24} /></button>
+            <a href={lightbox} download="image.png" onClick={e => e.stopPropagation()}
+              className="absolute bottom-4 right-4 px-3 py-1.5 text-sm bg-white/15 hover:bg-white/25 text-white rounded-lg">Download</a>
           </div>
         )}
         {/* Action chips — clickable to expand */}

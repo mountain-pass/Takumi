@@ -170,15 +170,7 @@ async def generate_image(cfg: dict, settings, prompt: str) -> dict:
         src = data["url"]
     else:
         raise ValueError("Image generation returned no image")
-    title = prompt[:80]
-    html = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>{title}</title><style>body{{margin:0;background:#0f1117;display:flex;"
-        "align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;"
-        "max-height:100vh;object-fit:contain}</style></head>"
-        f"<body><img src='{src}' alt='generated image'></body></html>"
-    )
-    return {"html": html, "title": title}
+    return {"src": src, "title": prompt[:80]}
 
 
 async def generate_video(cfg: dict, settings, prompt: str) -> dict:
@@ -202,12 +194,4 @@ async def generate_video(cfg: dict, settings, prompt: str) -> dict:
     src = data.get("url") or (f"data:video/mp4;base64,{data['b64_json']}" if data.get("b64_json") else None)
     if not src:
         raise ValueError("Video generation returned no video")
-    title = prompt[:80]
-    html = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>{title}</title><style>body{{margin:0;background:#0f1117;display:flex;"
-        "align-items:center;justify-content:center;min-height:100vh}video{max-width:100%;"
-        "max-height:100vh}</style></head>"
-        f"<body><video src='{src}' controls autoplay loop></video></body></html>"
-    )
-    return {"html": html, "title": title}
+    return {"src": src, "title": prompt[:80]}

@@ -1015,14 +1015,27 @@ async def get_artifact_meta(artifact_id: str):
 
 @router.get("/artifacts/{artifact_id}/raw")
 async def get_artifact_raw(artifact_id: str):
-    """Serve the artifact HTML to render inside a sandboxed iframe."""
-    from fastapi.responses import HTMLResponse, PlainTextResponse
+    """Serve an artifact: HTML inline, image/video as the media itself."""
+    from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
     a = await database.get_artifact(artifact_id)
     if not a:
         raise HTTPException(404, "Artifact not found")
-    if a["kind"] == "html":
-        return HTMLResponse(a["content"])
-    return PlainTextResponse(a["content"])
+    kind = a["kind"]
+    content = a["content"]
+    if kind in ("image", "video"):
+        # content is either a remote URL or a data: URI.
+        if content.startswith("data:"):
+            try:
+                header, b64 = content.split(",", 1)
+                media_type = header.split(":", 1)[1].split(";", 1)[0]
+                import base64 as _b64
+                return Response(_b64.b64decode(b64), media_type=media_type)
+            except Exception:
+                raise HTTPException(500, "Bad media data URI")
+        return RedirectResponse(content)
+    if kind == "html":
+        return HTMLResponse(content)
+    return PlainTextResponse(content)
 
 
 # ── API Providers ────────────────────────────────────────────────────────────
