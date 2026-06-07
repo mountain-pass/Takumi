@@ -472,6 +472,18 @@ async def test_llm(req: LLMTestRequest):
     rt = req.model_dump()
     try:
         provider = LLMProvider(req.llm_provider)
+
+        # Custom / OpenAI-compatible gateway with no explicit model → validate via
+        # /models (avoids 404s from picking an unprovisioned model).
+        if req.llm_provider in ("custom", "openai", "openrouter") and not req.llm_model:
+            try:
+                models = await _list_models_raw(rt.get("llm_base_url", ""), rt.get("llm_api_key", ""))
+            except Exception as e:
+                raise HTTPException(400, f"Could not reach the provider: {e}")
+            if not models:
+                raise HTTPException(400, "Connected, but no models were returned. Specify a model name.")
+            return {"ok": True, "models_available": len(models)}
+
         adapter = get_adapter(provider, get_settings(), rt)
         model = req.llm_model or await _resolve_test_model(
             req.llm_provider, rt.get("llm_base_url", ""), rt.get("llm_api_key", ""))
@@ -504,21 +516,24 @@ def _default_model(provider: str) -> str:
     return defaults.get(provider, "")
 
 
+async def _list_models_raw(base_url: str, api_key: str) -> list[str]:
+    """Fetch model ids from an OpenAI-compatible /models endpoint."""
+    import httpx
+    url = (base_url.rstrip("/") if base_url else "") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return [m.get("id") for m in resp.json().get("data", []) if m.get("id")]
+
+
 async def _resolve_test_model(provider: str, base_url: str, api_key: str) -> str:
-    """Pick a real model name to test with. Custom / OpenAI-compatible endpoints
-    don't have a fixed default (e.g. Agnes rejects 'default'), so discover one
-    from the provider's /models list."""
+    """Pick a real model name to test with, discovered from /models when possible."""
     if provider in ("custom", "openai", "openrouter"):
-        import httpx
-        url = (base_url.rstrip("/") if base_url else "") + "/models"
         try:
-            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                models = [m.get("id") for m in resp.json().get("data", []) if m.get("id")]
-                if models:
-                    return models[0]
+            models = await _list_models_raw(base_url, api_key)
+            if models:
+                return models[0]
         except Exception:
             pass
     return _default_model(provider)
@@ -1155,11 +1170,23 @@ async def test_provider(provider_id: str):
     }
     try:
         provider = LLMProvider(rec["provider"])
+
+        # For custom / OpenAI-compatible gateways (NVIDIA, Agnes, etc.), validate by
+        # listing models. A successful /models call proves the endpoint + key work.
+        # We do NOT run a completion with an arbitrary model — many gateways list
+        # hundreds of models, most not provisioned for a given account (→ 404).
+        if rec["provider"] in ("custom", "openai", "openrouter"):
+            try:
+                models = await _list_models_raw(rec["base_url"], rec["api_key"])
+            except Exception as e:
+                raise HTTPException(400, f"Could not reach the provider: {e}")
+            if not models:
+                raise HTTPException(400, "Connected, but the provider returned no models. "
+                                         "Set an explicit model name on the agent.")
+            return {"ok": True, "models_available": len(models), "sample_models": models[:8]}
+
         adapter = get_adapter(provider, get_settings(), rt)
         model = await _resolve_test_model(rec["provider"], rec["base_url"], rec["api_key"])
-        if not model:
-            raise HTTPException(400, "No model available to test. This endpoint exposes no /models "
-                                     "list — add an agent with an explicit model name from this provider.")
         resp = await adapter.complete(
             system_prompt="You are a helpful assistant.",
             messages=[{"role": "user", "content": "Reply with only the word: ready"}],
