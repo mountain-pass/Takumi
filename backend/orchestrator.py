@@ -163,6 +163,21 @@ class Orchestrator:
         if not task or task["status"] != "in_progress":
             return
 
+        # Self-heal fix task: the CTO finished patching the code → commit + notify.
+        try:
+            import json as _json
+            ctx = _json.loads(task.get("context") or "{}")
+        except Exception:
+            ctx = {}
+        if ctx.get("heal_incident_id"):
+            await database.update_task(task_id, {
+                "status": "completed", "result": result[:2000],
+                "completed_at": _dt.utcnow().isoformat(),
+            })
+            from . import self_heal
+            await self_heal.finalize_heal(self, ctx["heal_incident_id"], result)
+            return
+
         quality = self._ceo._evaluate_result(result, task) if self._ceo else "good"
         now = _dt.utcnow().isoformat()
         # A task that produced an artifact (image / video / dashboard) is a real

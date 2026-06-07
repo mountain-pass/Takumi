@@ -79,6 +79,23 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS heal_incidents (
+    id            TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|in_progress|healed|failed|dismissed
+    conversation_id TEXT,
+    agent_id      TEXT NOT NULL DEFAULT '',
+    provider      TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
+    base_url      TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
+    traceback     TEXT NOT NULL DEFAULT '',
+    branch        TEXT NOT NULL DEFAULT '',
+    cto_agent_id  TEXT NOT NULL DEFAULT '',
+    result        TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS mcp_oauth (
     server_id   TEXT PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
     tokens      TEXT NOT NULL DEFAULT '',   -- OAuthToken JSON
@@ -476,6 +493,49 @@ async def set_mcp_oauth(server_id: str, *, tokens: str | None = None,
 
 async def clear_mcp_oauth(server_id: str) -> None:
     await _conn().execute("DELETE FROM mcp_oauth WHERE server_id = ?", (server_id,))
+    await _conn().commit()
+
+
+# ── Self-heal incidents ───────────────────────────────────────────────────────
+
+async def save_heal_incident(inc: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO heal_incidents(id, status, conversation_id, agent_id, provider,
+              model, base_url, error, traceback, branch, cto_agent_id, result)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             status=excluded.status, branch=excluded.branch, cto_agent_id=excluded.cto_agent_id,
+             result=excluded.result, updated_at=datetime('now')""",
+        (
+            inc["id"], inc.get("status", "pending"), inc.get("conversation_id"),
+            inc.get("agent_id", ""), inc.get("provider", ""), inc.get("model", ""),
+            inc.get("base_url", ""), inc.get("error", ""), inc.get("traceback", ""),
+            inc.get("branch", ""), inc.get("cto_agent_id", ""), inc.get("result", ""),
+        ),
+    )
+    await _conn().commit()
+
+
+async def get_heal_incident(incident_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM heal_incidents WHERE id = ?", (incident_id,)
+    )).fetchone()
+    return dict(row) if row else None
+
+
+async def get_heal_incidents(limit: int = 50) -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM heal_incidents ORDER BY created_at DESC LIMIT ?", (limit,)
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_heal_incident(incident_id: str, updates: dict) -> None:
+    cols = ", ".join(f"{k}=?" for k in updates)
+    await _conn().execute(
+        f"UPDATE heal_incidents SET {cols}, updated_at=datetime('now') WHERE id=?",
+        (*updates.values(), incident_id),
+    )
     await _conn().commit()
 
 

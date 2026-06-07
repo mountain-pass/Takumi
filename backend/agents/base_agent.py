@@ -167,12 +167,34 @@ class BaseAgent:
                 # tasks, not free-form back-and-forth.
                 logger.debug("[%s] Ignoring non-task message from %s", self.config.name, sender_name)
         except Exception as e:
+            # If invoking this agent's LLM/provider failed in a code-fixable way,
+            # raise a self-heal incident (the CTO can patch the codebase on approval).
+            await self._maybe_self_heal(e)
             if msg.task_id:
                 # Report failure back to assignor
                 await self._report_task_failure(msg, str(e))
             logger.error("[%s] Message handling failed: %s", self.config.name, e, exc_info=True)
         finally:
             await self._set_status(AgentStatus.IDLE, current_task=None, action=None)
+
+    async def _maybe_self_heal(self, exc: Exception) -> None:
+        """Record + propose a self-heal incident for a code-fixable LLM error."""
+        try:
+            from .. import self_heal
+            if not self_heal.is_healable_llm_error(exc):
+                return
+            import traceback as _tb
+            provider = self.config.llm_provider.value if hasattr(self.config.llm_provider, "value") else str(self.config.llm_provider)
+            inc = await self_heal.record_incident(
+                conversation_id=getattr(self, "_artifact_ctx", {}).get("conversation_id") if hasattr(self, "_artifact_ctx") else None,
+                agent_id=self.config.id, provider=provider, model=self.config.llm_model,
+                base_url=getattr(self._adapter, "_base_url", "") or getattr(self._adapter, "_chat_url", ""),
+                error=str(exc), traceback="".join(_tb.format_exception(type(exc), exc, exc.__traceback__)),
+            )
+            if self._orchestrator:
+                await self_heal.propose(self._orchestrator, inc)
+        except Exception as he:
+            logger.debug("[%s] self-heal capture failed: %s", self.config.name, he)
 
     async def _execute_task(self, msg: AgentMessage, sender_name: str) -> None:
         """Own a task: execute it fully, then report results back to assignor."""
