@@ -224,6 +224,58 @@ const BUILTIN_SKILLS = [
   { id: 'create_artifact', label: 'Create Artifact' },
 ]
 
+// Manage an agent's secondary models (text / vision / image) it can call as tools.
+function ExtraModels({ value, onChange }) {
+  const { data: providers = [] } = useProviders()
+  const llmProviders = providers.filter(p => p.type === 'llm')
+
+  const add = () => onChange([
+    ...value,
+    { id: crypto.randomUUID(), label: '', kind: 'text', api_provider_id: '', llm_model: '' },
+  ])
+  const update = (id, patch) => onChange(value.map(m => (m.id === id ? { ...m, ...patch } : m)))
+  const remove = (id) => onChange(value.filter(m => m.id !== id))
+
+  return (
+    <div className="block space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Additional Models</span>
+        <button type="button" onClick={add}
+          className="text-[11px] text-indigo-600 hover:text-indigo-700 font-medium">+ Add model</button>
+      </div>
+      <p className="text-[10px] text-gray-400">Specialist models this agent can call as tools (coding, vision, image generation), alongside its main brain.</p>
+      {value.length === 0 && <p className="text-[11px] text-gray-300">None — the agent uses only its main model.</p>}
+      {value.map(m => (
+        <div key={m.id} className="border border-gray-200 rounded-xl p-2 space-y-1.5">
+          <div className="flex items-center gap-1.5">
+            <input className="flex-1 border border-gray-200 rounded-lg px-2 py-1 text-xs outline-none focus:border-indigo-400"
+              placeholder="Label (e.g. coder, designer)" value={m.label}
+              onChange={e => update(m.id, { label: e.target.value })} />
+            <select className="border border-gray-200 rounded-lg px-1.5 py-1 text-xs bg-white"
+              value={m.kind} onChange={e => update(m.id, { kind: e.target.value })}>
+              <option value="text">Text</option>
+              <option value="vision">Vision</option>
+              <option value="image">Image gen</option>
+            </select>
+            <button type="button" onClick={() => remove(m.id)}
+              className="p-1 text-gray-400 hover:text-red-500"><X size={13} /></button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <select className="border border-gray-200 rounded-lg px-1.5 py-1 text-xs bg-white flex-1 min-w-0"
+              value={m.api_provider_id} onChange={e => update(m.id, { api_provider_id: e.target.value })}>
+              <option value="">Provider…</option>
+              {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <input className="flex-1 border border-gray-200 rounded-lg px-2 py-1 text-xs outline-none focus:border-indigo-400"
+              placeholder="Model name" value={m.llm_model}
+              onChange={e => update(m.id, { llm_model: e.target.value })} />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
@@ -438,6 +490,11 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
             </div>
           </div>
         )}
+        {/* Additional specialist models (text / vision / image) */}
+        <ExtraModels
+          value={form.extra_models || []}
+          onChange={v => set('extra_models', v)}
+        />
        </>}
       </div>
 

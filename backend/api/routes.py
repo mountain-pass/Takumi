@@ -93,6 +93,7 @@ class CreateAgentRequest(BaseModel):
     token_budget: int = 0
     hitl_enabled: bool = False
     hitl_triggers: list[str] = []
+    extra_models: list[dict] = []
 
 
 class UpdateAgentRequest(BaseModel):
@@ -111,6 +112,7 @@ class UpdateAgentRequest(BaseModel):
     token_budget: int | None = None
     hitl_enabled: bool | None = None
     hitl_triggers: list[str] | None = None
+    extra_models: list[dict] | None = None
 
 
 class SubmitTaskRequest(BaseModel):

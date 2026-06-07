@@ -67,6 +67,11 @@ class AgentConfig(BaseModel):
     hitl_enabled: bool = False       # human-in-the-loop master switch (enforced later)
     hitl_triggers: list[str] = Field(default_factory=list)  # e.g. ["run_shell", "write_file"]
 
+    # Secondary "specialist" models the agent can invoke as tools alongside its
+    # main brain. Each: {id, label, kind, api_provider_id, llm_model, description}
+    # where kind ∈ {"text", "vision", "image"}.
+    extra_models: list[dict] = Field(default_factory=list)
+
 
 class AgentState(BaseModel):
     config: AgentConfig
