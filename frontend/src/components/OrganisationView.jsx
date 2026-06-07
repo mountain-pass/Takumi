@@ -239,6 +239,7 @@ function ExtraModelRow({ model: m, providers, onUpdate, onRemove }) {
           <option value="text">Text</option>
           <option value="vision">Vision</option>
           <option value="image">Image gen</option>
+          <option value="video">Video gen</option>
         </select>
         <button type="button" onClick={onRemove} className="p-1 text-gray-400 hover:text-red-500"><X size={13} /></button>
       </div>

@@ -594,6 +594,26 @@ class CEOAgent(BaseAgent):
 
     # ── Context builders ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _agent_capabilities(config) -> list[str]:
+        """Human-readable special capabilities so the Manager knows who to use for
+        image/video/vision/etc. tasks."""
+        caps = []
+        kinds = {(m.get("kind") or "text").lower() for m in (getattr(config, "extra_models", None) or [])}
+        if "image" in kinds:
+            caps.append("generate images")
+        if "video" in kinds:
+            caps.append("generate video")
+        if "vision" in kinds:
+            caps.append("analyse images (vision)")
+        text_labels = [m.get("label") for m in (getattr(config, "extra_models", None) or [])
+                       if (m.get("kind") or "text").lower() == "text" and m.get("label")]
+        if text_labels:
+            caps.append("specialist models: " + ", ".join(text_labels))
+        if "create_artifact" in (config.skills or []):
+            caps.append("build rich HTML dashboards/reports")
+        return caps
+
     def _build_agent_roster(self) -> str:
         if not self._orchestrator:
             return "No agents available."
@@ -601,9 +621,11 @@ class CEOAgent(BaseAgent):
         for agent in self._orchestrator.get_agents():
             if not agent.config.is_ceo:
                 status = agent.state.status.value if hasattr(agent.state.status, 'value') else agent.state.status
+                caps = self._agent_capabilities(agent.config)
+                cap_str = f" — CAN: {', '.join(caps)}" if caps else ""
                 lines.append(
                     f"- **{agent.config.name}** (id: `{agent.config.id}`) — "
-                    f"{agent.config.role}: {agent.config.description} [status: {status}]"
+                    f"{agent.config.role}: {agent.config.description} [status: {status}]{cap_str}"
                 )
         return "\n".join(lines) if lines else "No specialist agents yet."
 

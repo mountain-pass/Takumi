@@ -25,7 +25,7 @@ def slug(label: str) -> str:
 
 
 def tool_name(kind: str, label: str) -> str:
-    prefix = {"text": "ask", "vision": "see", "image": "draw"}.get(kind, "ask")
+    prefix = {"text": "ask", "vision": "see", "image": "draw", "video": "film"}.get(kind, "ask")
     return f"{prefix}_{slug(label)}"
 
 
@@ -49,6 +49,12 @@ def tools_for_agent(extra_models: list[dict]) -> list[dict]:
                 "name": name, "kind": kind, "config": m,
                 "description": f"Generate an image with the {label} model ({model}); it's saved as a viewable artifact. {desc}".strip(),
                 "parameters": {"prompt": "Description of the image to generate"},
+            })
+        elif kind == "video":
+            out.append({
+                "name": name, "kind": kind, "config": m,
+                "description": f"Generate a video with the {label} model ({model}); it's saved as a viewable artifact. {desc}".strip(),
+                "parameters": {"prompt": "Description of the video to generate"},
             })
         else:  # text
             out.append({
@@ -157,5 +163,37 @@ async def generate_image(cfg: dict, settings, prompt: str) -> dict:
         "align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;"
         "max-height:100vh;object-fit:contain}</style></head>"
         f"<body><img src='{src}' alt='generated image'></body></html>"
+    )
+    return {"html": html, "title": title}
+
+
+async def generate_video(cfg: dict, settings, prompt: str) -> dict:
+    """Generate a video via an OpenAI-compatible /videos/generations endpoint
+    (provider-dependent). Returns {"html", "title"} wrapping the resulting video."""
+    import httpx
+    from .. import database
+    prov = await database.get_api_provider(cfg.get("api_provider_id", ""))
+    if not prov:
+        raise ValueError("Provider not found for this model")
+    base = (prov.get("base_url") or "").rstrip("/")
+    api_key = prov.get("api_key", "")
+    url = base + "/videos/generations"
+    body = {"model": cfg.get("llm_model", ""), "prompt": prompt}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"} if api_key else {}
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(url, headers=headers, json=body)
+        if r.status_code >= 400:
+            raise ValueError(f"Video generation failed (HTTP {r.status_code}): {r.text[:200]}")
+        data = r.json().get("data", [{}])[0]
+    src = data.get("url") or (f"data:video/mp4;base64,{data['b64_json']}" if data.get("b64_json") else None)
+    if not src:
+        raise ValueError("Video generation returned no video")
+    title = prompt[:80]
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{title}</title><style>body{{margin:0;background:#0f1117;display:flex;"
+        "align-items:center;justify-content:center;min-height:100vh}video{max-width:100%;"
+        "max-height:100vh}</style></head>"
+        f"<body><video src='{src}' controls autoplay loop></video></body></html>"
     )
     return {"html": html, "title": title}

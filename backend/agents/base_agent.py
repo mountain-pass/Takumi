@@ -563,6 +563,11 @@ class BaseAgent:
                 await self._save_artifact({"title": art["title"], "html": art["html"]})
                 return (f"Image generated and saved as an artifact ('{art['title']}'). "
                         "Tell the user it's ready in the viewer — do not describe the raw image data.")
+            if kind == "video":
+                art = await model_tools.generate_video(cfg, self.settings, arguments.get("prompt", ""))
+                await self._save_artifact({"title": art["title"], "html": art["html"]})
+                return (f"Video generated and saved as an artifact ('{art['title']}'). "
+                        "Tell the user it's ready in the viewer.")
             # text
             return await model_tools.run_text(cfg, self.settings, arguments.get("prompt", ""))
         except Exception as e:
