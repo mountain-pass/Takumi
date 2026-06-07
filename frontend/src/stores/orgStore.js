@@ -154,6 +154,19 @@ export const useOrgStore = create((set, get) => ({
       if (payload.artifacts && payload.artifacts.length) msg.artifacts = payload.artifacts
       set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), msg] }))
       get().loadChatConversations()
+    } else if (type === 'self_heal') {
+      // A code-fixable LLM/provider error — surface a proposal (or result) in chat.
+      if (payload.kind === 'proposal') {
+        set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), {
+          id: `sh-${payload.incident_id}`, role: 'assistant', selfHeal: payload,
+          timestamp: new Date().toISOString(),
+        }] }))
+      } else if (payload.kind === 'result') {
+        set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), {
+          id: `shr-${payload.incident_id}`, role: 'assistant', content: payload.message,
+          isTaskResult: true, timestamp: new Date().toISOString(),
+        }] }))
+      }
     } else if (type === 'agent_added') {
       // Reload agents list
       get().fetchAgents()

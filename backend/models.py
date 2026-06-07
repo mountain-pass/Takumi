@@ -112,6 +112,7 @@ class WSEventType(str, Enum):
     AGENT_REMOVED = "agent_removed"
     HEARTBEAT = "heartbeat"
     TASK_COMPLETED = "task_completed"
+    SELF_HEAL = "self_heal"
     ERROR = "error"
 
 

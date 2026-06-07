@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import {
   Send, Plus, Loader2, MessageSquare, PanelRightOpen, PanelRightClose,
   Trash2, Clock, Sparkles, ToggleLeft, ToggleRight, Paperclip, X, FileText,
-  ExternalLink, LayoutDashboard,
+  ExternalLink, LayoutDashboard, AlertTriangle,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -506,6 +506,53 @@ function ActionChip({ summary, action }) {
   )
 }
 
+function SelfHealCard({ sh }) {
+  const [state, setState] = useState('idle') // idle | working | done | dismissed
+  const [note, setNote] = useState('')
+  async function approve() {
+    setState('working')
+    try {
+      const r = await fetch(`${API}/self-heal/${sh.incident_id}/approve`, { method: 'POST' })
+      if (!r.ok) throw new Error(await r.text())
+      const d = await r.json()
+      setNote(`On it — the CTO (${d.cto || 'engineer'}) is patching the code on branch ${d.branch}. I'll report back here.`)
+      setState('done')
+    } catch (e) { setNote(`Couldn't start: ${e.message}`); setState('idle') }
+  }
+  async function dismiss() {
+    try { await fetch(`${API}/self-heal/${sh.incident_id}/dismiss`, { method: 'POST' }) } catch {}
+    setState('dismissed')
+  }
+  if (state === 'dismissed') return null
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[80%] rounded-2xl rounded-bl-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
+        <div className="flex items-center gap-1.5 text-amber-700 font-semibold text-xs mb-1">
+          <AlertTriangle size={13} /> Self-heal available
+        </div>
+        <p className="text-gray-700">
+          Invoking <b>{sh.provider}</b>{sh.model ? ` (${sh.model})` : ''} failed with what looks like a
+          code/format issue. Want the <b>CTO</b> to investigate and patch the codebase? The fix lands on a
+          dedicated <code>self-heal</code> git branch you can roll back.
+        </p>
+        {sh.error && <p className="mt-1 text-[11px] text-gray-500 font-mono break-words line-clamp-3">{sh.error}</p>}
+        {note && <p className="mt-2 text-xs text-gray-600">{note}</p>}
+        {state === 'idle' && (
+          <div className="mt-2.5 flex gap-2">
+            <button onClick={approve} className="px-3 py-1.5 text-xs font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-lg">
+              Have the CTO fix it
+            </button>
+            <button onClick={dismiss} className="px-3 py-1.5 text-xs font-medium text-gray-500 hover:bg-gray-100 rounded-lg">
+              Dismiss
+            </button>
+          </div>
+        )}
+        {state === 'working' && <p className="mt-2 text-xs text-amber-700">Starting the CTO…</p>}
+      </div>
+    </div>
+  )
+}
+
 function ChatBubble({ message }) {
   const isUser = message.role === 'user'
   const actions = message.actions || []
@@ -514,6 +561,8 @@ function ChatBubble({ message }) {
   const artifacts = message.artifacts || []
   const openArtifact = useOrgStore(s => s.openArtifact)
   const [lightbox, setLightbox] = useState(null)
+
+  if (message.selfHeal) return <SelfHealCard sh={message.selfHeal} />
 
   return (
     <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>

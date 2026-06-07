@@ -1038,6 +1038,31 @@ async def get_artifact_raw(artifact_id: str):
     return PlainTextResponse(content)
 
 
+# ── Self-heal ─────────────────────────────────────────────────────────────────
+
+@router.get("/self-heal")
+async def list_heal_incidents():
+    return await database.get_heal_incidents()
+
+
+@router.post("/self-heal/{incident_id}/approve")
+async def approve_heal(incident_id: str):
+    from .. import self_heal
+    inc = await database.get_heal_incident(incident_id)
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+    res = await self_heal.run_heal(orchestrator, incident_id)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "Could not start self-heal"))
+    return res
+
+
+@router.post("/self-heal/{incident_id}/dismiss")
+async def dismiss_heal(incident_id: str):
+    await database.update_heal_incident(incident_id, {"status": "dismissed"})
+    return {"ok": True}
+
+
 # ── API Providers ────────────────────────────────────────────────────────────
 
 class ApiProviderCreate(BaseModel):
