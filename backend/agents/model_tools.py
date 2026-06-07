@@ -142,14 +142,28 @@ async def generate_image(cfg: dict, settings, prompt: str) -> dict:
     base = (prov.get("base_url") or "").rstrip("/")
     api_key = prov.get("api_key", "")
     url = base + "/images/generations"
-    body = {"model": cfg.get("llm_model", ""), "prompt": prompt, "n": 1,
-            "size": cfg.get("size", "1024x1024"), "response_format": "b64_json"}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"} if api_key else {}
+    # Many gateways (Agnes, etc.) don't support response_format/size on every model.
+    # Try a standard body, then progressively fall back to a minimal one.
+    bodies = [
+        {"model": cfg.get("llm_model", ""), "prompt": prompt, "n": 1, "size": cfg.get("size", "1024x1024")},
+        {"model": cfg.get("llm_model", ""), "prompt": prompt, "n": 1},
+        {"model": cfg.get("llm_model", ""), "prompt": prompt},
+    ]
+    data = None
+    last_err = ""
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, headers=headers, json=body)
-        if r.status_code >= 400:
-            raise ValueError(f"Image generation failed (HTTP {r.status_code}): {r.text[:200]}")
-        data = r.json().get("data", [{}])[0]
+        for body in bodies:
+            r = await client.post(url, headers=headers, json=body)
+            if r.status_code < 400:
+                data = r.json().get("data", [{}])[0]
+                break
+            last_err = f"HTTP {r.status_code}: {r.text[:250]}"
+            # Only retry when the error is about an unsupported parameter.
+            if "unsupported" not in r.text.lower() and "not supported" not in r.text.lower():
+                break
+    if data is None:
+        raise ValueError(f"Image generation failed ({last_err})")
     if data.get("b64_json"):
         src = f"data:image/png;base64,{data['b64_json']}"
     elif data.get("url"):
