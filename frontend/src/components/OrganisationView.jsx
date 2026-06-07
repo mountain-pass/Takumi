@@ -224,6 +224,79 @@ const BUILTIN_SKILLS = [
   { id: 'create_artifact', label: 'Create Artifact' },
 ]
 
+// One secondary-model row — fetches its provider's models for a dropdown.
+function ExtraModelRow({ model: m, providers, onUpdate, onRemove }) {
+  const { data: modelsData } = useProviderModels(m.api_provider_id || undefined)
+  const models = modelsData?.models || []
+  return (
+    <div className="border border-gray-200 rounded-xl p-2 space-y-1.5">
+      <div className="flex items-center gap-1.5">
+        <input className="flex-1 border border-gray-200 rounded-lg px-2 py-1 text-xs outline-none focus:border-indigo-400"
+          placeholder="Label (e.g. coder, designer)" value={m.label}
+          onChange={e => onUpdate({ label: e.target.value })} />
+        <select className="border border-gray-200 rounded-lg px-1.5 py-1 text-xs bg-white"
+          value={m.kind} onChange={e => onUpdate({ kind: e.target.value })}>
+          <option value="text">Text</option>
+          <option value="vision">Vision</option>
+          <option value="image">Image gen</option>
+          <option value="video">Video gen</option>
+        </select>
+        <button type="button" onClick={onRemove} className="p-1 text-gray-400 hover:text-red-500"><X size={13} /></button>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <select className="border border-gray-200 rounded-lg px-1.5 py-1 text-xs bg-white flex-1 min-w-0"
+          value={m.api_provider_id} onChange={e => onUpdate({ api_provider_id: e.target.value, llm_model: '' })}>
+          <option value="">Provider…</option>
+          {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        {models.length > 0 ? (
+          // Datalist: dropdown of the provider's models, but still type-able (e.g.
+          // image-gen models that aren't in /models).
+          <div className="flex-1 min-w-0">
+            <input list={`xm-${m.id}`} className="w-full border border-gray-200 rounded-lg px-2 py-1 text-xs outline-none focus:border-indigo-400"
+              placeholder="Model" value={m.llm_model} onChange={e => onUpdate({ llm_model: e.target.value })} />
+            <datalist id={`xm-${m.id}`}>
+              {models.map(name => <option key={name} value={name} />)}
+            </datalist>
+          </div>
+        ) : (
+          <input className="flex-1 border border-gray-200 rounded-lg px-2 py-1 text-xs outline-none focus:border-indigo-400"
+            placeholder="Model name" value={m.llm_model} onChange={e => onUpdate({ llm_model: e.target.value })} />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Manage an agent's secondary models (text / vision / image) it can call as tools.
+function ExtraModels({ value, onChange }) {
+  const { data: providers = [] } = useProviders()
+  const llmProviders = providers.filter(p => p.type === 'llm')
+
+  const add = () => onChange([
+    ...value,
+    { id: crypto.randomUUID(), label: '', kind: 'text', api_provider_id: '', llm_model: '' },
+  ])
+  const update = (id, patch) => onChange(value.map(m => (m.id === id ? { ...m, ...patch } : m)))
+  const remove = (id) => onChange(value.filter(m => m.id !== id))
+
+  return (
+    <div className="block space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Additional Models</span>
+        <button type="button" onClick={add}
+          className="text-[11px] text-indigo-600 hover:text-indigo-700 font-medium">+ Add model</button>
+      </div>
+      <p className="text-[10px] text-gray-400">Specialist models this agent can call as tools (coding, vision, image generation), alongside its main brain.</p>
+      {value.length === 0 && <p className="text-[11px] text-gray-300">None — the agent uses only its main model.</p>}
+      {value.map(m => (
+        <ExtraModelRow key={m.id} model={m} providers={llmProviders}
+          onUpdate={patch => update(m.id, patch)} onRemove={() => remove(m.id)} />
+      ))}
+    </div>
+  )
+}
+
 function EditPanel({ agent, onClose, onSave, onRemove }) {
   const { config } = agent
   const [form, setForm] = useState({ ...config })
@@ -438,6 +511,11 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
             </div>
           </div>
         )}
+        {/* Additional specialist models (text / vision / image) */}
+        <ExtraModels
+          value={form.extra_models || []}
+          onChange={v => set('extra_models', v)}
+        />
        </>}
       </div>
 

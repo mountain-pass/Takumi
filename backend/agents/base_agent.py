@@ -197,7 +197,7 @@ class BaseAgent:
         # Execute — this is where all the work happens internally
         await self._set_status(AgentStatus.WORKING, current_task=task_id, action="Working...")
 
-        if self.config.skills:
+        if self.config.skills or self.config.extra_models:
             response = await self._do_work_with_tools(msg.content)
         else:
             response = await self._llm_complete()
@@ -422,6 +422,17 @@ class BaseAgent:
             if tools_section:
                 system += tools_section
 
+        # Secondary "specialist" models this agent can invoke as tools.
+        xtools = self._extra_model_tools()
+        if xtools:
+            lines = ["\n\n## Specialist models (call like other tools, one at a time):",
+                     "Your main reasoning is this model, but you can hand specific sub-tasks to these:"]
+            for t in xtools.values():
+                params = ", ".join(f'"{k}": {v}' for k, v in t["parameters"].items())
+                lines.append(f'- **{t["name"]}**: {t["description"]}')
+                lines.append(f'  Parameters: {{{params}}}')
+            system += "\n".join(lines)
+
         # Append delegation instructions if agent has connections
         if not self.config.is_ceo:
             connections = await self._get_outbound_connections()
@@ -430,6 +441,11 @@ class BaseAgent:
                 system += "\n\n## Your connections\n" + connections
 
         return system
+
+    def _extra_model_tools(self) -> dict:
+        """Map of tool_name -> descriptor for this agent's secondary models."""
+        from .model_tools import tools_for_agent
+        return {t["name"]: t for t in tools_for_agent(self.config.extra_models)}
 
     async def _llm_complete(self) -> LLMResponse:
         messages = self._conversation[-self.config.max_context_messages:]
@@ -490,6 +506,11 @@ class BaseAgent:
 
         effective = await self._effective_skills()
 
+        # Secondary specialist models (text / vision / image-gen).
+        xtools = self._extra_model_tools()
+        if name in xtools:
+            return await self._run_extra_model(xtools[name], arguments)
+
         # create_artifact — store a rich HTML document for the side-panel viewer.
         if name == "create_artifact":
             if "create_artifact" not in effective:
@@ -528,13 +549,39 @@ class BaseAgent:
             logger.error("[%s] Tool %s failed: %s", self.config.name, name, e)
             return f"Tool error: {e}"
 
+    async def _run_extra_model(self, tool: dict, arguments: dict) -> str:
+        """Invoke one of the agent's secondary models (text / vision / image)."""
+        from . import model_tools
+        cfg, kind = tool["config"], tool["kind"]
+        try:
+            if kind == "vision":
+                return await model_tools.run_vision(
+                    cfg, self.settings,
+                    arguments.get("image_url", ""), arguments.get("question", ""))
+            if kind == "image":
+                art = await model_tools.generate_image(cfg, self.settings, arguments.get("prompt", ""))
+                await self._save_artifact({"title": art["title"], "kind": "image", "content": art["src"]})
+                return (f"Image generated ('{art['title']}'). It is shown inline in the chat. "
+                        "Tell the user the image is ready — do not describe the raw image data.")
+            if kind == "video":
+                art = await model_tools.generate_video(cfg, self.settings, arguments.get("prompt", ""))
+                await self._save_artifact({"title": art["title"], "kind": "video", "content": art["src"]})
+                return (f"Video generated ('{art['title']}'). It is shown inline in the chat. "
+                        "Tell the user the video is ready.")
+            # text
+            return await model_tools.run_text(cfg, self.settings, arguments.get("prompt", ""))
+        except Exception as e:
+            logger.error("[%s] Extra model '%s' failed: %s", self.config.name, tool["name"], e)
+            return f"Specialist model error: {e}"
+
     async def _save_artifact(self, arguments: dict) -> str:
-        """Persist a rich HTML artifact and record it for the current turn."""
+        """Persist an artifact (html / image / video) and record it for this turn."""
         import uuid as _uuid
         title = (arguments.get("title") or "Artifact").strip()[:120]
-        html = arguments.get("html") or ""
-        if not html.strip():
-            return "Error: create_artifact requires non-empty 'html'."
+        kind = (arguments.get("kind") or "html").lower()
+        content = arguments.get("content") or arguments.get("html") or ""
+        if not str(content).strip():
+            return f"Error: artifact requires non-empty content ({kind})."
         artifact_id = _uuid.uuid4().hex
         try:
             await database.save_artifact({
@@ -543,16 +590,15 @@ class BaseAgent:
                 "task_id": self._artifact_ctx.get("task_id"),
                 "agent_id": self.config.id,
                 "title": title,
-                "kind": "html",
-                "content": html,
+                "kind": kind,
+                "content": content,
             })
         except Exception as e:
             logger.error("[%s] Failed to save artifact: %s", self.config.name, e)
             return f"Error saving artifact: {e}"
-        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": "html"})
-        logger.info("[%s] Created artifact '%s' (%d bytes)", self.config.name, title, len(html))
-        return (f"Artifact '{title}' created (id={artifact_id}). It is now available to the user in the "
-                "viewer panel. Tell them you've created it and they can open it — do not paste the raw HTML.")
+        self._pending_artifacts.append({"id": artifact_id, "title": title, "kind": kind})
+        logger.info("[%s] Created %s artifact '%s'", self.config.name, kind, title)
+        return f"Artifact '{title}' created (id={artifact_id})."
 
     async def _maybe_extract_html_artifact(self, text: str) -> str:
         """If the result embeds a full HTML document (a fenced ```html block — the

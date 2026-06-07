@@ -50,6 +50,13 @@ export default function CronJobView() {
   const agentMap = {}
   agents.forEach(a => { agentMap[a.config.id] = a })
 
+  // Distinct agents working the same job (tasks sharing a conversation/plan).
+  const jobAgents = {}
+  allTasks.forEach(t => {
+    if (!t.conversation_id) return
+    ;(jobAgents[t.conversation_id] = jobAgents[t.conversation_id] || new Set()).add(t.agent_id)
+  })
+
   // Filter tasks
   const filtered = allTasks.filter(t => {
     if (typeFilter === 'scheduled' && t.task_type === 'adhoc') return false
@@ -144,6 +151,7 @@ export default function CronJobView() {
                 title="Active"
                 tasks={active}
                 agentMap={agentMap}
+                jobAgents={jobAgents}
                 expandedId={expandedId}
                 onToggle={setExpandedId}
               />
@@ -153,6 +161,7 @@ export default function CronJobView() {
                 title="Paused"
                 tasks={paused}
                 agentMap={agentMap}
+                jobAgents={jobAgents}
                 expandedId={expandedId}
                 onToggle={setExpandedId}
               />
@@ -162,6 +171,7 @@ export default function CronJobView() {
                 title="Completed / Failed"
                 tasks={completed}
                 agentMap={agentMap}
+                jobAgents={jobAgents}
                 expandedId={expandedId}
                 onToggle={setExpandedId}
                 defaultCollapsed
@@ -192,7 +202,7 @@ function StatPill({ label, value, color }) {
 
 // ── Task Group ───────────────────────────────────────────────────────────────
 
-function TaskGroup({ title, tasks, agentMap, expandedId, onToggle, defaultCollapsed = false }) {
+function TaskGroup({ title, tasks, agentMap, jobAgents = {}, expandedId, onToggle, defaultCollapsed = false }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
 
   return (
@@ -213,6 +223,8 @@ function TaskGroup({ title, tasks, agentMap, expandedId, onToggle, defaultCollap
               task={task}
               agent={agentMap[task.agent_id]}
               assigner={agentMap[task.assigned_by]}
+              agentMap={agentMap}
+              jobAgentIds={task.conversation_id ? [...(jobAgents[task.conversation_id] || [])] : [task.agent_id]}
               expanded={expandedId === task.id}
               onToggle={() => onToggle(expandedId === task.id ? null : task.id)}
             />
@@ -225,7 +237,7 @@ function TaskGroup({ title, tasks, agentMap, expandedId, onToggle, defaultCollap
 
 // ── SOP Card ─────────────────────────────────────────────────────────────────
 
-function SOPCard({ task, agent, assigner, expanded, onToggle }) {
+function SOPCard({ task, agent, assigner, agentMap = {}, jobAgentIds = [], expanded, onToggle }) {
   const updateTask = useUpdateTask()
   const deleteTask = useDeleteTask()
   const sc = STATUS_CONFIG[task.status] || STATUS_CONFIG.pending
@@ -314,15 +326,30 @@ function SOPCard({ task, agent, assigner, expanded, onToggle }) {
             </div>
           )}
 
-          {/* Meta grid */}
-          <div className="grid grid-cols-2 gap-2 text-[10px]">
-            <MetaRow label="Assigned by" value={assignerName} />
-            <MetaRow label="Created" value={formatDate(task.created_at)} />
-            {task.last_run_at && <MetaRow label="Last run" value={formatDate(task.last_run_at)} />}
-            {task.next_run_at && <MetaRow label="Next run" value={formatDate(task.next_run_at)} />}
-            {task.token_count > 0 && <MetaRow label="Tokens" value={task.token_count.toLocaleString()} />}
-            {task.schedule_cron && <MetaRow label="Schedule" value={task.schedule_cron} />}
-          </div>
+          {/* Meta — compact inline */}
+          {(() => {
+            const ids = jobAgentIds.length ? jobAgentIds : [task.agent_id]
+            const names = ids.map(id => agentMap[id]?.config?.name || '?')
+            const items = [
+              ['Agents', ids.length, names.join(', ')],
+              ['Assigned by', assignerName],
+              ['Tokens', task.token_count > 0 ? task.token_count.toLocaleString('en-US') : '—'],
+              ['Created', formatDate(task.created_at)],
+              task.last_run_at && ['Last run', formatDate(task.last_run_at)],
+              task.next_run_at && ['Next run', formatDate(task.next_run_at)],
+              task.schedule_cron && ['Schedule', task.schedule_cron],
+            ].filter(Boolean)
+            return (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] pt-1 border-t border-gray-100">
+                {items.map(([label, value, title]) => (
+                  <span key={label} className="text-gray-400" title={title || undefined}>
+                    {label}{' '}
+                    <span className="text-gray-700 font-medium">{value}</span>
+                  </span>
+                ))}
+              </div>
+            )
+          })()}
 
           {/* Actions */}
           <div className="flex gap-2 pt-1">
