@@ -594,6 +594,50 @@ class CEOAgent(BaseAgent):
 
     # ── Context builders ─────────────────────────────────────────────────────
 
+    def _agent_name_for(self, agent_id: str) -> str:
+        if self._orchestrator:
+            a = next((a for a in self._orchestrator.get_agents() if a.config.id == agent_id), None)
+            if a:
+                return a.config.name
+        return agent_id
+
+    @staticmethod
+    def _needed_generation_kind(text: str) -> str | None:
+        """Detect whether a task requires image/video generation."""
+        t = (text or "").lower()
+        video_kw = ("generate a video", "create a video", "make a video", "video of",
+                    "animate ", "generate video", "produce a video")
+        image_kw = ("generate an image", "generate image", "create an image", "create image",
+                    "make an image", "image of", "picture of", "photo of", "illustration of",
+                    "render an image", "draw ", "a logo", "hero image", "banner image")
+        if any(k in t for k in video_kw):
+            return "video"
+        if any(k in t for k in image_kw):
+            return "image"
+        return None
+
+    @staticmethod
+    def _config_has_kind(config, kind: str) -> bool:
+        return any((m.get("kind") or "text").lower() == kind
+                   for m in (getattr(config, "extra_models", None) or []))
+
+    async def _reroute_for_capability(self, agent_id: str, kind: str) -> str | None:
+        """If the chosen agent lacks the needed generation capability, pick a
+        connected agent that has it. Returns the agent id to use."""
+        if not self._orchestrator:
+            return agent_id
+        agents = {a.config.id: a for a in self._orchestrator.get_agents()}
+        chosen = agents.get(agent_id)
+        if chosen and self._config_has_kind(chosen.config, kind):
+            return agent_id  # already capable
+        # Prefer a connected, capable specialist (so the assignment succeeds).
+        capable = [a for a in self._orchestrator.get_agents()
+                   if not a.config.is_ceo and self._config_has_kind(a.config, kind)]
+        for a in capable:
+            if await database.can_assign_task(self.config.id, a.config.id):
+                return a.config.id
+        return capable[0].config.id if capable else agent_id
+
     @staticmethod
     def _agent_capabilities(config) -> list[str]:
         """Human-readable special capabilities so the Manager knows who to use for
@@ -833,6 +877,17 @@ class CEOAgent(BaseAgent):
         title = action.get("title", "")
         if not agent_id or not title:
             return {"status": "error", "detail": "Missing agent_id or title"}
+
+        # Capability-aware routing (enforced in code, not left to the LLM): if this
+        # is clearly an image/video generation task, make sure it goes to an agent
+        # that actually has that model — reroute if the chosen one can't do it.
+        needed = self._needed_generation_kind(f"{title} {action.get('instruction', '')}")
+        if needed:
+            rerouted = await self._reroute_for_capability(agent_id, needed)
+            if rerouted and rerouted != agent_id:
+                logger.info("[CEO] Rerouted %s task from %s to %s (capability)", needed,
+                            self._agent_name_for(agent_id), self._agent_name_for(rerouted))
+                agent_id = rerouted
 
         # Validate connection
         can_assign = await database.can_assign_task(self.config.id, agent_id)
