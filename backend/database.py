@@ -831,6 +831,47 @@ async def update_task(task_id: str, updates: dict) -> dict | None:
     return current
 
 
+# ── Backup / restore ──────────────────────────────────────────────────────────
+
+# Config tables that make up a portable backup (settings, not chat history).
+# Ordered so parents are inserted before children (FK-safe).
+BACKUP_TABLES = [
+    "org_settings", "api_keys", "api_providers",
+    "agents", "agent_connections", "mcp_servers", "mcp_oauth",
+]
+
+
+async def export_tables(tables: list[str]) -> dict:
+    out = {}
+    for t in tables:
+        rows = await (await _conn().execute(f"SELECT * FROM {t}")).fetchall()
+        out[t] = [dict(r) for r in rows]
+    return out
+
+
+async def import_tables(data: dict, tables: list[str]) -> dict:
+    """Replace the given tables with the backed-up rows (FK-safe)."""
+    conn = _conn()
+    await conn.execute("PRAGMA foreign_keys=OFF")
+    counts = {}
+    # Clear children first (reverse order).
+    for t in reversed(tables):
+        await conn.execute(f"DELETE FROM {t}")
+    for t in tables:
+        rows = data.get(t, []) or []
+        for row in rows:
+            cols = list(row.keys())
+            placeholders = ",".join("?" * len(cols))
+            await conn.execute(
+                f"INSERT INTO {t} ({','.join(cols)}) VALUES ({placeholders})",
+                [row[c] for c in cols],
+            )
+        counts[t] = len(rows)
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await conn.commit()
+    return counts
+
+
 async def get_tasks_for_conversation(conversation_id: str) -> list[dict]:
     """All tasks belonging to one chat conversation (a 'plan')."""
     rows = await (await _conn().execute(
