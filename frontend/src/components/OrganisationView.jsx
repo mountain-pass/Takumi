@@ -82,7 +82,7 @@ function DotGrid() {
     <svg className="absolute inset-0 w-full h-full pointer-events-none" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <pattern id="dots" x="0" y="0" width={GRID} height={GRID} patternUnits="userSpaceOnUse">
-          <circle cx="1.5" cy="1.5" r="1.2" fill="#d1d5db" />
+          <circle cx="1.5" cy="1.5" r="1.2" fill="var(--dot-color)" />
         </pattern>
       </defs>
       <rect width="100%" height="100%" fill="url(#dots)" />

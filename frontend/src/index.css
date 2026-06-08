@@ -72,6 +72,16 @@ html.dark textarea::placeholder { color: var(--dk-text-dim) !important; }
 html.dark code, html.dark pre { background-color: #11141d !important; color: var(--dk-text-2) !important; }
 html.dark ::-webkit-scrollbar-thumb { background: #2c3044; }
 
+/* Office floor + Organisation canvas (custom backgrounds the utility overrides miss) */
+.office-floor { background: linear-gradient(135deg, #f8f7f5 0%, #ede9e3 100%); }
+html.dark .office-floor { background: linear-gradient(135deg, #14161f 0%, #0c0e15 100%) !important; }
+html.dark .bg-slate-50,
+html.dark .bg-slate-100 { background-color: var(--dk-bg) !important; }
+
+/* Canvas dot-grid colour (the SVG circle fill reads this variable) */
+:root { --dot-color: #d1d5db; }
+html.dark { --dot-color: #2c3044; }
+
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.2; }
