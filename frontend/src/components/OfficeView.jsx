@@ -141,11 +141,8 @@ export default function OfficeView() {
 
         {/* Office floor */}
         <div
-          className="flex-1 overflow-auto p-6 cursor-default"
+          className="office-floor flex-1 overflow-auto p-6 cursor-default"
           onClick={() => clearSelected()}
-          style={{
-            background: 'linear-gradient(135deg, #f8f7f5 0%, #ede9e3 100%)',
-          }}
         >
           {agents.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-gray-400">
