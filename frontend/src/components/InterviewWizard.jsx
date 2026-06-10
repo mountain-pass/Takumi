@@ -6,7 +6,7 @@
  * Steps: 1) OpenRouter provider · 2) Questions + constraints ·
  *        3) Pick models to compare · 4) Run interviews + recommendation.
  */
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { X, Loader2, Plus, Trash2, Search, Trophy, Check, KeyRound, Sparkles } from 'lucide-react'
 
 const CONSTRAINTS = [
@@ -23,9 +23,14 @@ export default function InterviewWizard({ agentForm, onPick, onClose }) {
   const [step, setStep] = useState(1)
   const [shared, setShared] = useState({ constraints: {}, questions: [], selected: [] })
   const patch = (p) => setShared(s => ({ ...s, ...p }))
+  const downOnBackdrop = useRef(false)
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onMouseDown={e => { downOnBackdrop.current = e.target === e.currentTarget }}
+      onClick={e => { if (e.target === e.currentTarget && downOnBackdrop.current) onClose() }}
+    >
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col" onMouseDown={() => { downOnBackdrop.current = false }}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
           <div>
             <h2 className="text-lg font-bold text-gray-900 flex items-center gap-2">
