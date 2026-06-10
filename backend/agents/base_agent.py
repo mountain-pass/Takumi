@@ -58,6 +58,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 - NEVER say you are "waiting for results" — your tools return results immediately.
 - If you used tools and got results, synthesize them into a proper answer — once you have what you need, write the FINAL answer in plain text (no JSON, no further tool calls).
 - If the task asks for an HTML report, dashboard, chart, or any rich/visual deliverable, output the complete standalone HTML document inside a single fenced ```html code block in your final answer. It is saved automatically as a viewable artifact (a "View" button appears for the user) — this works for every agent. Do NOT wrap the HTML in a JSON tool call, and never paste raw HTML outside a ```html block. Keep your text reply to a one-line note like "I've prepared the dashboard."
+- When using a chart library (Chart.js, etc.), ALWAYS wrap each `<canvas>` in a container with a FIXED height (e.g. `<div style="position:relative;height:360px"><canvas></canvas></div>`). A responsive chart with `maintainAspectRatio:false` and no bounded-height parent grows infinitely. Never give a chart a percentage or unconstrained height.
 - Cite your sources when presenting research findings (include URLs where possible).
 """
 

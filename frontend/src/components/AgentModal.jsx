@@ -2,10 +2,11 @@
  * AgentModal — create a new agent or view agent details.
  */
 import React, { useState, useEffect } from 'react'
-import { Pencil } from 'lucide-react'
+import { Pencil, Trophy } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
 import AIPromptWizard from './AIPromptWizard'
+import InterviewWizard from './InterviewWizard'
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 
@@ -28,6 +29,21 @@ export default function AgentModal({ onClose }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [mcpServers, setMcpServers] = useState([])
+  const [showInterview, setShowInterview] = useState(false)
+
+  // Wizard recommended a model — set it (+ the OpenRouter provider) on the form.
+  async function applyInterviewPick(modelId) {
+    try {
+      const providers = await fetch('/api/providers').then(r => r.json())
+      const or = providers.find(p => (p.provider || '').toLowerCase() === 'openrouter' && p.type === 'llm')
+      if (or) {
+        set('api_provider_id', or.id)
+        set('llm_provider', 'openrouter')
+      }
+      set('llm_model', modelId)
+    } catch {}
+    setShowInterview(false)
+  }
 
   useEffect(() => {
     fetch('/api/mcp/servers')
@@ -108,6 +124,15 @@ export default function AgentModal({ onClose }) {
               )}
             </AIPromptWizard>
           </div>
+
+          {/* Not sure which model? Interview candidates */}
+          <button
+            type="button"
+            onClick={() => setShowInterview(true)}
+            className="flex items-center gap-1.5 text-xs font-medium text-indigo-600 hover:text-indigo-700"
+          >
+            <Trophy size={13} /> Not sure which model? Why not interview them →
+          </button>
 
           {/* Provider from API providers */}
           <label className="space-y-1">
@@ -258,7 +283,13 @@ export default function AgentModal({ onClose }) {
         </div>
       </div>
 
-      <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; background: white; } .input:focus { border-color: #6366f1; }`}</style>
+      {showInterview && (
+        <InterviewWizard
+          agentForm={form}
+          onPick={applyInterviewPick}
+          onClose={() => setShowInterview(false)}
+        />
+      )}
     </div>
   )
 }
