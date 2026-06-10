@@ -194,19 +194,19 @@ def _fallback_questions(role: str, constraints: dict | None = None) -> list[str]
 
 async def interview_model(base_url: str, api_key: str, model_id: str,
                           system_prompt: str, questions: list[str],
-                          max_cost: float = 1.0) -> dict:
+                          max_cost: float = 1.0, max_tokens: int = 10000) -> dict:
     """Ask one candidate model all the questions in a single bounded call."""
     base = (base_url or OPENROUTER_DEFAULT_BASE).rstrip("/")
     q_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
-    user = ("You are interviewing for a role. Answer each question concisely and "
-            "concretely (a few sentences each), numbered to match.\n\n" + q_block)
+    user = ("You are interviewing for a role. Answer each question concretely and "
+            "thoroughly, numbered to match.\n\n" + q_block)
     body = {
         "model": model_id,
         "messages": [
             {"role": "system", "content": system_prompt or "You are a capable specialist agent."},
             {"role": "user", "content": user},
         ],
-        "max_tokens": 900,
+        "max_tokens": max(256, int(max_tokens or 10000)),
         "usage": {"include": True},
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
@@ -235,7 +235,7 @@ async def evaluate(orchestrator, role: str, description: str, constraints: dict,
         return {"recommended": None, "summary": "No candidate produced a usable answer.", "ranking": []}
     blocks = []
     for t in valid:
-        blocks.append(f"### Candidate: {t['model_id']} (interview cost ${t.get('cost',0)})\n{t['answer'][:2500]}")
+        blocks.append(f"### Candidate: {t['model_id']} (interview cost ${t.get('cost',0)})\n{t['answer'][:5000]}")
     cons = {k: v for k, v in constraints.items() if v}
     system = (
         "You are the Manager evaluating candidate models for a role based on their interview answers. "
@@ -258,6 +258,13 @@ async def evaluate(orchestrator, role: str, description: str, constraints: dict,
             break
     out = _extract_evaluation(content, ids)
     if out:
+        # Ensure EVERY interviewed candidate is in the ranking (the Manager
+        # sometimes drops one) so the UI can list them all.
+        ranked_ids = {r.get("model_id") for r in out.get("ranking", [])}
+        for mid in ids:
+            if mid not in ranked_ids:
+                out.setdefault("ranking", []).append(
+                    {"model_id": mid, "score": 0, "verdict": "Not ranked by the Manager."})
         return out
     logger.warning("[interview] eval parse failed | raw=%r", content[:250])
     best = max(valid, key=lambda t: len(t.get("answer", "")))
