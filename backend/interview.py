@@ -98,29 +98,36 @@ def _parse_json(text: str):
 async def generate_questions(orchestrator, role: str, description: str,
                              system_prompt: str, constraints: dict) -> list[str]:
     adapter, model = _ceo_adapter(orchestrator)
-    cons = []
-    if constraints.get("max_cost"):
-        cons.append("cost-efficiency matters")
-    if constraints.get("needs_image"):
-        cons.append("must reason about generating/handling images")
-    if constraints.get("needs_tools"):
-        cons.append("must be good at calling tools / structured output")
-    if constraints.get("needs_browser"):
-        cons.append("must handle web browsing / research workflows")
-    if constraints.get("needs_vision"):
-        cons.append("must understand images (vision)")
-    cons_text = ("; ".join(cons)) or "general capability for the role"
+    # Capability priorities, each with a concrete example of the kind of task the
+    # question should put the model in.
+    cap_map = {
+        "needs_tools": "calling tools/APIs to take real actions (e.g. publishing a LinkedIn post, creating a ticket, querying a database)",
+        "needs_browser": "browsing/searching the web for current information (e.g. researching breaking industry news)",
+        "needs_vision": "interpreting images it is given (e.g. reading a chart or screenshot)",
+        "needs_image": "generating images (e.g. producing a social graphic or thumbnail)",
+        "max_cost": "working efficiently and concisely to keep token cost low",
+    }
+    caps = [cap_map[k] for k in cap_map if constraints.get(k)]
+    caps_text = ("; ".join(caps)) if caps else "the core skills this role requires"
     system = (
-        "You are the Manager of an AI organisation, hiring a model for a specialist role. "
-        "Produce a set of probing INTERVIEW QUESTIONS to ask candidate models, designed to "
-        "reveal whether a model is a good fit for THIS role. Mix capability, reasoning, "
-        "domain-knowledge, and edge-case questions. Return ONLY a JSON array of 5-10 question strings."
+        "You are the Manager of an AI organisation hiring an AI MODEL for a specialist role. "
+        "Write probing, SCENARIO-BASED interview questions that test HOW THIS MODEL would actually "
+        "DO this job day-to-day — grounded in the role, its description, and its system prompt. "
+        "Each question should drop the model into a concrete, realistic situation from THIS role and "
+        "reveal its approach, reasoning, and use of its capabilities — e.g. exactly how it would call a "
+        "tool to perform an action, how it would browse/search to gather information, how it would handle "
+        "an image, or how it would generate one. Prefer 'show me how you would …' scenarios over abstract "
+        "trivia. Make the questions specific to the role's real tasks, not generic. "
+        "Return ONLY a JSON array of 5-10 question strings."
     )
     user = (
-        f"Role: {role}\nDescription: {description}\n"
-        f"The agent's system prompt:\n\"\"\"\n{system_prompt}\n\"\"\"\n"
-        f"Priorities for this hire: {cons_text}.\n\n"
-        "Return 5-10 interview questions as a JSON array of strings."
+        f"Role: {role}\n"
+        f"Description: {description}\n"
+        f"The agent's system prompt (its actual job/persona):\n\"\"\"\n{system_prompt}\n\"\"\"\n\n"
+        f"Capabilities/priorities this hire must prove: {caps_text}.\n\n"
+        "Write 5-10 scenario-based questions tied to the real tasks of this role and its system prompt. "
+        "At least a few must explicitly probe the prioritised capabilities above (e.g. the exact tool call "
+        "or search workflow the model would use). Return a JSON array of strings only."
     )
     # Retry once — the Manager's model can return an empty completion.
     content = ""
@@ -135,7 +142,7 @@ async def generate_questions(orchestrator, role: str, description: str,
     if len(qs) >= 3:
         return qs[:10]
     logger.warning("[interview] question extraction weak (%d) | raw=%r", len(qs), content[:200])
-    return _fallback_questions(role)
+    return _fallback_questions(role, constraints)
 
 
 def _extract_questions(text: str) -> list[str]:
@@ -162,14 +169,25 @@ def _extract_questions(text: str) -> list[str]:
     return [l.strip().strip('",') for l in lines if len(l.strip()) > 15]
 
 
-def _fallback_questions(role: str) -> list[str]:
-    return [
-        f"Briefly, how would you approach the core responsibilities of a {role}?",
-        "Walk through how you'd handle an ambiguous request in this role.",
-        "What information would you gather before acting, and why?",
-        "Describe a tricky edge case in this domain and how you'd handle it.",
-        "How do you keep your output accurate and well-structured?",
+def _fallback_questions(role: str, constraints: dict | None = None) -> list[str]:
+    c = constraints or {}
+    qs = [
+        f"Walk me through, step by step, how you would carry out a typical task for a {role} — what you'd do first, what you'd produce, and how you'd check it.",
+        f"Give a concrete example of a {role} request and show exactly how you'd handle it end to end.",
+        "When a request is ambiguous, how do you decide what to do, and what would you ask or assume?",
     ]
+    if c.get("needs_tools"):
+        qs.append(f"Show me precisely how you'd call a tool/API to complete an action for this role (e.g. publishing a post or updating a record) — what tool, what arguments, and how you'd confirm it worked.")
+    if c.get("needs_browser"):
+        qs.append("Describe your exact web-search/browsing workflow to gather current, accurate information for this role — the queries you'd run and how you'd verify sources.")
+    if c.get("needs_vision"):
+        qs.append("You're given an image relevant to this role. How would you interpret it and turn it into useful output?")
+    if c.get("needs_image"):
+        qs.append("How would you generate an on-brief image for this role, and how would you describe/prompt it?")
+    if c.get("max_cost"):
+        qs.append("How do you keep responses efficient and concise without losing quality?")
+    qs.append("Describe a tricky edge case in this domain and how you'd handle it.")
+    return qs[:10]
 
 
 # ── Run interviews + evaluate ─────────────────────────────────────────────────
