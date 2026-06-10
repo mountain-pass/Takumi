@@ -180,7 +180,7 @@ function StepQuestions({ agentForm, shared, onState, onNext, onBack }) {
           {questions.map((q, i) => (
             <div key={i} className="flex gap-2 items-start">
               <span className="text-xs text-gray-400 mt-2 w-4 text-right">{i + 1}</span>
-              <textarea className="input flex-1 text-sm resize-none" rows={2} value={q} onChange={e => setQ(i, e.target.value)} />
+              <textarea className="input flex-1 text-sm leading-relaxed resize-y min-h-[72px]" rows={3} value={q} onChange={e => setQ(i, e.target.value)} />
               <button onClick={() => delQ(i)} className="p-1.5 text-gray-300 hover:text-red-500 mt-1"><Trash2 size={14} /></button>
             </div>
           ))}
@@ -218,49 +218,85 @@ function StepModels({ shared, onState, onNext, onBack }) {
   const byId = Object.fromEntries(data.models.map(m => [m.id, m]))
   const curated = data.curated.map(id => byId[id]).filter(Boolean)
   const q = search.trim().toLowerCase()
-  const searchResults = q
-    ? data.models.filter(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).slice(0, 20)
-    : []
+  // Top section: search results when searching, else the curated top list. Always
+  // hide ones already selected (they live in the bottom "Selected" section).
+  const pool = q
+    ? data.models.filter(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
+    : curated
+  const available = pool.filter(m => !selected.includes(m.id)).slice(0, 30)
+  const selectedModels = selected.map(id => byId[id]).filter(Boolean)
 
-  function toggle(id) {
-    onState({ selected: selected.includes(id) ? selected.filter(x => x !== id) : [...selected, id] })
-  }
+  const add = (id) => onState({ selected: [...selected, id] })
+  const remove = (id) => onState({ selected: selected.filter(x => x !== id) })
 
-  const Row = ({ m }) => (
-    <label className={`flex items-center gap-3 px-3 py-2 rounded-xl border cursor-pointer ${selected.includes(m.id) ? 'border-indigo-300 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'}`}>
-      <input type="checkbox" checked={selected.includes(m.id)} onChange={() => toggle(m.id)} className="w-4 h-4 rounded text-indigo-600" />
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium text-gray-800 truncate">{m.name}</p>
-        <p className="text-[11px] text-gray-400 truncate">{m.id}</p>
-      </div>
-      <div className="flex items-center gap-1.5 shrink-0">
-        {m.vision && <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-600">vision</span>}
-        {m.tools && <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-600">tools</span>}
-        <span className="text-[10px] text-gray-400 tabular-nums">{perM(m.prompt_price)}</span>
-      </div>
-    </label>
+  const Badges = ({ m }) => (
+    <div className="flex items-center gap-1.5 shrink-0">
+      {m.vision && <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-600">vision</span>}
+      {m.tools && <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-600">tools</span>}
+      <span className="text-[10px] text-gray-400 tabular-nums w-14 text-right">{perM(m.prompt_price)}</span>
+    </div>
   )
 
   return (
     <div className="space-y-4">
-      <div>
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Top models</p>
-        <div className="space-y-1.5">{curated.map(m => <Row key={m.id} m={m} />)}</div>
+      {/* Search at the top */}
+      <div className="relative">
+        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <input autoFocus className="input pl-9" placeholder="Search all OpenRouter models…"
+          value={search} onChange={e => setSearch(e.target.value)} />
       </div>
+
+      {/* Available pool */}
       <div>
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">Add another model</p>
-        <div className="relative mb-2">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-          <input className="input pl-9" placeholder="Search all OpenRouter models…" value={search} onChange={e => setSearch(e.target.value)} />
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">
+          {q ? `Results (${available.length})` : 'Top models'}
+        </p>
+        <div className="space-y-1.5 max-h-[34vh] overflow-y-auto pr-1">
+          {available.length === 0 && <p className="text-sm text-gray-400 py-3 text-center">No matches.</p>}
+          {available.map(m => (
+            <button key={m.id} type="button" onClick={() => add(m.id)}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded-xl border border-gray-200 hover:border-indigo-300 hover:bg-indigo-50/50 transition-colors text-left">
+              <Plus size={15} className="text-indigo-500 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-gray-800 truncate">{m.name}</p>
+                <p className="text-[11px] text-gray-400 truncate">{m.id}</p>
+              </div>
+              <Badges m={m} />
+            </button>
+          ))}
         </div>
-        <div className="space-y-1.5">{searchResults.map(m => <Row key={m.id} m={m} />)}</div>
       </div>
+
+      {/* Selected basket */}
+      <div className="border-t border-gray-100 pt-3">
+        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">
+          Selected to interview ({selectedModels.length})
+        </p>
+        {selectedModels.length === 0 ? (
+          <p className="text-sm text-gray-400 py-3 text-center border border-dashed border-gray-200 rounded-xl">
+            Search and click models above to add them here.
+          </p>
+        ) : (
+          <div className="space-y-1.5">
+            {selectedModels.map(m => (
+              <div key={m.id} className="flex items-center gap-3 px-3 py-2 rounded-xl border border-indigo-300 bg-indigo-50">
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-gray-800 truncate">{m.name}</p>
+                  <p className="text-[11px] text-gray-400 truncate">{m.id}</p>
+                </div>
+                <Badges m={m} />
+                <button onClick={() => remove(m.id)} className="p-1 text-gray-400 hover:text-red-500 shrink-0"><X size={15} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       <div className="flex justify-between items-center">
         <button onClick={onBack} className="btn-ghost">Back</button>
-        <div className="flex items-center gap-3">
-          <span className="text-xs text-gray-400">{selected.length} selected</span>
-          <button onClick={onNext} disabled={selected.length < 1} className="btn-primary disabled:opacity-40">Run interviews</button>
-        </div>
+        <button onClick={onNext} disabled={selected.length < 1} className="btn-primary disabled:opacity-40">
+          Run interviews ({selected.length})
+        </button>
       </div>
     </div>
   )
