@@ -1034,8 +1034,109 @@ async def get_artifact_raw(artifact_id: str):
                 raise HTTPException(500, "Bad media data URI")
         return RedirectResponse(content)
     if kind == "html":
-        return HTMLResponse(content)
+        return HTMLResponse(_guard_html_artifact(content))
     return PlainTextResponse(content)
+
+
+# Guard injected into served HTML artifacts. Chart.js (and similar) with
+# responsive:true + maintainAspectRatio:false grows the <canvas> to fill its
+# parent every frame; if the parent has no bounded height the page grows forever.
+# This caps each canvas's parent to a fixed, sane height so it can't run away.
+_ARTIFACT_GUARD = """
+<style>html,body{max-width:100%}canvas{max-height:75vh!important}</style>
+<script>
+(function(){
+  function clamp(){
+    document.querySelectorAll('canvas').forEach(function(cv){
+      var p = cv.parentElement; if(!p) return;
+      if(!p.dataset._clamped){
+        p.dataset._clamped='1';
+        var h = Math.round(Math.min(window.innerHeight*0.6, 520));
+        p.style.height = h+'px';
+        p.style.maxHeight = '75vh';
+        if(getComputedStyle(p).position==='static') p.style.position='relative';
+      }
+    });
+  }
+  if(document.readyState!=='loading') clamp();
+  document.addEventListener('DOMContentLoaded', clamp);
+  window.addEventListener('load', function(){ clamp(); setTimeout(clamp,300); });
+})();
+</script>
+"""
+
+
+def _guard_html_artifact(html: str) -> str:
+    """Inject the runaway-canvas guard into an HTML artifact."""
+    if "</body>" in html:
+        return html.replace("</body>", _ARTIFACT_GUARD + "</body>", 1)
+    return html + _ARTIFACT_GUARD
+
+
+# ── Agent interview wizard ────────────────────────────────────────────────────
+
+class InterviewQuestionsReq(BaseModel):
+    role: str = ""
+    description: str = ""
+    system_prompt: str = ""
+    constraints: dict = {}
+
+
+class InterviewRunReq(BaseModel):
+    role: str = ""
+    description: str = ""
+    system_prompt: str = ""
+    questions: list[str] = []
+    model_ids: list[str] = []
+    constraints: dict = {}
+    max_cost_per_model: float = 1.0
+
+
+@router.get("/openrouter/models")
+async def openrouter_models():
+    """List OpenRouter models (requires a configured OpenRouter provider)."""
+    from .. import interview
+    prov = await interview.get_openrouter_provider()
+    if not prov:
+        raise HTTPException(400, "No OpenRouter provider configured")
+    try:
+        models = await interview.list_models(prov.get("api_key", ""), prov.get("base_url", ""))
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach OpenRouter: {e}")
+    present = {m["id"] for m in models}
+    curated = [mid for mid in interview.CURATED_MODEL_IDS if mid in present]
+    return {"provider_id": prov["id"], "models": models, "curated": curated}
+
+
+@router.post("/interview/questions")
+async def interview_questions(req: InterviewQuestionsReq):
+    from .. import interview
+    qs = await interview.generate_questions(
+        orchestrator, req.role, req.description, req.system_prompt, req.constraints)
+    return {"questions": qs}
+
+
+@router.post("/interview/run")
+async def interview_run(req: InterviewRunReq):
+    """Interview each selected model and have the Manager rank them."""
+    import asyncio
+    from .. import interview
+    prov = await interview.get_openrouter_provider()
+    if not prov:
+        raise HTTPException(400, "No OpenRouter provider configured")
+    if not req.model_ids or not req.questions:
+        raise HTTPException(400, "Need at least one model and one question")
+    base, key = prov.get("base_url", ""), prov.get("api_key", "")
+    transcripts = await asyncio.gather(*[
+        interview.interview_model(base, key, mid, req.system_prompt, req.questions,
+                                  req.max_cost_per_model)
+        for mid in req.model_ids[:12]
+    ])
+    recommendation = await interview.evaluate(
+        orchestrator, req.role, req.description, req.constraints, list(transcripts))
+    total_cost = round(sum(t.get("cost", 0) for t in transcripts), 4)
+    return {"transcripts": list(transcripts), "recommendation": recommendation,
+            "total_cost": total_cost}
 
 
 # ── Backup / Restore ──────────────────────────────────────────────────────────

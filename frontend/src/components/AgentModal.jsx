@@ -1,11 +1,12 @@
 /**
  * AgentModal — create a new agent or view agent details.
  */
-import React, { useState, useEffect } from 'react'
-import { Pencil } from 'lucide-react'
+import React, { useState, useEffect, useRef } from 'react'
+import { Pencil, Trophy } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
 import AIPromptWizard from './AIPromptWizard'
+import InterviewWizard from './InterviewWizard'
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 
@@ -28,6 +29,22 @@ export default function AgentModal({ onClose }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [mcpServers, setMcpServers] = useState([])
+  const [showInterview, setShowInterview] = useState(false)
+  const downOnBackdrop = useRef(false)
+
+  // Wizard recommended a model — set it (+ the OpenRouter provider) on the form.
+  async function applyInterviewPick(modelId) {
+    try {
+      const providers = await fetch('/api/providers').then(r => r.json())
+      const or = providers.find(p => (p.provider || '').toLowerCase() === 'openrouter' && p.type === 'llm')
+      if (or) {
+        set('api_provider_id', or.id)
+        set('llm_provider', 'openrouter')
+      }
+      set('llm_model', modelId)
+    } catch {}
+    setShowInterview(false)
+  }
 
   useEffect(() => {
     fetch('/api/mcp/servers')
@@ -60,10 +77,14 @@ export default function AgentModal({ onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={onClose}>
+    <div
+      className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
+      onMouseDown={e => { downOnBackdrop.current = e.target === e.currentTarget }}
+      onClick={e => { if (e.target === e.currentTarget && downOnBackdrop.current) onClose() }}
+    >
       <div
         className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col"
-        onClick={e => e.stopPropagation()}
+        onMouseDown={() => { downOnBackdrop.current = false }}
       >
         <h2 className="text-lg font-bold text-gray-900 px-6 pt-6 pb-4 border-b border-gray-100 shrink-0">Add Agent</h2>
 
@@ -108,6 +129,22 @@ export default function AgentModal({ onClose }) {
               )}
             </AIPromptWizard>
           </div>
+
+          {/* Not sure which model? Interview candidates */}
+          <button
+            type="button"
+            onClick={() => setShowInterview(true)}
+            className="group col-span-2 w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl border border-indigo-200 bg-indigo-50/60 hover:bg-indigo-50 hover:border-indigo-300 transition-colors text-left"
+          >
+            <span className="shrink-0 w-8 h-8 rounded-lg bg-indigo-100 flex items-center justify-center">
+              <Trophy size={15} className="text-indigo-600" />
+            </span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-sm font-semibold text-indigo-700">Not sure which model?</span>
+              <span className="block text-xs text-indigo-600/80">Let the Manager interview candidates and recommend the best fit.</span>
+            </span>
+            <span className="shrink-0 text-indigo-400 group-hover:text-indigo-600 group-hover:translate-x-0.5 transition-all">→</span>
+          </button>
 
           {/* Provider from API providers */}
           <label className="space-y-1">
@@ -258,7 +295,13 @@ export default function AgentModal({ onClose }) {
         </div>
       </div>
 
-      <style>{`.input { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; font-size: 14px; outline: none; background: white; } .input:focus { border-color: #6366f1; }`}</style>
+      {showInterview && (
+        <InterviewWizard
+          agentForm={form}
+          onPick={applyInterviewPick}
+          onClose={() => setShowInterview(false)}
+        />
+      )}
     </div>
   )
 }
