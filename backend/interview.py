@@ -258,6 +258,13 @@ async def evaluate(orchestrator, role: str, description: str, constraints: dict,
             break
     out = _extract_evaluation(content, ids)
     if out:
+        # Ensure EVERY interviewed candidate is in the ranking (the Manager
+        # sometimes drops one) so the UI can list them all.
+        ranked_ids = {r.get("model_id") for r in out.get("ranking", [])}
+        for mid in ids:
+            if mid not in ranked_ids:
+                out.setdefault("ranking", []).append(
+                    {"model_id": mid, "score": 0, "verdict": "Not ranked by the Manager."})
         return out
     logger.warning("[interview] eval parse failed | raw=%r", content[:250])
     best = max(valid, key=lambda t: len(t.get("answer", "")))

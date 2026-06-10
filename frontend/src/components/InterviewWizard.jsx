@@ -327,8 +327,11 @@ function StepModels({ shared, onState, onNext, onBack }) {
 function StepRun({ agentForm, shared, onPick, onBack }) {
   const [result, setResult] = useState(null)
   const [err, setErr] = useState('')
+  const ran = useRef(false)
 
   useEffect(() => {
+    if (ran.current) return   // run the (paid) interview exactly once, even under StrictMode
+    ran.current = true
     fetch('/api/interview/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -345,9 +348,18 @@ function StepRun({ agentForm, shared, onPick, onBack }) {
   if (!result) return <Loading label={`Interviewing ${shared.selected.length} models — the Manager is asking and scoring…`} />
 
   const rec = result.recommendation || {}
-  const ranking = (rec.ranking || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0))
   const costFor = (id) => result.transcripts.find(t => t.model_id === id)?.cost ?? 0
-  const rows = ranking.length ? ranking : result.transcripts.map(t => ({ model_id: t.model_id, score: 0, verdict: t.error || '' }))
+  // Always list EVERY interviewed model, merging in the Manager's score/verdict
+  // where it provided one (the ranking JSON sometimes omits a candidate).
+  const rankById = Object.fromEntries((rec.ranking || []).map(r => [r.model_id, r]))
+  const rows = result.transcripts.map(t => {
+    const r = rankById[t.model_id] || {}
+    return {
+      model_id: t.model_id,
+      score: r.score || 0,
+      verdict: r.verdict || (t.error ? `Could not interview: ${t.error}` : 'Not ranked by the Manager'),
+    }
+  }).sort((a, b) => (b.score || 0) - (a.score || 0))
 
   return (
     <div className="space-y-4">
