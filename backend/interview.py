@@ -225,20 +225,69 @@ async def evaluate(orchestrator, role: str, description: str, constraints: dict,
         "Return ONLY JSON: {\"recommended\": \"<model_id>\", \"summary\": \"<2-3 sentences>\", "
         "\"ranking\": [{\"model_id\": \"...\", \"score\": <0-100>, \"verdict\": \"<one line>\"}]}."
     )
+    ids = [t["model_id"] for t in valid]
     user = (f"Role: {role}\nDescription: {description}\nPriorities: {json.dumps(cons)}\n\n"
             "Candidate interviews:\n\n" + "\n\n".join(blocks) +
-            "\n\nPick the single best-fit model and rank them all.")
-    resp = await adapter.complete(system_prompt=system,
-                                  messages=[{"role": "user", "content": user}],
-                                  model=model, max_tokens=1500)
-    try:
-        out = _parse_json(resp.content)
-        if not out.get("recommended") and out.get("ranking"):
-            out["recommended"] = out["ranking"][0].get("model_id")
+            f"\n\nThe candidate model_ids are: {ids}. "
+            "Pick the single best-fit model and rank them all. Use the exact model_ids above.")
+    content = ""
+    for _ in range(2):
+        resp = await adapter.complete(system_prompt=system,
+                                      messages=[{"role": "user", "content": user}],
+                                      model=model, max_tokens=2200)
+        content = (resp.content or "").strip()
+        if content:
+            break
+    out = _extract_evaluation(content, ids)
+    if out:
         return out
-    except Exception as e:
-        logger.warning("[interview] eval parse failed: %s", e)
-        best = max(valid, key=lambda t: len(t.get("answer", "")))
-        return {"recommended": best["model_id"],
-                "summary": "Heuristic pick (evaluation could not be parsed).",
-                "ranking": [{"model_id": t["model_id"], "score": 0, "verdict": ""} for t in valid]}
+    logger.warning("[interview] eval parse failed | raw=%r", content[:250])
+    best = max(valid, key=lambda t: len(t.get("answer", "")))
+    return {"recommended": best["model_id"],
+            "summary": "Picked the most thorough answer (the Manager's structured verdict was unavailable).",
+            "ranking": [{"model_id": t["model_id"], "score": 0, "verdict": ""} for t in valid]}
+
+
+def _match_id(raw: str, ids: list[str]) -> str:
+    """Map a possibly-shortened model id back to a real candidate id."""
+    raw = (raw or "").strip()
+    if raw in ids:
+        return raw
+    for mid in ids:
+        if raw and (raw in mid or mid in raw or raw.split("/")[-1] == mid.split("/")[-1]):
+            return mid
+    return raw
+
+
+def _extract_evaluation(text: str, ids: list[str]) -> dict | None:
+    """Parse the Manager's verdict — strict JSON first, then salvage from partial/
+    truncated output (recommended id + per-model score/verdict)."""
+    if not text:
+        return None
+    # 1. Strict JSON.
+    try:
+        out = _parse_json(text)
+        if isinstance(out, dict) and (out.get("recommended") or out.get("ranking")):
+            ranking = out.get("ranking") or []
+            for r in ranking:
+                r["model_id"] = _match_id(r.get("model_id", ""), ids)
+            rec = _match_id(out.get("recommended") or (ranking[0]["model_id"] if ranking else ""), ids)
+            return {"recommended": rec, "summary": (out.get("summary") or "").strip(), "ranking": ranking}
+    except Exception:
+        pass
+    # 2. Salvage from partial text.
+    rec_m = re.search(r'"recommended"\s*:\s*"([^"]+)"', text)
+    summary_m = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    ranking = []
+    for rm in re.finditer(r'"model_id"\s*:\s*"([^"]+)"(?:[^}]*?"score"\s*:\s*(\d+))?(?:[^}]*?"verdict"\s*:\s*"((?:[^"\\]|\\.)*)")?', text):
+        ranking.append({
+            "model_id": _match_id(rm.group(1), ids),
+            "score": int(rm.group(2)) if rm.group(2) else 0,
+            "verdict": (rm.group(3) or "").replace('\\"', '"'),
+        })
+    recommended = _match_id(rec_m.group(1), ids) if rec_m else (ranking[0]["model_id"] if ranking else "")
+    if recommended or ranking:
+        return {"recommended": recommended,
+                "summary": (summary_m.group(1).replace('\\"', '"') if summary_m else ""),
+                "ranking": ranking}
+    return None
