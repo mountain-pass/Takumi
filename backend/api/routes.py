@@ -3,7 +3,7 @@ REST API routes for agent & task management.
 """
 from __future__ import annotations
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -1137,6 +1137,96 @@ async def interview_run(req: InterviewRunReq):
     total_cost = round(sum(t.get("cost", 0) for t in transcripts), 4)
     return {"transcripts": list(transcripts), "recommendation": recommendation,
             "total_cost": total_cost}
+
+
+# ── Backup / Restore ──────────────────────────────────────────────────────────
+
+@router.get("/backup")
+async def backup_export():
+    """Download a zip of the org config (agents, connections, providers/keys, MCP
+    servers, org settings) plus each agent's folder files (agent.md, soul.md, …)."""
+    import io, os, zipfile, json as _json
+    from datetime import datetime
+    from fastapi.responses import Response
+
+    data = await database.export_tables(database.BACKUP_TABLES)
+    manifest = {"app": "takumi", "format": 1, "created_at": datetime.utcnow().isoformat()}
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", _json.dumps(manifest, indent=2))
+        z.writestr("data.json", _json.dumps(data, indent=2, default=str))
+        # Agent folder files (agent.md / soul.md / memory.md / skills.md).
+        agents_root = os.path.join(orchestrator.settings.data_dir, "agents")
+        if os.path.isdir(agents_root):
+            for root, _dirs, files in os.walk(agents_root):
+                for f in files:
+                    if f.startswith("."):  # skip .DS_Store and other dotfiles
+                        continue
+                    full = os.path.join(root, f)
+                    arc = os.path.relpath(full, orchestrator.settings.data_dir)  # agents/<slug>/file
+                    z.write(full, arcname=arc)
+    buf.seek(0)
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return Response(
+        buf.read(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="takumi-backup-{stamp}.zip"'},
+    )
+
+
+@router.post("/restore")
+async def backup_restore(file: UploadFile = File(...)):
+    """Restore from a backup zip (replaces config + agent folders), then reload."""
+    import io, os, zipfile, json as _json
+
+    raw = await file.read()
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception:
+        raise HTTPException(400, "Not a valid zip file")
+    if "data.json" not in z.namelist():
+        raise HTTPException(400, "Backup is missing data.json")
+    try:
+        data = _json.loads(z.read("data.json"))
+    except Exception as e:
+        raise HTTPException(400, f"Corrupt data.json: {e}")
+
+    # 1. Replace config tables.
+    counts = await database.import_tables(data, database.BACKUP_TABLES)
+
+    # 2. Restore agent folder files (zip-slip guarded).
+    data_dir = os.path.abspath(orchestrator.settings.data_dir)
+    files_written = 0
+    for name in z.namelist():
+        if not name.startswith("agents/") or name.endswith("/"):
+            continue
+        target = os.path.abspath(os.path.join(data_dir, name))
+        if not target.startswith(data_dir + os.sep):
+            continue  # path traversal — skip
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as fp:
+            fp.write(z.read(name))
+        files_written += 1
+
+    # 3. Refresh runtime settings (org name etc.) from the restored DB.
+    db_settings = await database.get_all_settings()
+    patch = {}
+    for key in ("org_name", "org_description", "llm_provider", "llm_model", "llm_base_url", "configured"):
+        if key in db_settings:
+            patch[key] = db_settings[key] if key != "configured" else (db_settings[key] == "True")
+    if patch:
+        runtime_settings.update(patch)
+
+    # 4. Reload live agents + MCP connections.
+    await orchestrator.reload_agents()
+    try:
+        from ..mcp_manager import mcp_manager
+        await mcp_manager.stop()
+        await mcp_manager.start()
+    except Exception as e:
+        logger.warning("MCP reconnect after restore failed: %s", e)
+
+    return {"ok": True, "imported": counts, "agent_files": files_written}
 
 
 # ── Self-heal ─────────────────────────────────────────────────────────────────
