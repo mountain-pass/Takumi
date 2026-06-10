@@ -1090,6 +1090,7 @@ class InterviewRunReq(BaseModel):
     model_ids: list[str] = []
     constraints: dict = {}
     max_cost_per_model: float = 1.0
+    max_tokens_per_model: int = 10000
 
 
 @router.get("/openrouter/models")
@@ -1129,7 +1130,7 @@ async def interview_run(req: InterviewRunReq):
     base, key = prov.get("base_url", ""), prov.get("api_key", "")
     transcripts = await asyncio.gather(*[
         interview.interview_model(base, key, mid, req.system_prompt, req.questions,
-                                  req.max_cost_per_model)
+                                  req.max_cost_per_model, req.max_tokens_per_model)
         for mid in req.model_ids[:12]
     ])
     recommendation = await interview.evaluate(

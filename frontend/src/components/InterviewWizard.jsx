@@ -21,7 +21,7 @@ const perM = (p) => p ? `$${(p * 1e6).toFixed(2)}/M` : 'free'
 
 export default function InterviewWizard({ agentForm, onPick, onClose }) {
   const [step, setStep] = useState(1)
-  const [shared, setShared] = useState({ constraints: {}, questions: [], selected: [] })
+  const [shared, setShared] = useState({ constraints: {}, questions: [], selected: [], maxTokens: 10000 })
   const patch = (p) => setShared(s => ({ ...s, ...p }))
   const downOnBackdrop = useRef(false)
   return (
@@ -195,6 +195,22 @@ function StepQuestions({ agentForm, shared, onState, onNext, onBack }) {
         )}
       </div>
 
+      {/* Token budget per candidate */}
+      <div className="border-t border-gray-100 pt-3">
+        <label className="flex items-center justify-between gap-3">
+          <span>
+            <span className="block text-xs font-semibold text-gray-400 uppercase tracking-wide">Max tokens per candidate</span>
+            <span className="block text-[11px] text-gray-400">Caps how much each model can write when answering — controls cost & length.</span>
+          </span>
+          <input
+            type="number" min={256} step={500}
+            className="input w-32 text-right"
+            value={shared.maxTokens ?? 10000}
+            onChange={e => onState({ maxTokens: Math.max(256, parseInt(e.target.value || '0', 10) || 0) })}
+          />
+        </label>
+      </div>
+
       <div className="flex justify-between">
         <button onClick={onBack} className="btn-ghost">Back</button>
         <button onClick={onNext} disabled={questions.filter(q => q.trim()).length < 1} className="btn-primary disabled:opacity-40">Next</button>
@@ -318,7 +334,8 @@ function StepRun({ agentForm, shared, onPick, onBack }) {
       body: JSON.stringify({
         role: agentForm.role, description: agentForm.description, system_prompt: agentForm.system_prompt,
         questions: (shared.questions || []).filter(q => q.trim()),
-        model_ids: shared.selected, constraints: shared.constraints, max_cost_per_model: 1.0,
+        model_ids: shared.selected, constraints: shared.constraints,
+        max_cost_per_model: 1.0, max_tokens_per_model: shared.maxTokens || 10000,
       }),
     }).then(async r => { if (!r.ok) throw new Error(await r.text()); return r.json() })
       .then(setResult).catch(e => setErr(e.message))
