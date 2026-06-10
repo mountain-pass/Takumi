@@ -129,9 +129,16 @@ export default function AgentModal({ onClose }) {
           <button
             type="button"
             onClick={() => setShowInterview(true)}
-            className="flex items-center gap-1.5 text-xs font-medium text-indigo-600 hover:text-indigo-700"
+            className="group col-span-2 w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl border border-indigo-200 bg-indigo-50/60 hover:bg-indigo-50 hover:border-indigo-300 transition-colors text-left"
           >
-            <Trophy size={13} /> Not sure which model? Why not interview them →
+            <span className="shrink-0 w-8 h-8 rounded-lg bg-indigo-100 flex items-center justify-center">
+              <Trophy size={15} className="text-indigo-600" />
+            </span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-sm font-semibold text-indigo-700">Not sure which model?</span>
+              <span className="block text-xs text-indigo-600/80">Let the Manager interview candidates and recommend the best fit.</span>
+            </span>
+            <span className="shrink-0 text-indigo-400 group-hover:text-indigo-600 group-hover:translate-x-0.5 transition-all">→</span>
           </button>
 
           {/* Provider from API providers */}
