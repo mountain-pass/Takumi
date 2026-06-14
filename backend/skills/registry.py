@@ -8,6 +8,10 @@ from typing import Callable, Any
 from .web_search import web_search, web_fetch
 from .files import read_file, write_file, list_files
 from .shell import run_shell
+from .browser import (
+    browser_navigate, browser_read, browser_click, browser_type,
+    browser_back, browser_screenshot,
+)
 
 
 # Each skill: { name, description, parameters (for the LLM prompt), callable }
@@ -59,7 +63,48 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "parameters": {"title": "Short title for the artifact", "html": "A complete standalone HTML document"},
         "callable": None,  # execution is intercepted by the agent (needs conversation/task context)
     },
+    # ── Browser control (drives a real, visible desktop Chrome window) ─────────
+    "browser_navigate": {
+        "name": "browser_navigate",
+        "description": "Open a URL in the controlled desktop Chrome browser and return the page's title, URL, visible text, and clickable links. Use this to browse real sites like a human (keeps your logins/cookies).",
+        "parameters": {"url": "The URL to open"},
+        "callable": browser_navigate,
+    },
+    "browser_read": {
+        "name": "browser_read",
+        "description": "Re-read the CURRENT browser page — returns its title, URL, visible text, and clickable links. Use after the page changes.",
+        "parameters": {},
+        "callable": browser_read,
+    },
+    "browser_click": {
+        "name": "browser_click",
+        "description": "Click something on the current page by its visible link/button text (or a CSS selector). Returns the resulting page.",
+        "parameters": {"target": "Visible text of the link/button to click, or a CSS selector"},
+        "callable": browser_click,
+    },
+    "browser_type": {
+        "name": "browser_type",
+        "description": "Type text into a field on the current page (e.g. a search or login box). Optionally submit with Enter.",
+        "parameters": {"text": "Text to type", "target": "(optional) field label, placeholder, or CSS selector; omit to type into the focused field", "submit": "(optional) true to press Enter after typing"},
+        "callable": browser_type,
+    },
+    "browser_back": {
+        "name": "browser_back",
+        "description": "Go back to the previous page in the browser.",
+        "parameters": {},
+        "callable": browser_back,
+    },
+    "browser_screenshot": {
+        "name": "browser_screenshot",
+        "description": "Save a screenshot of the current browser page to disk (useful as proof or for a vision step). Returns the file path.",
+        "parameters": {},
+        "callable": browser_screenshot,
+    },
 }
+
+# The single "Browser" toggle in the UI maps to this set of tool names.
+BROWSER_TOOLS = ["browser_navigate", "browser_read", "browser_click",
+                 "browser_type", "browser_back", "browser_screenshot"]
 
 
 def get_skill(name: str) -> dict | None:

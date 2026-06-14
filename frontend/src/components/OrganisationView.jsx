@@ -214,6 +214,8 @@ function ProviderModelPicker({ form, set }) {
   )
 }
 
+const BROWSER_TOOLS = ['browser_navigate', 'browser_read', 'browser_click', 'browser_type', 'browser_back', 'browser_screenshot']
+
 const BUILTIN_SKILLS = [
   { id: 'web_search', label: 'Web Search' },
   { id: 'web_fetch', label: 'Web Fetch' },
@@ -314,6 +316,10 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   const skills = form.skills || []
   const toggleSkill = (id, on) =>
     set('skills', on ? [...skills, id] : skills.filter(s => s !== id))
+  const browserOn = BROWSER_TOOLS.every(t => skills.includes(t))
+  const toggleBrowser = (on) =>
+    set('skills', on ? [...skills.filter(s => !BROWSER_TOOLS.includes(s)), ...BROWSER_TOOLS]
+                     : skills.filter(s => !BROWSER_TOOLS.includes(s)))
 
   async function handleSave() {
     setSaving(true)
@@ -394,6 +400,13 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
                 <span className="text-xs text-gray-700">{s.label}</span>
               </label>
             ))}
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={browserOn}
+                onChange={e => toggleBrowser(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+              <span className="text-xs text-gray-700">Browser</span>
+              <span className="text-[10px] text-gray-400">— desktop Chrome</span>
+            </label>
           </div>
         </div>
 
