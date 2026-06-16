@@ -15,6 +15,24 @@ import { useAgentTasks, useCreateTask, useUpdateTask, useDeleteTask } from '../h
 // Tokens in plain English (no locale-specific grouping like "万").
 const fmtTokens = (n) => (n || 0).toLocaleString('en-US')
 
+// Is this a recurring "daily SOP" task vs a one-off adhoc task?
+function isSopTask(task) {
+  return !!task.schedule_cron || ['routine', 'standing', 'scheduled'].includes(task.task_type)
+}
+function taskTypeLabel(task) {
+  if (isSopTask(task)) return task.schedule_human || 'Daily SOP'
+  return 'Adhoc'
+}
+// Time taken for a completed task (started_at → completed_at).
+function fmtDuration(startedAt, completedAt) {
+  const s = parseUtcTs(startedAt), e = parseUtcTs(completedAt)
+  if (!s || !e) return ''
+  const secs = Math.max(0, Math.round((e - s) / 1000))
+  if (secs < 60) return `${secs}s`
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+}
+
 // Parse a backend timestamp (UTC; SQLite "YYYY-MM-DD HH:MM:SS" has no zone) into
 // a local Date so "today" is computed in the browser's timezone.
 function parseUtcTs(ts) {
@@ -58,10 +76,11 @@ export default function OfficeView() {
   const [loadingMsgs, setLoadingMsgs] = useState(false)
   const msgsEndRef = useRef(null)
 
-  // Auto-switch to messages tab when an agent is selected
+  // Click an agent → show THEIR checklist (their tasks), not the shared list.
   useEffect(() => {
     if (selectedAgentId) {
-      setRightTab('messages')
+      setFilterAgent(selectedAgentId)
+      setRightTab('tasks')
       setPanelOpen(true)
     }
   }, [selectedAgentId])
@@ -194,7 +213,7 @@ export default function OfficeView() {
               }`}
             >
               <Briefcase size={12} className="inline mr-1 -mt-0.5" />
-              Tasks ({tasks.length})
+              {filterAgent && agentMap[filterAgent] ? 'Checklist' : 'Tasks'} ({tasks.length})
             </button>
             <button
               onClick={() => setRightTab('messages')}
@@ -291,6 +310,26 @@ export default function OfficeView() {
                   <option value="blocked">Blocked</option>
                 </select>
               </div>
+
+              {/* Per-agent checklist summary */}
+              {filterAgent && agentMap[filterAgent] && (
+                <div className="px-3 py-2 border-b border-gray-100 bg-indigo-50/40">
+                  <div className="flex items-center gap-2">
+                    <span className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[9px] font-bold shrink-0"
+                      style={{ backgroundColor: agentMap[filterAgent].config.avatar_color || '#6b7280' }}>
+                      {agentMap[filterAgent].config.name[0]}
+                    </span>
+                    <span className="text-xs font-semibold text-gray-700 truncate">{agentMap[filterAgent].config.name}'s checklist</span>
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-gray-500">
+                    <span><b className="text-gray-700">{tasks.filter(t => t.status === 'completed').length}</b>/{tasks.length} done</span>
+                    <span><b className="text-indigo-600">{tasks.filter(isSopTask).length}</b> daily SOP</span>
+                    <span><b className="text-gray-700">{tasks.filter(t => t.status === 'in_progress').length}</b> running</span>
+                    {tasks.some(t => t.status === 'failed') && <span className="text-red-500"><b>{tasks.filter(t => t.status === 'failed').length}</b> failed</span>}
+                    <span className="text-gray-400">{fmtTokens(todayByAgent[filterAgent] || 0)} tokens today</span>
+                  </div>
+                </div>
+              )}
 
               {/* Task list */}
               <div className="flex-1 overflow-y-auto scrollbar-thin">
@@ -477,7 +516,12 @@ function TaskRow({ task, agentMap }) {
       <div className="flex items-start gap-2">
         {/* Title + agent avatars */}
         <div className="flex-1 min-w-0">
-          <div className="text-xs font-medium text-gray-800 truncate">{task.title}</div>
+          <div className="flex items-center gap-1.5">
+            <span className={`text-[9px] px-1.5 py-px rounded font-medium shrink-0 ${
+              isSopTask(task) ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-500'
+            }`}>{taskTypeLabel(task)}</span>
+            <div className="text-xs font-medium text-gray-800 truncate">{task.title}</div>
+          </div>
           <div className="flex items-center gap-1.5 mt-1">
             {/* Agent mini avatars */}
             <div className="flex -space-x-1">
@@ -575,6 +619,7 @@ function TaskRow({ task, agentMap }) {
           {/* Metadata row */}
           <div className="flex items-center gap-3 text-[10px] text-gray-400">
             {task.token_count > 0 && <span>{fmtTokens(task.token_count)} tokens</span>}
+            {fmtDuration(task.started_at, task.completed_at) && <span>⏱ {fmtDuration(task.started_at, task.completed_at)}</span>}
             {task.run_count > 0 && <span>{task.run_count} run{task.run_count > 1 ? 's' : ''}</span>}
             {task.schedule_human && <span>{task.schedule_human}</span>}
             <span className="ml-auto">{task.created_at ? formatTime(task.created_at) : ''}</span>
