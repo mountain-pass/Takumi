@@ -27,10 +27,43 @@ CATEGORIES = [
 
 DEFAULT_THRESHOLD = 10  # block at "High" (score >= 10) by default
 
+# The organisation's risk policy — editable in the app, consumed by every
+# assessment so the agent scores against the company's actual specification.
+DEFAULT_POLICY = {
+    "threshold": DEFAULT_THRESHOLD,
+    "appetite": (
+        "We operate with a low appetite for security, data-privacy and legal/compliance "
+        "risk, and a moderate appetite for operational and reputational risk. Never expose "
+        "secrets, credentials, or personal data. Escalate anything legally or financially material."
+    ),
+    "categories": list(CATEGORIES),
+    "likelihood_scale": ["Rare", "Unlikely", "Possible", "Likely", "Almost certain"],
+    "consequence_scale": ["Insignificant", "Minor", "Moderate", "Major", "Severe"],
+}
+
+
+def get_policy() -> dict:
+    """Full risk policy with any saved overrides merged onto the defaults."""
+    saved = {}
+    try:
+        saved = runtime_settings.get().get("risk_policy") or {}
+        if isinstance(saved, str):
+            saved = json.loads(saved)
+    except Exception:
+        saved = {}
+    policy = {**DEFAULT_POLICY, **(saved if isinstance(saved, dict) else {})}
+    # Legacy: a standalone risk_threshold still wins if no policy threshold saved.
+    if "threshold" not in saved:
+        try:
+            policy["threshold"] = int(runtime_settings.get().get("risk_threshold", policy["threshold"]))
+        except Exception:
+            pass
+    return policy
+
 
 def get_threshold() -> int:
     try:
-        return int(runtime_settings.get().get("risk_threshold", DEFAULT_THRESHOLD))
+        return int(get_policy().get("threshold", DEFAULT_THRESHOLD))
     except Exception:
         return DEFAULT_THRESHOLD
 
@@ -143,15 +176,23 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
     rationale = ""
     if rc_agent is not None:
         try:
+            policy = get_policy()
             adapter = rc_agent._adapter
             model = rc_agent.config.llm_model
+            cats = policy.get("categories") or CATEGORIES
+            lscale = policy.get("likelihood_scale") or DEFAULT_POLICY["likelihood_scale"]
+            cscale = policy.get("consequence_scale") or DEFAULT_POLICY["consequence_scale"]
+            scale_txt = ("Likelihood 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(lscale)) +
+                         ". Consequence 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(cscale)) + ".")
             system = (
-                "You are an ISO 31000 risk & compliance assessor. Score the work across these "
-                f"categories: {', '.join(CATEGORIES)}. For each, give likelihood (1-5) and "
-                "consequence (1-5) and a one-line note. Be conservative — flag data leakage, "
-                "PII, financial/legal exposure, and reputational risk. Return ONLY JSON: "
-                "{\"categories\": {\"<cat>\": {\"likelihood\": n, \"consequence\": n, \"note\": \"...\"}}, "
-                "\"rationale\": \"2-3 sentences\"}."
+                "You are an ISO 31000 risk & compliance assessor for this organisation. Score the work "
+                f"against the ORGANISATION RISK POLICY below, across these categories: {', '.join(cats)}.\n\n"
+                f"ORGANISATION RISK APPETITE / POLICY:\n{policy.get('appetite','')}\n\n"
+                f"SCORING SCALE: {scale_txt}\n\n"
+                "For each relevant category give likelihood (1-5) and consequence (1-5) and a one-line note. "
+                "Be conservative against the policy — flag data leakage, PII, financial/legal exposure, and "
+                "reputational risk. Return ONLY JSON: {\"categories\": {\"<cat>\": {\"likelihood\": n, "
+                "\"consequence\": n, \"note\": \"...\"}}, \"rationale\": \"2-3 sentences referencing the policy\"}."
             )
             user = f"Subject: {subject}\n\nWork to assess:\n\"\"\"\n{(content or '')[:6000]}\n\"\"\""
             resp = await adapter.complete(system_prompt=system,

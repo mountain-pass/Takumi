@@ -1252,19 +1252,29 @@ async def risk_register(limit: int = 50):
 @router.get("/risk/policy")
 async def get_risk_policy():
     from .. import compliance
-    return {"threshold": compliance.get_threshold(), "categories": compliance.CATEGORIES,
+    policy = compliance.get_policy()
+    return {**policy, "all_categories": compliance.CATEGORIES,
             "levels": {"low": "1-4", "medium": "5-9", "high": "10-15", "critical": "16-25"}}
 
 
-class RiskThresholdReq(BaseModel):
-    threshold: int
+class RiskPolicyReq(BaseModel):
+    threshold: int | None = None
+    appetite: str | None = None
+    categories: list[str] | None = None
+    likelihood_scale: list[str] | None = None
+    consequence_scale: list[str] | None = None
 
 
 @router.post("/risk/policy")
-async def set_risk_policy(req: RiskThresholdReq):
-    t = max(1, min(25, int(req.threshold)))
-    runtime_settings.update({"risk_threshold": t})
-    return {"ok": True, "threshold": t}
+async def set_risk_policy(req: RiskPolicyReq):
+    from .. import compliance
+    policy = compliance.get_policy()
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "threshold" in updates:
+        updates["threshold"] = max(1, min(25, int(updates["threshold"])))
+    policy.update(updates)
+    runtime_settings.update({"risk_policy": policy})
+    return {"ok": True, "policy": policy}
 
 
 class RiskDecisionReq(BaseModel):
