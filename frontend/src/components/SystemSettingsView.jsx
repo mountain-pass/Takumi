@@ -249,6 +249,11 @@ export default function SystemSettingsView() {
 
         <hr className="border-gray-200" />
 
+        {/* Risk & Compliance */}
+        <RiskPolicy />
+
+        <hr className="border-gray-200" />
+
         {/* Backup & Restore */}
         <BackupRestore />
 
@@ -415,6 +420,45 @@ function Heartbeat({ orgData }) {
             className="ml-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
             Save
           </button>
+          {saved && <span className="text-xs text-green-600">Saved ✓</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Risk & Compliance policy ──────────────────────────────────────────────────
+function RiskPolicy() {
+  const [threshold, setThreshold] = React.useState(10)
+  const [saved, setSaved] = React.useState(false)
+  React.useEffect(() => {
+    fetch('/api/risk/policy').then(r => r.json()).then(d => setThreshold(d.threshold || 10)).catch(() => {})
+  }, [])
+  async function save() {
+    setSaved(false)
+    await fetch('/api/risk/policy', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threshold: Math.max(1, Math.min(25, threshold)) }),
+    })
+    setSaved(true); setTimeout(() => setSaved(false), 2500)
+  }
+  const levelOf = (s) => s >= 16 ? 'Critical' : s >= 10 ? 'High' : s >= 5 ? 'Medium' : 'Low'
+  return (
+    <div className="space-y-3">
+      <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Risk &amp; Compliance</h2>
+      <div className="border border-gray-200 rounded-xl p-4 space-y-3">
+        <p className="text-xs text-gray-500">
+          If you have a Risk &amp; Compliance agent, every delegated task's output is scored against ISO 31000
+          (1–25). Outputs at or above this threshold are sent back to the agent once to self-remediate; if
+          still over, the task is held for your approval. Lower = stricter.
+        </p>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-700">Block at score</span>
+          <input type="number" min={1} max={25} value={threshold}
+            onChange={e => { setThreshold(parseInt(e.target.value || '1', 10) || 1); setSaved(false) }}
+            className="w-20 border border-gray-300 rounded-xl px-3 py-2 text-sm text-right focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+          <span className="text-xs text-gray-400">({levelOf(threshold)}+ blocked)</span>
+          <button onClick={save} className="ml-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">Save</button>
           {saved && <span className="text-xs text-green-600">Saved ✓</span>}
         </div>
       </div>

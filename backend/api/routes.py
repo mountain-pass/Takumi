@@ -1242,6 +1242,43 @@ async def backup_restore(file: UploadFile = File(...)):
     return {"ok": True, "imported": counts, "agent_files": files_written}
 
 
+# ── Risk & Compliance ─────────────────────────────────────────────────────────
+
+@router.get("/risk/register")
+async def risk_register(limit: int = 50):
+    return await database.get_risk_assessments(limit)
+
+
+@router.get("/risk/policy")
+async def get_risk_policy():
+    from .. import compliance
+    return {"threshold": compliance.get_threshold(), "categories": compliance.CATEGORIES,
+            "levels": {"low": "1-4", "medium": "5-9", "high": "10-15", "critical": "16-25"}}
+
+
+class RiskThresholdReq(BaseModel):
+    threshold: int
+
+
+@router.post("/risk/policy")
+async def set_risk_policy(req: RiskThresholdReq):
+    t = max(1, min(25, int(req.threshold)))
+    runtime_settings.update({"risk_threshold": t})
+    return {"ok": True, "threshold": t}
+
+
+class RiskDecisionReq(BaseModel):
+    approve: bool
+
+
+@router.post("/tasks/{task_id}/risk-decision")
+async def risk_decision(task_id: str, req: RiskDecisionReq):
+    res = await orchestrator.resolve_risk_hold(task_id, req.approve)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "Could not resolve"))
+    return res
+
+
 # ── Self-heal ─────────────────────────────────────────────────────────────────
 
 @router.get("/self-heal")

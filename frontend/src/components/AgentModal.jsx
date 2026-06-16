@@ -10,6 +10,7 @@ import InterviewWizard from './InterviewWizard'
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 const BROWSER_TOOLS = ['browser_navigate', 'browser_read', 'browser_click', 'browser_type', 'browser_back', 'browser_screenshot']
+const RISK_TOOLS = ['assess_risk', 'scan_secrets', 'review_outbound', 'risk_register']
 
 export default function AgentModal({ onClose }) {
   const createAgentMut = useCreateAgent()
@@ -243,6 +244,20 @@ export default function AgentModal({ onClose }) {
                 />
                 <span className="text-xs text-gray-700">Browser</span>
                 <span className="text-[10px] text-gray-400">— control desktop Chrome</span>
+              </label>
+              {/* Risk & Compliance — one toggle enables the risk-scorer tools */}
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={RISK_TOOLS.every(t => form.skills.includes(t))}
+                  onChange={e => {
+                    const rest = form.skills.filter(s => !RISK_TOOLS.includes(s))
+                    set('skills', e.target.checked ? [...rest, ...RISK_TOOLS] : rest)
+                  }}
+                  className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <span className="text-xs text-gray-700">Risk &amp; Compliance</span>
+                <span className="text-[10px] text-gray-400">— ISO 31000 risk scoring</span>
               </label>
             </div>
           </div>
