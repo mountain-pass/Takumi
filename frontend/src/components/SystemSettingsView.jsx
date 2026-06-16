@@ -244,6 +244,11 @@ export default function SystemSettingsView() {
 
         <hr className="border-gray-200" />
 
+        {/* Platform heartbeat */}
+        <Heartbeat orgData={orgData} />
+
+        <hr className="border-gray-200" />
+
         {/* Backup & Restore */}
         <BackupRestore />
 
@@ -365,6 +370,53 @@ function BackupRestore() {
         <p className="text-[11px] text-amber-600">
           ⚠️ The backup contains your API keys in plain text — store it securely. Restoring replaces existing config.
         </p>
+      </div>
+    </div>
+  )
+}
+
+// ── Platform heartbeat ────────────────────────────────────────────────────────
+function Heartbeat({ orgData }) {
+  const [mins, setMins] = React.useState(5)
+  const [saved, setSaved] = React.useState(false)
+  const init = React.useRef(false)
+  React.useEffect(() => {
+    if (orgData && !init.current) {
+      init.current = true
+      const secs = orgData.heartbeat_interval || 300
+      setMins(Math.max(1, Math.round(secs / 60)))
+    }
+  }, [orgData])
+
+  async function save() {
+    setSaved(false)
+    await fetch('/api/settings/heartbeat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seconds: Math.max(30, mins * 60) }),
+    })
+    setSaved(true); setTimeout(() => setSaved(false), 2500)
+  }
+
+  return (
+    <div className="space-y-3">
+      <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Platform Heartbeat</h2>
+      <div className="border border-gray-200 rounded-xl p-4 space-y-3">
+        <p className="text-xs text-gray-500">
+          How often the platform checks each agent's checklist for due tasks (daily SOPs and scheduled jobs)
+          and triggers them. The Manager also posts a daily update once per day.
+        </p>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-700">Check every</span>
+          <input type="number" min={1} step={1} value={mins}
+            onChange={e => { setMins(Math.max(1, parseInt(e.target.value || '1', 10) || 1)); setSaved(false) }}
+            className="w-20 border border-gray-300 rounded-xl px-3 py-2 text-sm text-right focus:outline-none focus:ring-2 focus:ring-indigo-300" />
+          <span className="text-sm text-gray-700">minute{mins === 1 ? '' : 's'}</span>
+          <button onClick={save}
+            className="ml-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+            Save
+          </button>
+          {saved && <span className="text-xs text-green-600">Saved ✓</span>}
+        </div>
       </div>
     </div>
   )

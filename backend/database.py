@@ -204,6 +204,7 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agents ADD COLUMN hitl_triggers TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE agent_tasks ADD COLUMN context TEXT NOT NULL DEFAULT '{}'",
         "ALTER TABLE agents ADD COLUMN extra_models TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE agent_tasks ADD COLUMN daily_sop INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await _db.execute(migration)
@@ -741,8 +742,8 @@ async def create_task(task: dict) -> dict:
         """INSERT INTO agent_tasks(
             id, agent_id, assigned_by, title, instruction, task_type,
             priority, status, schedule_cron, schedule_human, next_run_at,
-            parent_task_id, conversation_id, depends_on, context
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            parent_task_id, conversation_id, depends_on, context, daily_sop
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task["id"], task["agent_id"], task.get("assigned_by", "user"),
             task["title"], task.get("instruction", ""),
@@ -752,6 +753,7 @@ async def create_task(task: dict) -> dict:
             task.get("parent_task_id"), task.get("conversation_id"),
             task.get("depends_on"),
             json.dumps(task.get("context", {})) if not isinstance(task.get("context"), str) else task.get("context", "{}"),
+            int(task.get("daily_sop", 0)),
         ),
     )
     await _conn().commit()
@@ -789,6 +791,15 @@ async def get_all_tasks(status: str | None = None, limit: int = 100) -> list[dic
         rows = await (await _conn().execute(
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,)
         )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_daily_sop_tasks() -> list[dict]:
+    """The Manager's MASTER list — all active daily-SOP tasks across agents."""
+    rows = await (await _conn().execute(
+        "SELECT * FROM agent_tasks WHERE daily_sop = 1 AND status != 'cancelled' "
+        "ORDER BY agent_id, created_at"
+    )).fetchall()
     return [dict(r) for r in rows]
 
 

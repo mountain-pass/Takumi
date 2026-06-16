@@ -380,6 +380,18 @@ async def save_org(req: OrgRequest):
     return runtime_settings.get()
 
 
+class HeartbeatRequest(BaseModel):
+    seconds: int
+
+
+@router.post("/settings/heartbeat")
+async def set_heartbeat(req: HeartbeatRequest):
+    """Configure how often the platform heartbeat checks for due agent tasks."""
+    secs = max(30, int(req.seconds))
+    runtime_settings.update({"heartbeat_interval": secs})
+    return {"ok": True, "heartbeat_interval": secs}
+
+
 # ── LLM provider settings ─────────────────────────────────────────────────────
 
 class LLMSettingsRequest(BaseModel):
