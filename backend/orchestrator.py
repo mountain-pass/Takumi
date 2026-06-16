@@ -102,6 +102,59 @@ class Orchestrator:
             await self._spawn_agent(cfg)
         logger.info("[orchestrator] Reloaded %d agents from DB", len(self._agents))
 
+    async def post_daily_update(self) -> None:
+        """Manager's daily check-up: summarise every daily-SOP task's latest
+        outcome and post it into a 'Daily update' chat conversation."""
+        import uuid
+        from datetime import date
+        sops = await database.get_daily_sop_tasks()
+        if not sops or not self._ceo:
+            return
+        today = date.today().isoformat()
+        names = {a.config.id: a.config.name for a in self.get_agents()}
+        failed = [t for t in sops if t.get("status") == "failed"]
+
+        lines = [f"## Daily update — {today}", "",
+                 f"Tracking **{len(sops)}** daily SOP task(s) across the team."]
+        by_agent: dict[str, list] = {}
+        for t in sops:
+            by_agent.setdefault(t["agent_id"], []).append(t)
+        for aid, ts in by_agent.items():
+            lines.append(f"\n**{names.get(aid, aid[:8])}**")
+            for t in ts:
+                icon = {"completed": "✅", "failed": "❌", "in_progress": "⏳",
+                        "pending": "🕗"}.get(t.get("status"), "•")
+                last = (t.get("last_run_at") or "not yet run")[:16].replace("T", " ")
+                lines.append(f"- {icon} {t['title']} — last run {last}")
+                res = (t.get("result") or "").strip()
+                if res and t.get("status") == "failed":
+                    lines.append(f"    ⚠️ {res[:180]}")
+                elif res and t.get("status") == "completed":
+                    lines.append(f"    → {res[:180]}")
+        if failed:
+            lines.append(f"\n⚠️ **{len(failed)} task(s) need attention.**")
+        summary = "\n".join(lines)
+
+        conv_id = f"daily-{today}"
+        if not await database.get_conversation(conv_id):
+            await database.create_conversation(conv_id, title=f"Daily update — {today}")
+        await database.save_message({
+            "id": uuid.uuid4().hex,
+            "conversation_id": conv_id,
+            "from_agent_id": self._ceo.config.id,
+            "to_agent_id": "user",
+            "content": summary,
+            "role": "assistant",
+            "metadata": {"daily_update": True},
+        })
+        if self._ws_broadcast:
+            from .models import WSEvent, WSEventType
+            await self._ws_broadcast(WSEvent(
+                type=WSEventType.TASK_COMPLETED,
+                payload={"message": summary, "conversation_id": conv_id, "daily_update": True},
+            ).model_dump_json())
+        logger.info("[orchestrator] Posted daily update covering %d SOP task(s)", len(sops))
+
     # ── Agent management ──────────────────────────────────────────────────────
 
     async def add_agent(self, config: AgentConfig) -> BaseAgent:

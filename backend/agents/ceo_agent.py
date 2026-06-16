@@ -115,6 +115,7 @@ When creating research tasks, explicitly instruct agents: "Use web_search and we
 - Only assign tasks to agents you are connected to (listed below).
 - ALWAYS delegate research/data tasks — never answer them yourself with potentially outdated info.
 - For recurring work (daily reports, weekly reviews), use task_type "routine" with a schedule.
+- **Daily SOP tasks**: when the user wants an agent to do something EVERY DAY as part of their standing duties (a daily routine/SOP), create the task with `"daily": true`. This saves it to that agent's daily checklist AND your master list (shown above under "Daily SOP master list"), and the platform runs it automatically each day. Only REMOVE a daily SOP (cancel/delete the task) when the user explicitly says it's no longer needed — never drop one on your own. Use your master list to follow up on these daily.
 - Keep task instructions **specific, self-contained, and actionable**. The agent should be able to complete the task without asking follow-up questions.
 - Include all relevant context in the instruction — don't assume the agent knows background from prior conversations.
 - Never show raw agent IDs to the user — use agent names instead.
@@ -496,11 +497,13 @@ class CEOAgent(BaseAgent):
         roster = self._build_agent_roster()
         connections = await self._build_connection_map_async()
         active_tasks_text = await self._build_active_tasks_summary()
+        master_list = await self._build_sop_master_list()
 
         context = (
             f"\n\n---\n## Organisation context\n\n"
             f"### Your team\n{roster}\n\n"
             f"### Connections\n{connections}\n\n"
+            f"### Daily SOP master list (recurring tasks you track every day)\n{master_list}\n\n"
             f"### Active tasks\n{active_tasks_text}"
         )
 
@@ -657,6 +660,22 @@ class CEOAgent(BaseAgent):
         if "create_artifact" in (config.skills or []):
             caps.append("build rich HTML dashboards/reports")
         return caps
+
+    async def _build_sop_master_list(self) -> str:
+        """The Manager's master list of daily SOP tasks across all agents."""
+        try:
+            tasks = await database.get_daily_sop_tasks()
+        except Exception:
+            return "None yet."
+        if not tasks:
+            return "No daily SOPs yet. Create one with a create_task action that includes \"daily\": true."
+        names = {a.config.id: a.config.name for a in (self._orchestrator.get_agents() if self._orchestrator else [])}
+        lines = []
+        for t in tasks:
+            who = names.get(t["agent_id"], t["agent_id"][:8])
+            last = (t.get("last_run_at") or "")[:10] or "never"
+            lines.append(f"- **{t['title']}** → {who} (last run: {last}, status: {t.get('status')})")
+        return "\n".join(lines)
 
     def _build_agent_roster(self) -> str:
         if not self._orchestrator:
@@ -898,6 +917,15 @@ class CEOAgent(BaseAgent):
         task_type = action.get("task_type", "adhoc")
         schedule_cron = action.get("schedule_cron")
 
+        # Daily SOP: a recurring task the agent must do every day. It persists on
+        # the agent's checklist AND the Manager's master list, and is only removed
+        # when the user says so. Modelled as a daily recurring task.
+        is_daily = bool(action.get("daily")) or schedule_cron == "@daily"
+        daily_sop = 1 if is_daily else 0
+        if is_daily:
+            task_type = "routine"
+            schedule_cron = "@daily"
+
         # Compute next_run_at for scheduled tasks
         next_run_at = None
         if task_type in ("routine", "standing") and schedule_cron:
@@ -919,8 +947,10 @@ class CEOAgent(BaseAgent):
             "priority": action.get("priority", "normal"),
             "status": "blocked" if is_blocked else "pending",
             "schedule_cron": schedule_cron,
-            "schedule_human": action.get("schedule_human"),
+            "schedule_human": action.get("schedule_human") or ("Daily" if is_daily else None),
             "depends_on": depends_on,
+            "daily_sop": daily_sop,
+            # Daily SOPs run on their schedule, not immediately on creation.
             "next_run_at": next_run_at or datetime.utcnow().isoformat(),
             # Plan membership + the overall objective this task serves.
             "conversation_id": getattr(self, "_active_conversation_id", None),

@@ -9,11 +9,20 @@ import uuid
 from datetime import datetime, timedelta
 
 from . import database
+from . import runtime_settings
 
 logger = logging.getLogger(__name__)
 
-# How often the scheduler checks for due tasks (seconds)
-TICK_INTERVAL = 60
+# Default heartbeat: how often the platform checks for due tasks (seconds).
+# Configurable in Settings via runtime_settings['heartbeat_interval'].
+DEFAULT_HEARTBEAT = 300  # 5 minutes
+
+
+def _heartbeat_interval() -> int:
+    try:
+        return max(30, int(runtime_settings.get().get("heartbeat_interval", DEFAULT_HEARTBEAT)))
+    except Exception:
+        return DEFAULT_HEARTBEAT
 
 
 class TaskScheduler:
@@ -24,7 +33,7 @@ class TaskScheduler:
     async def start(self) -> None:
         self._running = True
         asyncio.create_task(self._loop(), name="task-scheduler")
-        logger.info("Task scheduler started (tick=%ds)", TICK_INTERVAL)
+        logger.info("Task scheduler started (heartbeat=%ds)", _heartbeat_interval())
 
     async def stop(self) -> None:
         self._running = False
@@ -35,13 +44,16 @@ class TaskScheduler:
                 await self._tick()
             except Exception as e:
                 logger.error("Task scheduler tick error: %s", e, exc_info=True)
-            await asyncio.sleep(TICK_INTERVAL)
+            await asyncio.sleep(_heartbeat_interval())  # re-read each cycle so a settings change takes effect
 
     async def _tick(self) -> None:
         now = datetime.utcnow()
 
         # Recover stale in_progress tasks (stuck for >5 minutes)
         await self._recover_stale_tasks(now)
+
+        # Once a day, have the Manager post a daily update across all SOPs.
+        await self._maybe_daily_update(now)
 
         due = await database.get_due_tasks(now.isoformat())
         if not due:
@@ -50,6 +62,21 @@ class TaskScheduler:
         logger.info("Task scheduler found %d due tasks", len(due))
         for task in due:
             asyncio.create_task(self._execute_task(task))
+
+    async def _maybe_daily_update(self, now: datetime) -> None:
+        """Auto-post the Manager's daily update once per calendar day."""
+        try:
+            today = now.date().isoformat()
+            if await database.get_setting("_last_daily_update") == today:
+                return
+            sops = await database.get_daily_sop_tasks()
+            if not sops:
+                return
+            if hasattr(self._orch, "post_daily_update"):
+                await self._orch.post_daily_update()
+            await database.set_setting("_last_daily_update", today)
+        except Exception as e:
+            logger.error("Daily update failed: %s", e, exc_info=True)
 
     async def _recover_stale_tasks(self, now: datetime) -> None:
         """Reset in_progress tasks that have been running too long (likely from a crashed process)."""
