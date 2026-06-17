@@ -6,8 +6,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:8000',
-      '/ws': { target: 'ws://localhost:8000', ws: true },
+      // Use 127.0.0.1 (not 'localhost') — Node 18 resolves localhost to IPv6 ::1,
+      // but the backend binds IPv4, causing ECONNREFUSED ::1:8000.
+      '/api': 'http://127.0.0.1:8000',
+      '/ws': { target: 'ws://127.0.0.1:8000', ws: true },
     },
   },
 })
