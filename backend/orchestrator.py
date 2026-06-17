@@ -286,13 +286,29 @@ class Orchestrator:
         from datetime import datetime as _dt
         from . import compliance
         rc = compliance.find_rc_agent(self)
-        # Don't gate: no R&C agent, the R&C agent's own work, or already-gated retries.
+        # Don't gate: no R&C agent, the R&C agent's own work, or compliance off.
         if not rc or rc.config.id == from_agent_id:
             return "proceed"
-        attempt = int((ctx.get("compliance") or {}).get("attempt", 0))
+        mode = compliance.get_mode()
+        comp = ctx.get("compliance") or {}
+        if mode == "off":
+            return "proceed"
+        # In 'match' mode only gate tasks the Manager flagged as policy-relevant.
+        if mode == "match" and not comp.get("required"):
+            return "proceed"
+        # Use the strictest matched named policy (lowest threshold), else baseline.
+        named_policy = None
         try:
-            rec = await compliance.assess(rc, subject=task.get("title", ""),
-                                          content=result, task_id=task["id"], attempt=attempt)
+            rows = [r for r in [await database.get_risk_policy_row(pid)
+                                for pid in (comp.get("policy_ids") or [])] if r]
+            if rows:
+                named_policy = min(rows, key=lambda r: r.get("threshold", 10))
+        except Exception:
+            named_policy = None
+        attempt = int(comp.get("attempt", 0))
+        try:
+            rec = await compliance.assess(rc, subject=task.get("title", ""), content=result,
+                                          task_id=task["id"], attempt=attempt, named_policy=named_policy)
         except Exception as e:
             logger.error("[compliance] gate assessment failed: %s", e)
             return "proceed"  # fail-open so a broken assessor can't block all work

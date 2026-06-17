@@ -196,6 +196,16 @@ CREATE TABLE IF NOT EXISTS risk_assessments (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_risk_task ON risk_assessments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS risk_policies (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    threshold   INTEGER NOT NULL DEFAULT 10,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -810,6 +820,40 @@ async def get_all_tasks(status: str | None = None, limit: int = 100) -> list[dic
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,)
         )).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Risk policies (named) ─────────────────────────────────────────────────────
+
+async def list_risk_policies(enabled_only: bool = False) -> list[dict]:
+    q = "SELECT * FROM risk_policies"
+    if enabled_only:
+        q += " WHERE enabled = 1"
+    q += " ORDER BY created_at"
+    rows = await (await _conn().execute(q)).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_risk_policy_row(policy_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM risk_policies WHERE id = ?", (policy_id,))).fetchone()
+    return dict(row) if row else None
+
+
+async def save_risk_policy(p: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled)
+           VALUES(?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET name=excluded.name, body=excluded.body,
+             summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled""",
+        (p["id"], p.get("name", ""), p.get("body", ""), p.get("summary", ""),
+         int(p.get("threshold", 10)), int(p.get("enabled", 1))),
+    )
+    await _conn().commit()
+
+
+async def delete_risk_policy(policy_id: str) -> None:
+    await _conn().execute("DELETE FROM risk_policies WHERE id = ?", (policy_id,))
+    await _conn().commit()
 
 
 # ── Risk register ─────────────────────────────────────────────────────────────

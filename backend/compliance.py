@@ -157,7 +157,7 @@ def score_categories(categories: dict) -> tuple[int, dict]:
 def _parse_json(text: str):
     t = (text or "").strip()
     t = re.sub(r"^```(?:json)?\s*", "", t).rstrip("`").strip()
-    m = re.search(r"(\{.*\})", t, re.S)
+    m = re.search(r"(\{.*\}|\[.*\])", t, re.S)
     if m:
         t = m.group(1)
     return json.loads(t)
@@ -166,28 +166,31 @@ def _parse_json(text: str):
 # ── LLM-assisted assessment (used by the gate and the skill) ──────────────────
 
 async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
-                 attempt: int = 0) -> dict:
-    """Have the Risk & Compliance agent score `content` against ISO 31000 and the
-    org threshold, factoring in detected secret leaks. Logs to the register."""
+                 attempt: int = 0, named_policy: dict | None = None) -> dict:
+    """Have the Risk & Compliance agent score `content` against ISO 31000. If a
+    named policy applies, its body is the appetite and its threshold is used;
+    otherwise the org baseline policy applies. Logs to the register."""
     findings = scan_secrets(content or "")
-    threshold = get_threshold()
+    base = get_policy()
+    appetite = (named_policy.get("body") if named_policy else base.get("appetite", "")) or base.get("appetite", "")
+    threshold = int(named_policy["threshold"]) if named_policy else get_threshold()
+    policy_label = named_policy["name"] if named_policy else "the organisation baseline policy"
 
     categories = {}
     rationale = ""
     if rc_agent is not None:
         try:
-            policy = get_policy()
             adapter = rc_agent._adapter
             model = rc_agent.config.llm_model
-            cats = policy.get("categories") or CATEGORIES
-            lscale = policy.get("likelihood_scale") or DEFAULT_POLICY["likelihood_scale"]
-            cscale = policy.get("consequence_scale") or DEFAULT_POLICY["consequence_scale"]
+            cats = base.get("categories") or CATEGORIES
+            lscale = base.get("likelihood_scale") or DEFAULT_POLICY["likelihood_scale"]
+            cscale = base.get("consequence_scale") or DEFAULT_POLICY["consequence_scale"]
             scale_txt = ("Likelihood 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(lscale)) +
                          ". Consequence 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(cscale)) + ".")
             system = (
                 "You are an ISO 31000 risk & compliance assessor for this organisation. Score the work "
-                f"against the ORGANISATION RISK POLICY below, across these categories: {', '.join(cats)}.\n\n"
-                f"ORGANISATION RISK APPETITE / POLICY:\n{policy.get('appetite','')}\n\n"
+                f"against the POLICY below ({policy_label}), across these categories: {', '.join(cats)}.\n\n"
+                f"POLICY:\n{appetite}\n\n"
                 f"SCORING SCALE: {scale_txt}\n\n"
                 "For each relevant category give likelihood (1-5) and consequence (1-5) and a one-line note. "
                 "Be conservative against the policy — flag data leakage, PII, financial/legal exposure, and "
@@ -205,16 +208,18 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
             logger.warning("[compliance] LLM assessment failed: %s", e)
 
     return await finalize(subject, categories, content, findings=findings,
-                          rationale=rationale, task_id=task_id, attempt=attempt,
+                          rationale=rationale, task_id=task_id, attempt=attempt, threshold=threshold,
                           assessor_id=rc_agent.config.id if rc_agent is not None else "")
 
 
 async def finalize(subject: str, categories: dict, content: str = "", *,
                    findings: list | None = None, rationale: str = "",
-                   task_id: str = "", assessor_id: str = "", attempt: int = 0) -> dict:
+                   task_id: str = "", assessor_id: str = "", attempt: int = 0,
+                   threshold: int | None = None) -> dict:
     """Compute the score/level/verdict from categories (+ secret scan) against the
     threshold, log to the register, and return the structured assessment."""
-    threshold = get_threshold()
+    if threshold is None:
+        threshold = get_threshold()
     if findings is None:
         findings = scan_secrets(content or "")
     score, norm = score_categories(categories)
@@ -249,6 +254,56 @@ async def finalize(subject: str, categories: dict, content: str = "", *,
     except Exception as e:
         logger.error("[compliance] could not save assessment: %s", e)
     return record
+
+
+# ── Compliance mode + named policies ──────────────────────────────────────────
+
+def get_mode() -> str:
+    """How strict the compliance gate is: 'all', 'match', or 'off'."""
+    m = (runtime_settings.get().get("compliance_mode") or "all").lower()
+    return m if m in ("all", "match", "off") else "all"
+
+
+async def summarise_policy(agent, name: str, body: str) -> str:
+    """One-line summary of a policy so tasks can be matched against it."""
+    if agent is None or not (body or "").strip():
+        return ""
+    try:
+        system = ("Summarise this risk & compliance policy in ONE sentence that captures the kind of "
+                  "work, topics, or actions it governs (so tasks can be matched against it). "
+                  "Return only the sentence.")
+        resp = await agent._adapter.complete(
+            system_prompt=system,
+            messages=[{"role": "user", "content": f"Policy '{name}':\n{(body or '')[:4000]}"}],
+            model=agent.config.llm_model, max_tokens=120)
+        return (resp.content or "").strip().strip('"')[:400]
+    except Exception as e:
+        logger.warning("[compliance] policy summarise failed: %s", e)
+        return ""
+
+
+async def match_policies(manager_agent, task_text: str, policies: list[dict]) -> list[dict]:
+    """Which enabled policies relate to this task (the Manager's judgement)."""
+    pols = [p for p in policies if p.get("enabled", 1)]
+    if not pols or manager_agent is None:
+        return []
+    listing = "\n".join(
+        f'- id={p["id"]} | {p.get("name","")}: {p.get("summary") or (p.get("body","")[:160])}'
+        for p in pols)
+    try:
+        system = ("Decide which compliance policies (if any) a task relates to. Return ONLY a JSON "
+                  "array of the matching policy id strings — empty array if none apply.")
+        user = f"Task:\n{(task_text or '')[:1500]}\n\nPolicies:\n{listing}"
+        resp = await manager_agent._adapter.complete(
+            system_prompt=system, messages=[{"role": "user", "content": user}],
+            model=manager_agent.config.llm_model, max_tokens=200)
+        ids = _parse_json(resp.content)
+        if isinstance(ids, list):
+            idset = {str(x) for x in ids}
+            return [p for p in pols if p["id"] in idset]
+    except Exception as e:
+        logger.warning("[compliance] policy match failed: %s", e)
+    return []
 
 
 def find_rc_agent(orchestrator):

@@ -661,6 +661,32 @@ class CEOAgent(BaseAgent):
             caps.append("build rich HTML dashboards/reports")
         return caps
 
+    async def _tag_compliance(self, title: str, instruction: str) -> dict | None:
+        """Decide whether a task needs independent Risk & Compliance review.
+        'all' → always; 'match' → only if it matches a named policy; 'off' → never."""
+        from .. import compliance
+        mode = compliance.get_mode()
+        if mode == "off":
+            return None
+        # Only gate when there's actually a Risk & Compliance agent to review it.
+        if self._orchestrator and not compliance.find_rc_agent(self._orchestrator):
+            return None
+        if mode == "all":
+            return {"required": True, "mode": "all", "policy_ids": [], "policy_names": []}
+        # mode == 'match': the Manager checks the task against named policies.
+        try:
+            policies = await database.list_risk_policies(enabled_only=True)
+        except Exception:
+            policies = []
+        if not policies:
+            return None
+        matched = await compliance.match_policies(self, f"{title}\n{instruction}", policies)
+        if not matched:
+            return None
+        return {"required": True, "mode": "match",
+                "policy_ids": [p["id"] for p in matched],
+                "policy_names": [p["name"] for p in matched]}
+
     async def _build_sop_master_list(self) -> str:
         """The Manager's master list of daily SOP tasks across all agents."""
         try:
@@ -937,6 +963,14 @@ class CEOAgent(BaseAgent):
         # If task depends on another, mark it as blocked until the dependency completes
         is_blocked = bool(depends_on)
 
+        # Compliance tagging: per the org compliance mode, flag this task for
+        # independent Risk & Compliance review before it can complete.
+        compliance_ctx = await self._tag_compliance(title, action.get("instruction", ""))
+
+        context = {"objective": getattr(self, "_active_objective", "")[:600], "inputs": []}
+        if compliance_ctx:
+            context["compliance"] = compliance_ctx
+
         task = {
             "id": task_id,
             "agent_id": agent_id,
@@ -954,7 +988,7 @@ class CEOAgent(BaseAgent):
             "next_run_at": next_run_at or datetime.utcnow().isoformat(),
             # Plan membership + the overall objective this task serves.
             "conversation_id": getattr(self, "_active_conversation_id", None),
-            "context": {"objective": getattr(self, "_active_objective", "")[:600], "inputs": []},
+            "context": context,
         }
         await database.create_task(task)
 
