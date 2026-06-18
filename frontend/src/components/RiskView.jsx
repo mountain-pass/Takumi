@@ -68,7 +68,6 @@ function PolicyTab() {
   if (!policy) return <Loading />
 
   const set = (k, v) => { setPolicy(p => ({ ...p, [k]: v })); setSaved(false) }
-  const setScale = (key, i, v) => set(key, policy[key].map((x, j) => j === i ? v : x))
   const toggleCat = (c) => {
     const cats = policy.categories || []
     set('categories', cats.includes(c) ? cats.filter(x => x !== c) : [...cats, c])
@@ -129,25 +128,13 @@ function PolicyTab() {
         </div>
       </Section>
 
-      {/* Scales */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
-        <Section title="Likelihood scale (1–5)">
-          {(policy.likelihood_scale || []).map((v, i) => (
-            <div key={i} className="flex items-center gap-2 mb-1.5">
-              <span className="w-4 text-xs text-gray-400">{i + 1}</span>
-              <input className="input flex-1" value={v} onChange={e => setScale('likelihood_scale', i, e.target.value)} />
-            </div>
-          ))}
-        </Section>
-        <Section title="Consequence scale (1–5)">
-          {(policy.consequence_scale || []).map((v, i) => (
-            <div key={i} className="flex items-center gap-2 mb-1.5">
-              <span className="w-4 text-xs text-gray-400">{i + 1}</span>
-              <input className="input flex-1" value={v} onChange={e => setScale('consequence_scale', i, e.target.value)} />
-            </div>
-          ))}
-        </Section>
-      </div>
+      {/* Scales with definitions */}
+      <Section title="Likelihood scale (1–5)" hint="Define what each level means so scoring is consistent and auditable.">
+        <ScaleEditor scale={policy.likelihood_scale} onChange={s => set('likelihood_scale', s)} />
+      </Section>
+      <Section title="Consequence / impact scale (1–5)" hint="Define the impact at each level (financial, data, legal, reputational…).">
+        <ScaleEditor scale={policy.consequence_scale} onChange={s => set('consequence_scale', s)} />
+      </Section>
 
       {/* Categories */}
       <Section title="Risk categories" hint="Which categories the agent scores against.">
@@ -176,6 +163,24 @@ function PolicyTab() {
   )
 }
 
+function ScaleEditor({ scale = [], onChange }) {
+  const setField = (i, field, v) => onChange(scale.map((x, j) => (j === i ? { ...x, [field]: v } : x)))
+  return (
+    <div className="space-y-2">
+      {scale.map((lvl, i) => (
+        <div key={i} className="flex gap-2 items-start">
+          <span className="w-4 text-xs text-gray-400 mt-2 text-right shrink-0">{i + 1}</span>
+          <input className="input w-32 shrink-0" placeholder="Label" value={lvl.label || ''}
+            onChange={e => setField(i, 'label', e.target.value)} />
+          <textarea className="input flex-1 text-xs leading-relaxed resize-y" rows={2}
+            placeholder="Definition / criteria for this level" value={lvl.definition || ''}
+            onChange={e => setField(i, 'definition', e.target.value)} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function RiskMatrix({ threshold, like = [], cons = [] }) {
   const rows = [5, 4, 3, 2, 1] // consequence high → low
   return (
@@ -183,12 +188,12 @@ function RiskMatrix({ threshold, like = [], cons = [] }) {
       <div className="flex">
         <div className="w-24" />
         {[1, 2, 3, 4, 5].map(l => (
-          <div key={l} className="w-12 text-center text-gray-400 truncate" title={like[l - 1]}>{l}</div>
+          <div key={l} className="w-12 text-center text-gray-400 truncate" title={like[l - 1]?.definition || like[l - 1]?.label}>{l}</div>
         ))}
       </div>
       {rows.map(c => (
         <div key={c} className="flex items-center">
-          <div className="w-24 text-right pr-2 text-gray-400 truncate" title={cons[c - 1]}>{c} {cons[c - 1] || ''}</div>
+          <div className="w-24 text-right pr-2 text-gray-400 truncate" title={cons[c - 1]?.definition || ''}>{c} {cons[c - 1]?.label || ''}</div>
           {[1, 2, 3, 4, 5].map(l => {
             const s = l * c
             const blocked = s >= threshold

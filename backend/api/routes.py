@@ -1242,6 +1242,15 @@ async def backup_restore(file: UploadFile = File(...)):
     return {"ok": True, "imported": counts, "agent_files": files_written}
 
 
+# ── Activity log (system-wide) ────────────────────────────────────────────────
+
+@router.get("/activity")
+async def get_activity_log(hours: float = 24, agent_id: str | None = None, limit: int = 200):
+    from datetime import datetime, timedelta
+    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    return await database.get_activity(since_iso=since, agent_id=agent_id, limit=limit)
+
+
 # ── Risk & Compliance ─────────────────────────────────────────────────────────
 
 @router.get("/risk/register")
@@ -1261,8 +1270,8 @@ class RiskPolicyReq(BaseModel):
     threshold: int | None = None
     appetite: str | None = None
     categories: list[str] | None = None
-    likelihood_scale: list[str] | None = None
-    consequence_scale: list[str] | None = None
+    likelihood_scale: list | None = None       # [{label, definition}]
+    consequence_scale: list | None = None       # [{label, definition}]
     mode: str | None = None   # 'all' | 'match' | 'off'
 
 

@@ -13,6 +13,7 @@ from .browser import (
     browser_back, browser_screenshot,
 )
 from .risk import assess_risk, scan_secrets, review_outbound, risk_register
+from .activity import activity_log
 
 
 # Each skill: { name, description, parameters (for the LLM prompt), callable }
@@ -125,6 +126,12 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "description": "List recent entries from the organisation's risk register.",
         "parameters": {"limit": "(optional) how many entries, default 15"},
         "callable": risk_register,
+    },
+    "activity_log": {
+        "name": "activity_log",
+        "description": "Check the system-wide activity log to see what the agents have actually DONE — every tool/MCP/web/shell/browser call, with which agent and when. Use this to answer questions like 'did the system do anything today?' or 'what has James been doing?'.",
+        "parameters": {"hours": "(optional) look back this many hours, default 24", "agent": "(optional) filter to one agent's name"},
+        "callable": activity_log,
     },
 }
 

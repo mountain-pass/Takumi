@@ -75,6 +75,12 @@ class Orchestrator:
                     logger.info("[orchestrator] Upgraded '%s' from legacy delegate prompt to current CEO prompt", cfg.name)
             await database.set_setting("_ceo_prompt_v2", "1")
 
+        # Ensure the Manager can read the activity log (added after first spawn).
+        for cfg in configs:
+            if cfg.is_ceo and "activity_log" not in (cfg.skills or []):
+                cfg.skills = list(cfg.skills or []) + ["activity_log"]
+                await database.save_agent(cfg.model_dump(mode="json"))
+
         for cfg in configs:
             await self._spawn_agent(cfg)
 
@@ -274,6 +280,11 @@ class Orchestrator:
             "agent_id": from_agent_id, "action": "completed", "detail": result[:500],
         })
         logger.info("[orchestrator] Task '%s' completed by %s", task.get("title", "")[:40], self._agent_name(from_agent_id))
+        await database.log_activity({
+            "agent_id": from_agent_id, "agent_name": self._agent_name(from_agent_id),
+            "kind": "task", "action": "completed task", "task_id": task_id,
+            "summary": f"{task.get('title','')[:80]} → {result[:120]}", "ok": 1,
+        })
 
         await self._handoff_to_dependents(task, result, from_agent_id)
         await self._present_if_plan_complete(task)
