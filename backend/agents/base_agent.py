@@ -381,6 +381,7 @@ class BaseAgent:
             await self._set_status(AgentStatus.WORKING, action=f"Using {tool_name}...")
             tool_result = await self._execute_tool(tool_name, tool_args)
             tools_used += 1
+            await self._log_activity(tool_name, tool_args, tool_result)
 
             # Truncate large tool results before re-feeding them: smaller context =
             # faster calls AND fewer "confused" responses from the model.
@@ -522,6 +523,45 @@ class BaseAgent:
             return None
         except Exception:
             return None
+
+    async def _log_activity(self, name: str, arguments: dict, result: str) -> None:
+        """Record this tool call to the system-wide activity log."""
+        if name == "activity_log":
+            return  # don't log reads of the log itself
+        kind = "tool"
+        if name.startswith("mcp__"):
+            kind = "mcp"
+        elif name in ("web_search", "web_fetch"):
+            kind = "web"
+        elif name.startswith("browser_"):
+            kind = "browser"
+        elif name == "run_shell":
+            kind = "shell"
+        elif name in ("assess_risk", "scan_secrets", "review_outbound", "risk_register"):
+            kind = "risk"
+        elif name in ("read_file", "write_file", "list_files"):
+            kind = "file"
+        elif name.startswith(("ask_", "see_", "draw_", "film_")):
+            kind = "model"
+        # Short human-readable summary of the call.
+        arg_bits = []
+        for k, v in (arguments or {}).items():
+            sv = str(v).replace("\n", " ")
+            arg_bits.append(f"{k}={sv[:80]}")
+        summary = ", ".join(arg_bits)[:300]
+        res = (result or "").strip().replace("\n", " ")
+        ok = not res.lower().startswith(("error", "tool error", "could not", "⚠️"))
+        if res:
+            summary += f" → {res[:120]}"
+        try:
+            await database.log_activity({
+                "agent_id": self.config.id, "agent_name": self.config.name,
+                "kind": kind, "action": name, "summary": summary,
+                "task_id": getattr(self, "_artifact_ctx", {}).get("task_id"),
+                "ok": 1 if ok else 0,
+            })
+        except Exception:
+            pass
 
     async def _execute_tool(self, name: str, arguments: dict) -> str:
         """Execute a registered skill/tool and return its result."""

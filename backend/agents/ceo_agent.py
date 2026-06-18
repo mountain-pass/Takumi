@@ -453,6 +453,7 @@ class CEOAgent(BaseAgent):
             args = tool_call.get("arguments", {}) or {}
             await self._set_status(AgentStatus.WORKING, action=f"Using {name}…")
             result = await self._execute_tool(name, args)
+            await self._log_activity(name, args, result)
             logger.info("[Manager] tool %s -> %s", name, str(result)[:120])
             msgs.append({"role": "assistant", "content": resp.content})
             msgs.append({"role": "user", "content": f"[Tool Result — {name}]:\n{result}"})
@@ -1081,7 +1082,7 @@ def make_ceo_config() -> AgentConfig:
         system_prompt=CEO_SYSTEM_PROMPT,
         llm_provider=LLMProvider.ANTHROPIC,
         llm_model="claude-sonnet-4-6",
-        skills=["web_search", "web_fetch", "create_artifact"],  # fallback if agents fail
+        skills=["web_search", "web_fetch", "create_artifact", "activity_log"],  # +log so it can report what the system did
         is_ceo=True,
         avatar_color="#DC2626",
         max_context_messages=30,

@@ -197,6 +197,20 @@ CREATE TABLE IF NOT EXISTS risk_assessments (
 );
 CREATE INDEX IF NOT EXISTS idx_risk_task ON risk_assessments(task_id, created_at);
 
+CREATE TABLE IF NOT EXISTS activity_log (
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL DEFAULT '',
+    agent_name  TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT 'tool',   -- tool | web | mcp | shell | browser | risk | task | model
+    action      TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    task_id     TEXT,
+    ok          INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity_log(agent_id, created_at);
+
 CREATE TABLE IF NOT EXISTS risk_policies (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL DEFAULT '',
@@ -819,6 +833,42 @@ async def get_all_tasks(status: str | None = None, limit: int = 100) -> list[dic
         rows = await (await _conn().execute(
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,)
         )).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Activity log (system-wide) ────────────────────────────────────────────────
+
+async def log_activity(entry: dict) -> None:
+    import uuid as _uuid
+    try:
+        await _conn().execute(
+            """INSERT INTO activity_log(id, agent_id, agent_name, kind, action, summary, task_id, ok)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entry.get("id") or _uuid.uuid4().hex, entry.get("agent_id", ""),
+             entry.get("agent_name", ""), entry.get("kind", "tool"),
+             entry.get("action", "")[:120], entry.get("summary", "")[:600],
+             entry.get("task_id"), int(entry.get("ok", 1))),
+        )
+        await _conn().commit()
+    except Exception:
+        pass  # logging must never break the agent
+
+
+async def get_activity(since_iso: str | None = None, agent_id: str | None = None,
+                       limit: int = 200) -> list[dict]:
+    q = "SELECT * FROM activity_log"
+    cond, args = [], []
+    if since_iso:
+        # created_at is stored as SQLite datetime('now') ("YYYY-MM-DD HH:MM:SS"),
+        # so normalise the ISO 'T' separator for a correct string comparison.
+        cond.append("created_at >= ?"); args.append(str(since_iso).replace("T", " "))
+    if agent_id:
+        cond.append("agent_id = ?"); args.append(agent_id)
+    if cond:
+        q += " WHERE " + " AND ".join(cond)
+    q += " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit)
+    rows = await (await _conn().execute(q, tuple(args))).fetchall()
     return [dict(r) for r in rows]
 
 
