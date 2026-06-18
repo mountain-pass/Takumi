@@ -553,6 +553,48 @@ function SelfHealCard({ sh }) {
   )
 }
 
+function RiskHoldCard({ rh }) {
+  const [state, setState] = useState('idle') // idle | working | approved | rejected
+  async function decide(approve) {
+    setState('working')
+    try {
+      const r = await fetch(`${API}/tasks/${rh.task_id}/risk-decision`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approve }),
+      })
+      if (!r.ok) throw new Error(await r.text())
+      setState(approve ? 'approved' : 'rejected')
+    } catch { setState('idle') }
+  }
+  const tone = rh.level === 'critical' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'
+  return (
+    <div className="flex justify-start">
+      <div className={`max-w-[80%] rounded-2xl rounded-bl-md border px-4 py-3 text-sm ${tone}`}>
+        <div className="flex items-center gap-1.5 text-amber-700 font-semibold text-xs mb-1">
+          <AlertTriangle size={13} /> Compliance hold — needs your approval
+        </div>
+        <p className="text-gray-700">
+          Task <b>{rh.title}</b> was assessed as <b className="uppercase">{rh.level}</b> risk
+          (score {rh.score}/25, threshold {rh.threshold}) and could not be remediated below the threshold.
+        </p>
+        {rh.rationale && <p className="mt-1 text-xs text-gray-600">{rh.rationale}</p>}
+        {rh.findings?.length > 0 && (
+          <p className="mt-1 text-[11px] text-red-600">Flagged: {rh.findings.join(', ')}</p>
+        )}
+        {state === 'idle' && (
+          <div className="mt-2.5 flex gap-2">
+            <button onClick={() => decide(true)} className="px-3 py-1.5 text-xs font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg">Approve & continue</button>
+            <button onClick={() => decide(false)} className="px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg">Reject</button>
+          </div>
+        )}
+        {state === 'working' && <p className="mt-2 text-xs text-gray-500">Submitting…</p>}
+        {state === 'approved' && <p className="mt-2 text-xs text-green-700 font-medium">Approved — the task will continue.</p>}
+        {state === 'rejected' && <p className="mt-2 text-xs text-red-700 font-medium">Rejected — the task was stopped.</p>}
+      </div>
+    </div>
+  )
+}
+
 function ChatBubble({ message }) {
   const isUser = message.role === 'user'
   const actions = message.actions || []
@@ -563,6 +605,7 @@ function ChatBubble({ message }) {
   const [lightbox, setLightbox] = useState(null)
 
   if (message.selfHeal) return <SelfHealCard sh={message.selfHeal} />
+  if (message.riskHold) return <RiskHoldCard rh={message.riskHold} />
 
   return (
     <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>

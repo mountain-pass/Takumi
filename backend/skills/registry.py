@@ -12,6 +12,7 @@ from .browser import (
     browser_navigate, browser_read, browser_click, browser_type,
     browser_back, browser_screenshot,
 )
+from .risk import assess_risk, scan_secrets, review_outbound, risk_register
 
 
 # Each skill: { name, description, parameters (for the LLM prompt), callable }
@@ -100,11 +101,39 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "parameters": {},
         "callable": browser_screenshot,
     },
+    # ── Risk & Compliance (ISO 31000 risk scoring) ────────────────────────────
+    "assess_risk": {
+        "name": "assess_risk",
+        "description": "Score a piece of work against ISO 31000. Provide a 'categories' object mapping each relevant risk category (security, data_privacy, financial, legal_compliance, reputational, operational) to {likelihood: 1-5, consequence: 1-5, note}. Returns the overall risk level, score, and a proceed/block verdict against the org threshold, and logs it to the risk register.",
+        "parameters": {"subject": "What is being assessed", "categories": "Object of category → {likelihood, consequence, note}", "content": "(optional) the actual text/output to also scan for secrets"},
+        "callable": assess_risk,
+    },
+    "scan_secrets": {
+        "name": "scan_secrets",
+        "description": "Detect leaked secrets, API keys, credentials, or PII in a block of text (secret-leak gate).",
+        "parameters": {"text": "The text to scan"},
+        "callable": scan_secrets,
+    },
+    "review_outbound": {
+        "name": "review_outbound",
+        "description": "Review an outbound communication (email/message/post) before it is sent — scans for secrets/PII and returns a compliance checklist.",
+        "parameters": {"message": "The outbound message text", "recipient": "(optional) who it's going to"},
+        "callable": review_outbound,
+    },
+    "risk_register": {
+        "name": "risk_register",
+        "description": "List recent entries from the organisation's risk register.",
+        "parameters": {"limit": "(optional) how many entries, default 15"},
+        "callable": risk_register,
+    },
 }
 
 # The single "Browser" toggle in the UI maps to this set of tool names.
 BROWSER_TOOLS = ["browser_navigate", "browser_read", "browser_click",
                  "browser_type", "browser_back", "browser_screenshot"]
+
+# The single "Risk & Compliance" toggle maps to this set.
+RISK_TOOLS = ["assess_risk", "scan_secrets", "review_outbound", "risk_register"]
 
 
 def get_skill(name: str) -> dict | None:

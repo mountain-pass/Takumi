@@ -167,6 +167,12 @@ export const useOrgStore = create((set, get) => ({
           isTaskResult: true, timestamp: new Date().toISOString(),
         }] }))
       }
+    } else if (type === 'risk_hold') {
+      // A task is held on a compliance review — surface an approve/reject card.
+      set(s => ({ pendingChatMessages: [...(s.pendingChatMessages || []), {
+        id: `risk-${payload.task_id}`, role: 'assistant', riskHold: payload,
+        timestamp: new Date().toISOString(),
+      }] }))
     } else if (type === 'agent_added') {
       // Reload agents list
       get().fetchAgents()

@@ -113,6 +113,7 @@ class WSEventType(str, Enum):
     HEARTBEAT = "heartbeat"
     TASK_COMPLETED = "task_completed"
     SELF_HEAL = "self_heal"
+    RISK_HOLD = "risk_hold"
     ERROR = "error"
 
 

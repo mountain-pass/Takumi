@@ -260,6 +260,11 @@ class Orchestrator:
             logger.warning("[orchestrator] Task '%s' returned empty result — failed", task.get("title", "")[:40])
             return
 
+        # Risk & Compliance gate — assess the output before finalising it.
+        gate = await self._compliance_gate(task, result, from_agent_id, ctx)
+        if gate != "proceed":
+            return  # remediation re-dispatched, or held for human approval
+
         await database.update_task(task_id, {
             "status": "completed", "result": result[:2000], "completed_at": now,
             "last_run_at": now, "run_count": task.get("run_count", 0) + 1,
@@ -272,6 +277,117 @@ class Orchestrator:
 
         await self._handoff_to_dependents(task, result, from_agent_id)
         await self._present_if_plan_complete(task)
+
+    async def _compliance_gate(self, task: dict, result: str, from_agent_id: str, ctx: dict) -> str:
+        """Assess a finished task's output via the Risk & Compliance agent.
+        Returns 'proceed' (safe), 'remediate' (sent back once), or 'hold' (awaiting
+        human approval)."""
+        import json as _json
+        from datetime import datetime as _dt
+        from . import compliance
+        rc = compliance.find_rc_agent(self)
+        # Don't gate: no R&C agent, the R&C agent's own work, or compliance off.
+        if not rc or rc.config.id == from_agent_id:
+            return "proceed"
+        mode = compliance.get_mode()
+        comp = ctx.get("compliance") or {}
+        if mode == "off":
+            return "proceed"
+        # In 'match' mode only gate tasks the Manager flagged as policy-relevant.
+        if mode == "match" and not comp.get("required"):
+            return "proceed"
+        # Use the strictest matched named policy (lowest threshold), else baseline.
+        named_policy = None
+        try:
+            rows = [r for r in [await database.get_risk_policy_row(pid)
+                                for pid in (comp.get("policy_ids") or [])] if r]
+            if rows:
+                named_policy = min(rows, key=lambda r: r.get("threshold", 10))
+        except Exception:
+            named_policy = None
+        attempt = int(comp.get("attempt", 0))
+        try:
+            rec = await compliance.assess(rc, subject=task.get("title", ""), content=result,
+                                          task_id=task["id"], attempt=attempt, named_policy=named_policy)
+        except Exception as e:
+            logger.error("[compliance] gate assessment failed: %s", e)
+            return "proceed"  # fail-open so a broken assessor can't block all work
+        if rec["verdict"] == "proceed":
+            return "proceed"
+
+        details = rec.get("rationale", "")
+        if rec.get("findings"):
+            details += " Findings: " + ", ".join(f["type"] for f in rec["findings"])
+
+        if attempt == 0:
+            # Give the agent ONE chance to self-remediate below the threshold.
+            ctx2 = dict(ctx); ctx2.setdefault("compliance", {})["attempt"] = 1
+            await database.update_task(task["id"], {
+                "status": "in_progress", "context": _json.dumps(ctx2),
+                "started_at": _dt.utcnow().isoformat(),
+            })
+            instruction = (
+                f"⚠️ Compliance hold: your output for '{task.get('title','')}' was assessed as "
+                f"**{rec['level'].upper()}** risk (score {rec['score']}/25, threshold {rec['threshold']}). "
+                f"{details}\n\nRevise your output to reduce the risk below the threshold — remove any "
+                "secrets/PII, soften exposure, and address the flagged categories — then resubmit. "
+                "This is your one remediation attempt."
+            )
+            from .models import AgentMessage
+            await self.bus.publish(AgentMessage(
+                from_agent=rc.config.id, to_agent=from_agent_id,
+                content=instruction, task_id=task["id"]))
+            logger.info("[compliance] Task '%s' flagged %s — sent back for remediation",
+                        task.get("title", "")[:40], rec["level"])
+            return "remediate"
+
+        # Second time still over threshold → hold for human approval.
+        await database.update_task(task["id"], {"status": "on_hold", "result": result[:2000]})
+        await self._notify_risk_hold(task, rec)
+        logger.info("[compliance] Task '%s' HELD for human approval (%s)",
+                    task.get("title", "")[:40], rec["level"])
+        return "hold"
+
+    async def _notify_risk_hold(self, task: dict, rec: dict) -> None:
+        if not self._ws_broadcast:
+            return
+        from .models import WSEvent, WSEventType
+        payload = {
+            "task_id": task["id"], "title": task.get("title", ""),
+            "level": rec["level"], "score": rec["score"], "threshold": rec["threshold"],
+            "rationale": rec.get("rationale", ""),
+            "findings": [f["type"] for f in rec.get("findings", [])],
+            "conversation_id": task.get("conversation_id"),
+        }
+        await self._ws_broadcast(WSEvent(type=WSEventType.RISK_HOLD, payload=payload).model_dump_json())
+
+    async def resolve_risk_hold(self, task_id: str, approve: bool) -> dict:
+        """User approves or rejects a held task."""
+        task = await database.get_task(task_id)
+        if not task or task["status"] != "on_hold":
+            return {"ok": False, "error": "Task is not awaiting approval"}
+        from datetime import datetime as _dt
+        rec = await database.get_latest_risk_for_task(task_id)
+        if approve:
+            now = _dt.utcnow().isoformat()
+            await database.update_task(task_id, {"status": "completed", "completed_at": now, "last_run_at": now})
+            if rec:
+                rec["decision"] = "approved"; rec["id"] = __import__("uuid").uuid4().hex
+                await database.save_risk_assessment(rec)
+            fresh = await database.get_task(task_id)
+            await self._handoff_to_dependents(fresh, fresh.get("result", ""), fresh["agent_id"])
+            await self._present_if_plan_complete(fresh)
+            logger.info("[compliance] Held task '%s' APPROVED by user", task.get("title", "")[:40])
+        else:
+            await database.update_task(task_id, {
+                "status": "failed",
+                "result": "Rejected by user on compliance review.",
+            })
+            if rec:
+                rec["decision"] = "rejected"; rec["id"] = __import__("uuid").uuid4().hex
+                await database.save_risk_assessment(rec)
+            logger.info("[compliance] Held task '%s' REJECTED by user", task.get("title", "")[:40])
+        return {"ok": True, "decision": "approved" if approve else "rejected"}
 
     async def on_task_failed(self, task_id: str, error: str, from_agent_id: str) -> None:
         """A task errored. Record it, fail any tasks that depended on it (their

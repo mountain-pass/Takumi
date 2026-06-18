@@ -1242,6 +1242,95 @@ async def backup_restore(file: UploadFile = File(...)):
     return {"ok": True, "imported": counts, "agent_files": files_written}
 
 
+# ── Risk & Compliance ─────────────────────────────────────────────────────────
+
+@router.get("/risk/register")
+async def risk_register(limit: int = 50):
+    return await database.get_risk_assessments(limit)
+
+
+@router.get("/risk/policy")
+async def get_risk_policy():
+    from .. import compliance
+    policy = compliance.get_policy()
+    return {**policy, "mode": compliance.get_mode(), "all_categories": compliance.CATEGORIES,
+            "levels": {"low": "1-4", "medium": "5-9", "high": "10-15", "critical": "16-25"}}
+
+
+class RiskPolicyReq(BaseModel):
+    threshold: int | None = None
+    appetite: str | None = None
+    categories: list[str] | None = None
+    likelihood_scale: list[str] | None = None
+    consequence_scale: list[str] | None = None
+    mode: str | None = None   # 'all' | 'match' | 'off'
+
+
+@router.post("/risk/policy")
+async def set_risk_policy(req: RiskPolicyReq):
+    from .. import compliance
+    policy = compliance.get_policy()
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "mode" in updates:
+        m = updates.pop("mode")
+        if m in ("all", "match", "off"):
+            runtime_settings.update({"compliance_mode": m})
+    if "threshold" in updates:
+        updates["threshold"] = max(1, min(25, int(updates["threshold"])))
+    policy.update(updates)
+    runtime_settings.update({"risk_policy": policy})
+    return {"ok": True, "policy": policy, "mode": compliance.get_mode()}
+
+
+# ── Named risk policies (matchable) ──────────────────────────────────────────
+
+@router.get("/risk/policies")
+async def list_named_policies():
+    return await database.list_risk_policies()
+
+
+class NamedPolicyReq(BaseModel):
+    id: str | None = None
+    name: str = ""
+    body: str = ""
+    threshold: int = 10
+    enabled: bool = True
+
+
+@router.post("/risk/policies")
+async def save_named_policy(req: NamedPolicyReq):
+    import uuid
+    from .. import compliance
+    pid = req.id or uuid.uuid4().hex
+    mgr = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
+    summary = await compliance.summarise_policy(mgr, req.name, req.body)
+    if not summary:  # fall back to the policy text so matching still works
+        summary = (req.body or "").strip()[:240]
+    await database.save_risk_policy({
+        "id": pid, "name": req.name, "body": req.body, "summary": summary,
+        "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
+    })
+    return await database.get_risk_policy_row(pid)
+
+
+@router.delete("/risk/policies/{policy_id}")
+async def delete_named_policy(policy_id: str):
+    await database.delete_risk_policy(policy_id)
+    return {"ok": True}
+
+
+class RiskDecisionReq(BaseModel):
+    approve: bool
+
+
+@router.post("/tasks/{task_id}/risk-decision")
+async def risk_decision(task_id: str, req: RiskDecisionReq):
+    res = await orchestrator.resolve_risk_hold(task_id, req.approve)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "Could not resolve"))
+    return res
+
+
 # ── Self-heal ─────────────────────────────────────────────────────────────────
 
 @router.get("/self-heal")

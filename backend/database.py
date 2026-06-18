@@ -178,6 +178,34 @@ CREATE TABLE IF NOT EXISTS agent_task_logs (
 
 CREATE INDEX IF NOT EXISTS idx_task_logs_task ON agent_task_logs(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_logs_agent ON agent_task_logs(agent_id, created_at);
+
+CREATE TABLE IF NOT EXISTS risk_assessments (
+    id           TEXT PRIMARY KEY,
+    task_id      TEXT,
+    assessor_id  TEXT NOT NULL DEFAULT '',
+    subject      TEXT NOT NULL DEFAULT '',
+    score        INTEGER NOT NULL DEFAULT 0,
+    level        TEXT NOT NULL DEFAULT 'low',
+    threshold    INTEGER NOT NULL DEFAULT 10,
+    verdict      TEXT NOT NULL DEFAULT 'proceed',  -- proceed | review | block
+    decision     TEXT NOT NULL DEFAULT 'proceed',  -- proceed | remediated | held | approved | rejected
+    categories   TEXT NOT NULL DEFAULT '{}',
+    findings     TEXT NOT NULL DEFAULT '[]',
+    rationale    TEXT NOT NULL DEFAULT '',
+    attempt      INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_risk_task ON risk_assessments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS risk_policies (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    threshold   INTEGER NOT NULL DEFAULT 10,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -792,6 +820,79 @@ async def get_all_tasks(status: str | None = None, limit: int = 100) -> list[dic
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,)
         )).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Risk policies (named) ─────────────────────────────────────────────────────
+
+async def list_risk_policies(enabled_only: bool = False) -> list[dict]:
+    q = "SELECT * FROM risk_policies"
+    if enabled_only:
+        q += " WHERE enabled = 1"
+    q += " ORDER BY created_at"
+    rows = await (await _conn().execute(q)).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_risk_policy_row(policy_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM risk_policies WHERE id = ?", (policy_id,))).fetchone()
+    return dict(row) if row else None
+
+
+async def save_risk_policy(p: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled)
+           VALUES(?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET name=excluded.name, body=excluded.body,
+             summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled""",
+        (p["id"], p.get("name", ""), p.get("body", ""), p.get("summary", ""),
+         int(p.get("threshold", 10)), int(p.get("enabled", 1))),
+    )
+    await _conn().commit()
+
+
+async def delete_risk_policy(policy_id: str) -> None:
+    await _conn().execute("DELETE FROM risk_policies WHERE id = ?", (policy_id,))
+    await _conn().commit()
+
+
+# ── Risk register ─────────────────────────────────────────────────────────────
+
+async def save_risk_assessment(a: dict) -> None:
+    await _conn().execute(
+        """INSERT INTO risk_assessments(id, task_id, assessor_id, subject, score, level,
+              threshold, verdict, decision, categories, findings, rationale, attempt)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            a["id"], a.get("task_id"), a.get("assessor_id", ""), a.get("subject", "")[:300],
+            int(a.get("score", 0)), a.get("level", "low"), int(a.get("threshold", 10)),
+            a.get("verdict", "proceed"), a.get("decision", "proceed"),
+            json.dumps(a.get("categories", {})), json.dumps(a.get("findings", [])),
+            a.get("rationale", "")[:2000], int(a.get("attempt", 0)),
+        ),
+    )
+    await _conn().commit()
+
+
+async def get_risk_assessments(limit: int = 50) -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM risk_assessments ORDER BY created_at DESC LIMIT ?", (limit,)
+    )).fetchall()
+    return [_hydrate_risk(dict(r)) for r in rows]
+
+
+async def get_latest_risk_for_task(task_id: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM risk_assessments WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+        (task_id,),
+    )).fetchone()
+    return _hydrate_risk(dict(row)) if row else None
+
+
+def _hydrate_risk(d: dict) -> dict:
+    d["categories"] = json.loads(d.get("categories") or "{}")
+    d["findings"] = json.loads(d.get("findings") or "[]")
+    return d
 
 
 async def get_daily_sop_tasks() -> list[dict]:

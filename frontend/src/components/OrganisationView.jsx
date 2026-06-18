@@ -215,6 +215,7 @@ function ProviderModelPicker({ form, set }) {
 }
 
 const BROWSER_TOOLS = ['browser_navigate', 'browser_read', 'browser_click', 'browser_type', 'browser_back', 'browser_screenshot']
+const RISK_TOOLS = ['assess_risk', 'scan_secrets', 'review_outbound', 'risk_register']
 
 const BUILTIN_SKILLS = [
   { id: 'web_search', label: 'Web Search' },
@@ -320,6 +321,10 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   const toggleBrowser = (on) =>
     set('skills', on ? [...skills.filter(s => !BROWSER_TOOLS.includes(s)), ...BROWSER_TOOLS]
                      : skills.filter(s => !BROWSER_TOOLS.includes(s)))
+  const riskOn = RISK_TOOLS.every(t => skills.includes(t))
+  const toggleRisk = (on) =>
+    set('skills', on ? [...skills.filter(s => !RISK_TOOLS.includes(s)), ...RISK_TOOLS]
+                     : skills.filter(s => !RISK_TOOLS.includes(s)))
 
   async function handleSave() {
     setSaving(true)
@@ -406,6 +411,13 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
                 className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
               <span className="text-xs text-gray-700">Browser</span>
               <span className="text-[10px] text-gray-400">— desktop Chrome</span>
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={riskOn}
+                onChange={e => toggleRisk(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+              <span className="text-xs text-gray-700">Risk &amp; Compliance</span>
+              <span className="text-[10px] text-gray-400">— ISO 31000</span>
             </label>
           </div>
         </div>

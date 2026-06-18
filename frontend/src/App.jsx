@@ -17,6 +17,7 @@ import {
   Trash2,
   Moon,
   Sun,
+  ShieldCheck,
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
@@ -29,6 +30,7 @@ import CronJobView from './components/CronJobView'
 import SkillMarketplaceView from './components/SkillMarketplaceView'
 import WorkflowView from './components/WorkflowView'
 import OfficeView from './components/OfficeView'
+import RiskView from './components/RiskView'
 import APISettingsView from './components/APISettingsView'
 import SystemSettingsView from './components/SystemSettingsView'
 import ChannelView from './components/ChannelView'
@@ -45,6 +47,7 @@ const PRIMARY_NAV = [
 
 const OBSERVER_NAV = [
   { id: 'office', icon: Building2, label: 'Office' },
+  { id: 'risk', icon: ShieldCheck, label: 'Risk & Compliance' },
 ]
 
 const SETTINGS_NAV = [
@@ -60,6 +63,7 @@ const VIEW_MAP = {
   skills:       <SkillMarketplaceView />,
   workflows:    <WorkflowView />,
   office:       <OfficeView />,
+  risk:         <RiskView />,
   api:          <APISettingsView />,
   settings:     <SystemSettingsView />,
   channels:     <ChannelView />,
