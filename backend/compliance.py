@@ -27,6 +27,23 @@ CATEGORIES = [
 
 DEFAULT_THRESHOLD = 10  # block at "High" (score >= 10) by default
 
+# Each scale level carries a definition (not just a label) so scoring is
+# consistent and auditable — what does "Likely" or "Major" actually mean here.
+DEFAULT_LIKELIHOOD = [
+    {"label": "Rare", "definition": "May occur only in exceptional circumstances; strong controls make occurrence very unlikely."},
+    {"label": "Unlikely", "definition": "Could occur, but existing controls (reviews, tests, gates) significantly reduce the probability."},
+    {"label": "Possible", "definition": "Might occur under normal conditions; moderate complexity or limited controls."},
+    {"label": "Likely", "definition": "Will probably occur in most circumstances without intervention; weak or missing controls."},
+    {"label": "Almost certain", "definition": "Expected to occur; a known gap, no controls, or a previously observed failure mode."},
+]
+DEFAULT_CONSEQUENCE = [
+    {"label": "Insignificant", "definition": "Negligible effect; no harm to data, finances, customers, reputation, or compliance."},
+    {"label": "Minor", "definition": "Small, easily remediated effect; internal only, no external/customer impact."},
+    {"label": "Moderate", "definition": "Noticeable impact; some customer/operational disruption or limited data/financial exposure."},
+    {"label": "Major", "definition": "Significant impact; material financial loss, a regulatory breach, or real customer/data harm."},
+    {"label": "Severe", "definition": "Critical impact; major breach, legal/regulatory action, large financial loss, or serious reputational damage."},
+]
+
 # The organisation's risk policy — editable in the app, consumed by every
 # assessment so the agent scores against the company's actual specification.
 DEFAULT_POLICY = {
@@ -37,9 +54,27 @@ DEFAULT_POLICY = {
         "secrets, credentials, or personal data. Escalate anything legally or financially material."
     ),
     "categories": list(CATEGORIES),
-    "likelihood_scale": ["Rare", "Unlikely", "Possible", "Likely", "Almost certain"],
-    "consequence_scale": ["Insignificant", "Minor", "Moderate", "Major", "Severe"],
+    "likelihood_scale": [dict(x) for x in DEFAULT_LIKELIHOOD],
+    "consequence_scale": [dict(x) for x in DEFAULT_CONSEQUENCE],
 }
+
+
+def _norm_scale(items, defaults) -> list[dict]:
+    """Coerce a scale to exactly 5 {label, definition} levels, accepting the legacy
+    plain-string format and back-filling definitions from the defaults."""
+    items = items or []
+    out = []
+    for i in range(5):
+        d = defaults[i]
+        v = items[i] if i < len(items) else None
+        if isinstance(v, dict):
+            out.append({"label": str(v.get("label") or d["label"])[:60],
+                        "definition": str(v.get("definition") or d["definition"])[:400]})
+        elif isinstance(v, str) and v.strip():
+            out.append({"label": v.strip()[:60], "definition": d["definition"]})
+        else:
+            out.append(dict(d))
+    return out
 
 
 def get_policy() -> dict:
@@ -52,6 +87,8 @@ def get_policy() -> dict:
     except Exception:
         saved = {}
     policy = {**DEFAULT_POLICY, **(saved if isinstance(saved, dict) else {})}
+    policy["likelihood_scale"] = _norm_scale(policy.get("likelihood_scale"), DEFAULT_LIKELIHOOD)
+    policy["consequence_scale"] = _norm_scale(policy.get("consequence_scale"), DEFAULT_CONSEQUENCE)
     # Legacy: a standalone risk_threshold still wins if no policy threshold saved.
     if "threshold" not in saved:
         try:
@@ -183,10 +220,13 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
             adapter = rc_agent._adapter
             model = rc_agent.config.llm_model
             cats = base.get("categories") or CATEGORIES
-            lscale = base.get("likelihood_scale") or DEFAULT_POLICY["likelihood_scale"]
-            cscale = base.get("consequence_scale") or DEFAULT_POLICY["consequence_scale"]
-            scale_txt = ("Likelihood 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(lscale)) +
-                         ". Consequence 1-5 = " + ", ".join(f"{i+1} {v}" for i, v in enumerate(cscale)) + ".")
+            lscale = base.get("likelihood_scale") or DEFAULT_LIKELIHOOD
+            cscale = base.get("consequence_scale") or DEFAULT_CONSEQUENCE
+            scale_txt = (
+                "LIKELIHOOD levels (score 1-5):\n" +
+                "\n".join(f"  {i+1} = {s['label']}: {s['definition']}" for i, s in enumerate(lscale)) +
+                "\nCONSEQUENCE levels (score 1-5):\n" +
+                "\n".join(f"  {i+1} = {s['label']}: {s['definition']}" for i, s in enumerate(cscale)))
             system = (
                 "You are an ISO 31000 risk & compliance assessor for this organisation. Score the work "
                 f"against the POLICY below ({policy_label}), across these categories: {', '.join(cats)}.\n\n"

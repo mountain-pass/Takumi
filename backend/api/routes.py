@@ -1270,8 +1270,8 @@ class RiskPolicyReq(BaseModel):
     threshold: int | None = None
     appetite: str | None = None
     categories: list[str] | None = None
-    likelihood_scale: list[str] | None = None
-    consequence_scale: list[str] | None = None
+    likelihood_scale: list | None = None       # [{label, definition}]
+    consequence_scale: list | None = None       # [{label, definition}]
     mode: str | None = None   # 'all' | 'match' | 'off'
 
 
