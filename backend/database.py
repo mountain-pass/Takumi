@@ -247,6 +247,8 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agent_tasks ADD COLUMN context TEXT NOT NULL DEFAULT '{}'",
         "ALTER TABLE agents ADD COLUMN extra_models TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE agent_tasks ADD COLUMN daily_sop INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE risk_policies ADD COLUMN transcript TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE risk_policies ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await _db.execute(migration)
@@ -891,12 +893,14 @@ async def get_risk_policy_row(policy_id: str) -> dict | None:
 
 async def save_risk_policy(p: dict) -> None:
     await _conn().execute(
-        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled)
-           VALUES(?, ?, ?, ?, ?, ?)
+        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled, transcript)
+           VALUES(?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET name=excluded.name, body=excluded.body,
-             summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled""",
+             summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled,
+             transcript=excluded.transcript""",
         (p["id"], p.get("name", ""), p.get("body", ""), p.get("summary", ""),
-         int(p.get("threshold", 10)), int(p.get("enabled", 1))),
+         int(p.get("threshold", 10)), int(p.get("enabled", 1)),
+         json.dumps(p.get("transcript", [])) if not isinstance(p.get("transcript"), str) else p.get("transcript", "[]")),
     )
     await _conn().commit()
 
@@ -904,6 +908,18 @@ async def save_risk_policy(p: dict) -> None:
 async def delete_risk_policy(policy_id: str) -> None:
     await _conn().execute("DELETE FROM risk_policies WHERE id = ?", (policy_id,))
     await _conn().commit()
+
+
+async def set_default_risk_policy(policy_id: str) -> None:
+    await _conn().execute("UPDATE risk_policies SET is_default = 0")
+    await _conn().execute("UPDATE risk_policies SET is_default = 1 WHERE id = ?", (policy_id,))
+    await _conn().commit()
+
+
+async def get_default_risk_policy() -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM risk_policies WHERE is_default = 1 AND enabled = 1 LIMIT 1")).fetchone()
+    return dict(row) if row else None
 
 
 # ── Risk register ─────────────────────────────────────────────────────────────

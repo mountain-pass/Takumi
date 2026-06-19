@@ -4,8 +4,8 @@
  *    categories, and a visual 5×5 risk matrix. Consumed by every assessment.
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
-import React, { useState, useEffect } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, FileText, Plus, Trash2, X } from 'lucide-react'
+import React, { useState, useEffect, useRef } from 'react'
+import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, FileText, Plus, Trash2, X, MessageSquareText } from 'lucide-react'
 
 const MODES = [
   { id: 'all', label: 'All tasks', hint: 'Every task is reviewed against the org policy.' },
@@ -247,15 +247,17 @@ function RegisterTab() {
   )
 }
 
-// ── Policies tab (named, matchable) ───────────────────────────────────────────
+// ── Policies tab (interview-built, matchable, with a default) ──────────────────
 function PoliciesTab() {
   const [policies, setPolicies] = useState(null)
-  const [editing, setEditing] = useState(null) // policy object or {} for new
+  const [editing, setEditing] = useState(null)        // manual editor
+  const [interviewing, setInterviewing] = useState(false)
+  const [viewing, setViewing] = useState(null)        // policy whose interview to view
 
   const load = () => fetch('/api/risk/policies').then(r => r.json()).then(setPolicies).catch(() => setPolicies([]))
   useEffect(() => { load() }, [])
 
-  async function save(p) {
+  async function saveManual(p) {
     await fetch('/api/risk/policies', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: p.id, name: p.name, body: p.body, threshold: p.threshold ?? 10, enabled: p.enabled ?? true }),
@@ -266,37 +268,198 @@ function PoliciesTab() {
     if (!confirm('Delete this policy?')) return
     await fetch(`/api/risk/policies/${id}`, { method: 'DELETE' }); load()
   }
+  async function setDefault(id) {
+    await fetch(`/api/risk/policies/${id}/default`, { method: 'POST' }); load()
+  }
 
   if (!policies) return <Loading />
+
+  // First-run: no policies → big Start call-to-action.
+  if (policies.length === 0) {
+    return (
+      <div className="max-w-xl mx-auto px-6 py-16 text-center">
+        <ShieldCheck size={36} className="mx-auto mb-3 text-indigo-400" />
+        <h2 className="text-base font-bold text-gray-800">Build your risk policy</h2>
+        <p className="text-sm text-gray-500 mt-1 mb-5">
+          The Manager will interview you — one question at a time — about your organisation and risk
+          appetite, then draft a detailed policy with a suggested block-at-score threshold you can adjust.
+        </p>
+        <button onClick={() => setInterviewing(true)}
+          className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+          <MessageSquareText size={16} /> Start the interview
+        </button>
+        {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); load() }} onClose={() => setInterviewing(false)} />}
+      </div>
+    )
+  }
+
+  const defaultId = policies.find(p => p.is_default)?.id
   return (
     <div className="max-w-3xl mx-auto px-6 py-6 space-y-3">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-gray-500 max-w-md">
-          Named policies the Manager matches tasks against (in "Only matched" mode). Each is summarised by an agent so tasks can be linked to it.
-        </p>
-        <button onClick={() => setEditing({ name: '', body: '', threshold: 10, enabled: true })}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs text-gray-500 shrink-0">Default policy:</span>
+          <select value={defaultId || ''} onChange={e => setDefault(e.target.value)}
+            className="input py-1 text-sm flex-1 min-w-0">
+            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold})</option>)}
+          </select>
+        </div>
+        <button onClick={() => setInterviewing(true)}
           className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shrink-0">
-          <Plus size={14} /> New policy
+          <MessageSquareText size={14} /> New policy
         </button>
       </div>
-      {policies.length === 0 && <p className="text-sm text-gray-400 py-8 text-center border border-dashed border-gray-200 rounded-xl">No policies yet.</p>}
+      <p className="text-[11px] text-gray-400">The default policy drives the org baseline; in "Only matched" mode the Manager links tasks to whichever policy applies.</p>
+
       {policies.map(p => (
         <div key={p.id} className="border border-gray-200 rounded-xl p-3">
           <div className="flex items-start gap-2">
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-semibold text-gray-800">{p.name || 'Untitled'}</span>
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">block ≥ {p.threshold}</span>
+                {p.is_default ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-600">default</span> : null}
                 {!p.enabled && <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-400">disabled</span>}
               </div>
               {p.summary && <p className="text-[11px] text-gray-500 mt-0.5">{p.summary}</p>}
             </div>
-            <button onClick={() => setEditing(p)} className="text-[11px] text-indigo-600 hover:underline shrink-0">Edit</button>
-            <button onClick={() => remove(p.id)} className="p-1 text-gray-300 hover:text-red-500 shrink-0"><Trash2 size={14} /></button>
+            <div className="flex items-center gap-2 shrink-0">
+              {JSON.parse(p.transcript || '[]').length > 0 &&
+                <button onClick={() => setViewing(p)} className="text-[11px] text-gray-500 hover:underline">View interview</button>}
+              <button onClick={() => setEditing(p)} className="text-[11px] text-indigo-600 hover:underline">Edit</button>
+              <button onClick={() => remove(p.id)} className="p-1 text-gray-300 hover:text-red-500"><Trash2 size={14} /></button>
+            </div>
           </div>
         </div>
       ))}
-      {editing && <PolicyEditor policy={editing} onSave={save} onClose={() => setEditing(null)} />}
+
+      {editing && <PolicyEditor policy={editing} onSave={saveManual} onClose={() => setEditing(null)} />}
+      {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); load() }} onClose={() => setInterviewing(false)} />}
+      {viewing && <TranscriptViewer policy={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  )
+}
+
+// Chat-style interview: the Manager asks one question at a time, then drafts the policy.
+function PolicyInterview({ onDone, onClose }) {
+  const [msgs, setMsgs] = useState([])          // {role, content}
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(true)
+  const [final, setFinal] = useState(null)      // {name, appetite, threshold, rationale}
+  const [saving, setSaving] = useState(false)
+  const endRef = useRef(null)
+
+  async function step(history) {
+    setBusy(true)
+    try {
+      const r = await fetch('/api/risk/interview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ history }),
+      })
+      const d = await r.json()
+      if (d.type === 'final') {
+        setFinal({ name: d.name || 'Risk Policy', appetite: d.appetite || '', threshold: d.threshold || 10, rationale: d.rationale || '' })
+      } else {
+        setMsgs(m => [...m, { role: 'assistant', content: d.question || '…' }])
+      }
+    } finally { setBusy(false) }
+  }
+  useEffect(() => { step([]) }, [])
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, final])
+
+  function send() {
+    const text = input.trim()
+    if (!text || busy) return
+    const next = [...msgs, { role: 'user', content: text }]
+    setMsgs(next); setInput('')
+    step(next)
+  }
+  async function save() {
+    setSaving(true)
+    await fetch('/api/risk/policies', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      // The backend makes the FIRST policy default automatically; otherwise the
+      // user chooses the default from the dropdown.
+      body: JSON.stringify({ name: final.name, body: final.appetite, threshold: final.threshold, transcript: msgs }),
+    })
+    setSaving(false); onDone()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2"><MessageSquareText size={16} className="text-indigo-500" /> Policy interview</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+
+        {!final ? (
+          <>
+            <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+              {msgs.map((m, i) => (
+                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
+                </div>
+              ))}
+              {busy && <div className="flex justify-start"><div className="bg-gray-100 rounded-2xl px-3.5 py-2"><Loader2 size={14} className="animate-spin text-gray-400" /></div></div>}
+              <div ref={endRef} />
+            </div>
+            <div className="px-4 py-3 border-t border-gray-100 flex gap-2">
+              <input className="input flex-1" placeholder="Type your answer…" value={input}
+                onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} disabled={busy} />
+              <button onClick={send} disabled={busy || !input.trim()} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-40">Send</button>
+            </div>
+          </>
+        ) : (
+          <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+            <p className="text-xs text-gray-500">The Manager drafted this from your answers. Review and adjust the block-at-score before saving.</p>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-gray-400 uppercase">Name</span>
+              <input className="input" value={final.name} onChange={e => setFinal({ ...final, name: e.target.value })} /></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-gray-400 uppercase">Risk appetite / policy</span>
+              <textarea className="input resize-y" rows={7} value={final.appetite} onChange={e => setFinal({ ...final, appetite: e.target.value })} /></label>
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-gray-700">Block at score</span>
+              <input type="number" min={1} max={25} className="input w-20 text-right" value={final.threshold}
+                onChange={e => setFinal({ ...final, threshold: Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)) })} />
+              <span className="text-[11px] text-gray-400">Manager suggested {final.threshold} — override if you prefer.</span>
+            </div>
+            {final.rationale && <p className="text-[11px] text-gray-500 bg-amber-50 border border-amber-100 rounded-lg p-2"><b>Why:</b> {final.rationale}</p>}
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setFinal(null)} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-xl">Back to interview</button>
+              <button onClick={save} disabled={saving || !final.name.trim()} className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl disabled:opacity-40">{saving ? 'Saving…' : 'Save policy'}</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TranscriptViewer({ policy, onClose }) {
+  const transcript = JSON.parse(policy.transcript || '[]')
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h3 className="text-sm font-bold text-gray-900">How "{policy.name}" was derived</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+          <div className="flex flex-wrap gap-2 text-[11px] mb-1">
+            <span className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">block ≥ {policy.threshold}</span>
+          </div>
+          {transcript.length === 0 && <p className="text-sm text-gray-400">No interview transcript (created manually).</p>}
+          {transcript.map((m, i) => (
+            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-700'}`}>{m.content}</div>
+            </div>
+          ))}
+          <div className="border-t border-gray-100 pt-3">
+            <p className="text-[11px] font-semibold text-gray-400 uppercase mb-1">Resulting policy</p>
+            <p className="text-sm text-gray-700 whitespace-pre-wrap">{policy.body}</p>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

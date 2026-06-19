@@ -322,6 +322,52 @@ async def summarise_policy(agent, name: str, body: str) -> str:
         return ""
 
 
+_INTERVIEW_SYSTEM = (
+    "You are the Manager of an AI organisation acting as a RISK & COMPLIANCE policy "
+    "interviewer. Interview the user — ONE QUESTION AT A TIME — to build this "
+    "organisation's risk appetite and a block-at-score threshold for the ISO 31000 5×5 "
+    "matrix (likelihood×consequence, score 1-25; bands: Low 1-4, Medium 5-9, High 10-15, "
+    "Critical 16-25).\n\n"
+    "Cover: industry & regulatory context; appetite for security, data-privacy, financial, "
+    "legal/compliance, reputational and operational risk; what work or outcomes must NEVER "
+    "happen; and where human sign-off is required. Ask 6-9 short questions total, ONE per "
+    "turn — never ask the next until the user has answered. Be warm and concrete.\n\n"
+    "Respond with STRICT JSON only:\n"
+    "- next question: {\"type\":\"question\",\"question\":\"<one question>\"}\n"
+    "- when you have enough: {\"type\":\"final\",\"name\":\"<short policy name>\","
+    "\"appetite\":\"<detailed company risk appetite / policy, 1-3 paragraphs>\","
+    "\"threshold\":<int 1-25>,\"rationale\":\"<why this threshold, referencing their answers>\"}\n"
+    "Output JSON and nothing else."
+)
+
+
+async def policy_interview(manager_agent, history: list[dict]) -> dict:
+    """Drive one turn of the policy interview. `history` is the prior Q&A
+    (assistant=question, user=answer). Returns {type:'question'|'final', ...}."""
+    if manager_agent is None:
+        return {"type": "final", "name": "Risk Policy",
+                "appetite": "Default conservative risk appetite (no interviewer available).",
+                "threshold": 10, "rationale": "Fallback default."}
+    msgs = [{"role": ("assistant" if m.get("role") == "assistant" else "user"),
+             "content": m.get("content", "")} for m in (history or [])]
+    if not msgs:
+        msgs = [{"role": "user", "content": "Begin the interview. Ask your first question."}]
+    try:
+        resp = await manager_agent._adapter.complete(
+            system_prompt=_INTERVIEW_SYSTEM, messages=msgs,
+            model=manager_agent.config.llm_model, max_tokens=900)
+        data = _parse_json(resp.content)
+        if isinstance(data, dict) and data.get("type") in ("question", "final"):
+            if data["type"] == "final":
+                data["threshold"] = max(1, min(25, int(data.get("threshold", 10) or 10)))
+            return data
+        # Fallback: treat raw text as the next question.
+        return {"type": "question", "question": (resp.content or "Tell me about your organisation's risk appetite.").strip()[:500]}
+    except Exception as e:
+        logger.warning("[compliance] interview step failed: %s", e)
+        return {"type": "question", "question": "Could you describe your organisation and the kinds of risk you most want to control?"}
+
+
 async def match_policies(manager_agent, task_text: str, policies: list[dict]) -> list[dict]:
     """Which enabled policies relate to this task (the Manager's judgement)."""
     pols = [p for p in policies if p.get("enabled", 1)]

@@ -1304,6 +1304,8 @@ class NamedPolicyReq(BaseModel):
     body: str = ""
     threshold: int = 10
     enabled: bool = True
+    transcript: list = []     # the interview Q&A this policy was derived from
+    make_default: bool = False
 
 
 @router.post("/risk/policies")
@@ -1318,14 +1320,39 @@ async def save_named_policy(req: NamedPolicyReq):
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
+        "transcript": req.transcript or [],
     })
+    # First policy becomes default automatically; or if explicitly requested.
+    existing = await database.list_risk_policies()
+    if req.make_default or len(existing) == 1:
+        await database.set_default_risk_policy(pid)
     return await database.get_risk_policy_row(pid)
+
+
+@router.post("/risk/policies/{policy_id}/default")
+async def set_default_policy(policy_id: str):
+    if not await database.get_risk_policy_row(policy_id):
+        raise HTTPException(404, "Policy not found")
+    await database.set_default_risk_policy(policy_id)
+    return {"ok": True, "default": policy_id}
 
 
 @router.delete("/risk/policies/{policy_id}")
 async def delete_named_policy(policy_id: str):
     await database.delete_risk_policy(policy_id)
     return {"ok": True}
+
+
+class InterviewReq(BaseModel):
+    history: list = []   # [{role:'assistant'|'user', content:str}]
+
+
+@router.post("/risk/interview")
+async def risk_interview(req: InterviewReq):
+    """One turn of the policy interview, driven by the Manager."""
+    from .. import compliance
+    mgr = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
+    return await compliance.policy_interview(mgr, req.history)
 
 
 class RiskDecisionReq(BaseModel):

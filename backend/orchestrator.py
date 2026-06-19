@@ -314,6 +314,9 @@ class Orchestrator:
                                 for pid in (comp.get("policy_ids") or [])] if r]
             if rows:
                 named_policy = min(rows, key=lambda r: r.get("threshold", 10))
+            else:
+                # No specific match → assess against the default policy if one is set.
+                named_policy = await database.get_default_risk_policy()
         except Exception:
             named_policy = None
         attempt = int(comp.get("attempt", 0))
