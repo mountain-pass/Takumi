@@ -330,13 +330,15 @@ _INTERVIEW_SYSTEM = (
     "Critical 16-25).\n\n"
     "Cover: industry & regulatory context; appetite for security, data-privacy, financial, "
     "legal/compliance, reputational and operational risk; what work or outcomes must NEVER "
-    "happen; and where human sign-off is required. Ask 6-9 short questions total, ONE per "
-    "turn — never ask the next until the user has answered. Be warm and concrete.\n\n"
+    "happen; where human sign-off is required; and HOW OFTEN the policy should be reviewed "
+    "(most orgs review annually, and always after a major incident). Ask 6-9 short questions "
+    "total, ONE per turn — never ask the next until the user has answered. Be warm and concrete.\n\n"
     "Respond with STRICT JSON only:\n"
     "- next question: {\"type\":\"question\",\"question\":\"<one question>\"}\n"
     "- when you have enough: {\"type\":\"final\",\"name\":\"<short policy name>\","
-    "\"appetite\":\"<detailed company risk appetite / policy, 1-3 paragraphs>\","
-    "\"threshold\":<int 1-25>,\"rationale\":\"<why this threshold, referencing their answers>\"}\n"
+    "\"appetite\":\"<detailed company risk appetite / policy, 1-3 paragraphs, including the review "
+    "cadence>\",\"threshold\":<int 1-25>,\"review_frequency_months\":<int, e.g. 12 for annual>,"
+    "\"rationale\":\"<why this threshold, referencing their answers>\"}\n"
     "Output JSON and nothing else."
 )
 
@@ -360,6 +362,7 @@ async def policy_interview(manager_agent, history: list[dict]) -> dict:
         if isinstance(data, dict) and data.get("type") in ("question", "final"):
             if data["type"] == "final":
                 data["threshold"] = max(1, min(25, int(data.get("threshold", 10) or 10)))
+                data["review_frequency_months"] = max(1, min(60, int(data.get("review_frequency_months", 12) or 12)))
             return data
         # Fallback: treat raw text as the next question.
         return {"type": "question", "question": (resp.content or "Tell me about your organisation's risk appetite.").strip()[:500]}
@@ -390,6 +393,39 @@ async def match_policies(manager_agent, task_text: str, policies: list[dict]) ->
     except Exception as e:
         logger.warning("[compliance] policy match failed: %s", e)
     return []
+
+
+# ── Policy review lifecycle ───────────────────────────────────────────────────
+
+def review_status(policy: dict) -> dict:
+    """Compute when a policy is next due for review and whether it's overdue."""
+    from datetime import date, timedelta
+    freq = int(policy.get("review_frequency_months", 12) or 12)
+    last = policy.get("last_reviewed")
+    next_due = None
+    if last:
+        try:
+            y, m, d = (int(x) for x in last[:10].split("-"))
+            nd = date(y, m, d) + timedelta(days=round(freq * 30.44))
+            next_due = nd.isoformat()
+        except Exception:
+            next_due = None
+    overdue = bool(policy.get("review_due"))
+    if next_due and next_due <= date.today().isoformat():
+        overdue = True
+    if not last:
+        overdue = True
+    return {"next_review": next_due, "overdue": overdue,
+            "reason": policy.get("review_reason", "")}
+
+
+async def policies_due_for_review() -> list[dict]:
+    out = []
+    for p in await database.list_risk_policies(enabled_only=True):
+        st = review_status(p)
+        if st["overdue"]:
+            out.append({**p, **st})
+    return out
 
 
 def find_rc_agent(orchestrator):

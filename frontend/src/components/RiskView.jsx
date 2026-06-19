@@ -5,7 +5,7 @@
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
 import React, { useState, useEffect, useRef } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, FileText, Plus, Trash2, X, MessageSquareText } from 'lucide-react'
+import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText } from 'lucide-react'
 
 const MODES = [
   { id: 'all', label: 'All tasks', hint: 'Every task is reviewed against the org policy.' },
@@ -33,13 +33,11 @@ export default function RiskView() {
         <p className="text-xs text-gray-400 mt-0.5">ISO 31000 risk policy and the assessment register.</p>
         <div className="flex gap-1 mt-3">
           <TabBtn active={tab === 'policy'} onClick={() => setTab('policy')} icon={SlidersHorizontal}>Global Policy</TabBtn>
-          <TabBtn active={tab === 'policies'} onClick={() => setTab('policies')} icon={FileText}>Policies</TabBtn>
           <TabBtn active={tab === 'register'} onClick={() => setTab('register')} icon={ScrollText}>Risk Register</TabBtn>
         </div>
       </div>
       <div className="flex-1 overflow-y-auto">
         {tab === 'policy' && <PolicyTab />}
-        {tab === 'policies' && <PoliciesTab />}
         {tab === 'register' && <RegisterTab />}
       </div>
     </div>
@@ -56,109 +54,169 @@ function TabBtn({ active, onClick, icon: Icon, children }) {
   )
 }
 
-// ── Policy tab ────────────────────────────────────────────────────────────────
+// ── Global Policy tab ─────────────────────────────────────────────────────────
+// One active policy (created via interview) the agent follows, plus the org-wide
+// scoring framework (matrix, scales, categories, mode) and the review lifecycle.
 function PolicyTab() {
-  const [policy, setPolicy] = useState(null)
-  const [saved, setSaved] = useState(false)
-  const [saving, setSaving] = useState(false)
+  const [fw, setFw] = useState(null)            // framework: scales/categories/mode
+  const [policies, setPolicies] = useState(null)
+  const [active, setActive] = useState(null)    // editable copy of the active policy
+  const [interviewing, setInterviewing] = useState(false)
+  const [viewing, setViewing] = useState(null)
+  const [savedFw, setSavedFw] = useState(false)
+  const [savedPol, setSavedPol] = useState(false)
 
-  useEffect(() => {
-    fetch('/api/risk/policy').then(r => r.json()).then(setPolicy).catch(() => setPolicy({}))
-  }, [])
-  if (!policy) return <Loading />
+  const loadFw = () => fetch('/api/risk/policy').then(r => r.json()).then(setFw).catch(() => setFw({}))
+  const loadPolicies = () => fetch('/api/risk/policies').then(r => r.json()).then(list => {
+    setPolicies(list)
+    setActive(list.find(p => p.is_default) || list[0] || null)
+  }).catch(() => setPolicies([]))
+  useEffect(() => { loadFw(); loadPolicies() }, [])
 
-  const set = (k, v) => { setPolicy(p => ({ ...p, [k]: v })); setSaved(false) }
-  const toggleCat = (c) => {
-    const cats = policy.categories || []
-    set('categories', cats.includes(c) ? cats.filter(x => x !== c) : [...cats, c])
+  if (!fw || !policies) return <Loading />
+
+  // ── New project: no policy yet → interview to create the global policy ──
+  if (policies.length === 0) {
+    return (
+      <div className="max-w-xl mx-auto px-6 py-16 text-center">
+        <ShieldCheck size={36} className="mx-auto mb-3 text-indigo-400" />
+        <h2 className="text-base font-bold text-gray-800">Set up your global risk policy</h2>
+        <p className="text-sm text-gray-500 mt-1 mb-5">
+          The Manager will interview you — one question at a time — about your organisation and risk
+          appetite, then draft a policy with a suggested block-at-score and a review cadence you can adjust.
+        </p>
+        <button onClick={() => setInterviewing(true)}
+          className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+          <MessageSquareText size={16} /> Start the interview
+        </button>
+        {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); loadPolicies() }} onClose={() => setInterviewing(false)} />}
+      </div>
+    )
   }
-  async function save() {
-    setSaving(true); setSaved(false)
+
+  const setA = (k, v) => { setActive(p => ({ ...p, [k]: v })); setSavedPol(false) }
+  const setFwField = (k, v) => { setFw(p => ({ ...p, [k]: v })); setSavedFw(false) }
+  const toggleCat = (c) => {
+    const cats = fw.categories || []
+    setFwField('categories', cats.includes(c) ? cats.filter(x => x !== c) : [...cats, c])
+  }
+  async function savePolicy() {
+    await fetch('/api/risk/policies', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: active.id, name: active.name, body: active.body,
+        threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12 }),
+    })
+    setSavedPol(true); setTimeout(() => setSavedPol(false), 2500); loadPolicies()
+  }
+  async function saveFw() {
     await fetch('/api/risk/policy', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        threshold: policy.threshold, appetite: policy.appetite, categories: policy.categories,
-        likelihood_scale: policy.likelihood_scale, consequence_scale: policy.consequence_scale,
-        mode: policy.mode,
-      }),
+      body: JSON.stringify({ categories: fw.categories, likelihood_scale: fw.likelihood_scale,
+        consequence_scale: fw.consequence_scale, mode: fw.mode }),
     })
-    setSaving(false); setSaved(true); setTimeout(() => setSaved(false), 2500)
+    setSavedFw(true); setTimeout(() => setSavedFw(false), 2500)
   }
+  async function setDefault(id) { await fetch(`/api/risk/policies/${id}/default`, { method: 'POST' }); loadPolicies() }
+  async function markReviewed() { await fetch(`/api/risk/policies/${active.id}/reviewed`, { method: 'POST' }); loadPolicies() }
 
-  const threshold = policy.threshold || 10
+  const threshold = active?.threshold || 10
+  const lvl = LEVELS.find(l => l.key === levelOf(threshold))
   return (
     <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
+      {/* Active policy selector */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs text-gray-500 shrink-0">Active policy the agent follows:</span>
+          <select value={active?.id || ''} onChange={e => setDefault(e.target.value)} className="input py-1 text-sm flex-1 min-w-0">
+            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold})</option>)}
+          </select>
+        </div>
+        <button onClick={() => setInterviewing(true)}
+          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shrink-0">
+          <MessageSquareText size={14} /> New policy
+        </button>
+      </div>
+
+      {active && (
+        <>
+          {/* Review status banner */}
+          <div className={`rounded-xl border p-3 ${active.overdue ? 'border-amber-300 bg-amber-50' : 'border-gray-200 bg-gray-50/60'}`}>
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="text-xs text-gray-600">
+                <b className="text-gray-800">Review:</b> last {active.last_reviewed || 'never'} · next due {active.next_review || '—'} · every {active.review_frequency_months || 12} months
+                {active.overdue && <span className="ml-2 text-amber-700 font-semibold">⚠ review due{active.reason ? ` (${active.reason})` : ''}</span>}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {JSON.parse(active.transcript || '[]').length > 0 &&
+                  <button onClick={() => setViewing(active)} className="text-[11px] text-gray-500 hover:underline">View interview</button>}
+                <button onClick={markReviewed} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white">Mark reviewed</button>
+              </div>
+            </div>
+          </div>
+
+          {/* Appetite + threshold (per active policy) */}
+          <Section title="Risk appetite / policy" hint="Injected into every assessment so the agent scores against your specification.">
+            <textarea rows={6} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
+          </Section>
+          <Section title="Block at score & review cadence">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-sm text-gray-700">Block at score</span>
+              <input type="number" min={1} max={25} value={threshold} onChange={e => setA('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))} className="w-20 input text-right" />
+              <span className={`text-[11px] px-2 py-0.5 rounded border ${lvl.cls}`}>{lvl.label}+ blocked</span>
+              <span className="text-sm text-gray-700 ml-3">Review every</span>
+              <input type="number" min={1} max={60} value={active.review_frequency_months || 12} onChange={e => setA('review_frequency_months', Math.max(1, Math.min(60, parseInt(e.target.value || '12', 10) || 12)))} className="w-20 input text-right" />
+              <span className="text-sm text-gray-700">months</span>
+            </div>
+            <div className="mt-3"><RiskMatrix threshold={threshold} like={fw.likelihood_scale} cons={fw.consequence_scale} /></div>
+            <div className="flex items-center gap-3 mt-3">
+              <button onClick={savePolicy} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save policy</button>
+              {savedPol && <span className="text-xs text-green-600">Saved ✓</span>}
+            </div>
+          </Section>
+        </>
+      )}
+
+      <hr className="border-gray-200" />
+      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Scoring framework (org-wide)</p>
+
       {/* Compliance mode */}
-      <Section title="Compliance review mode"
-        hint="Decide how much work the Risk & Compliance agent gates (requires a Risk & Compliance agent).">
+      <Section title="Compliance review mode" hint="How much work the Risk & Compliance agent gates (requires a Risk & Compliance agent).">
         <div className="grid grid-cols-3 gap-2">
           {MODES.map(m => (
-            <button key={m.id} onClick={() => set('mode', m.id)}
-              className={`text-left px-3 py-2 rounded-xl border text-xs ${
-                (policy.mode || 'all') === m.id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'}`}>
+            <button key={m.id} onClick={() => setFwField('mode', m.id)}
+              className={`text-left px-3 py-2 rounded-xl border text-xs ${(fw.mode || 'all') === m.id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'}`}>
               <div className="font-semibold text-gray-800">{m.label}</div>
               <div className="text-[10px] text-gray-400 mt-0.5">{m.hint}</div>
             </button>
           ))}
         </div>
       </Section>
-
-      {/* Appetite */}
-      <Section title="Company risk appetite / policy"
-        hint="Free-text policy injected into every assessment so the agent scores against your specification.">
-        <textarea rows={4} className="input resize-y" value={policy.appetite || ''}
-          onChange={e => set('appetite', e.target.value)} />
-      </Section>
-
-      {/* Threshold + matrix */}
-      <Section title="Risk threshold & matrix"
-        hint="Scores at or above the threshold are sent back for one self-remediation attempt, then held for approval.">
-        <div className="flex items-center gap-3 mb-3">
-          <span className="text-sm text-gray-700">Block at score</span>
-          <input type="number" min={1} max={25} value={threshold}
-            onChange={e => set('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))}
-            className="w-20 input text-right" />
-          <span className={`text-[11px] px-2 py-0.5 rounded border ${LEVELS.find(l => l.key === levelOf(threshold)).cls}`}>
-            {LEVELS.find(l => l.key === levelOf(threshold)).label}+ blocked
-          </span>
-        </div>
-        <RiskMatrix threshold={threshold} like={policy.likelihood_scale} cons={policy.consequence_scale} />
-        <div className="flex flex-wrap gap-2 mt-3">
-          {LEVELS.map(l => <span key={l.key} className={`text-[10px] px-2 py-0.5 rounded border ${l.cls}`}>{l.label}</span>)}
-        </div>
-      </Section>
-
-      {/* Scales with definitions */}
       <Section title="Likelihood scale (1–5)" hint="Define what each level means so scoring is consistent and auditable.">
-        <ScaleEditor scale={policy.likelihood_scale} onChange={s => set('likelihood_scale', s)} />
+        <ScaleEditor scale={fw.likelihood_scale} onChange={s => setFwField('likelihood_scale', s)} />
       </Section>
       <Section title="Consequence / impact scale (1–5)" hint="Define the impact at each level (financial, data, legal, reputational…).">
-        <ScaleEditor scale={policy.consequence_scale} onChange={s => set('consequence_scale', s)} />
+        <ScaleEditor scale={fw.consequence_scale} onChange={s => setFwField('consequence_scale', s)} />
       </Section>
-
-      {/* Categories */}
       <Section title="Risk categories" hint="Which categories the agent scores against.">
         <div className="flex flex-wrap gap-2">
-          {(policy.all_categories || policy.categories || []).map(c => {
-            const on = (policy.categories || []).includes(c)
+          {(fw.all_categories || fw.categories || []).map(c => {
+            const on = (fw.categories || []).includes(c)
             return (
               <button key={c} onClick={() => toggleCat(c)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium border capitalize ${
-                  on ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border capitalize ${on ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
                 {c.replace('_', ' ')}
               </button>
             )
           })}
         </div>
       </Section>
-
       <div className="flex items-center gap-3">
-        <button onClick={save} disabled={saving}
-          className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-50">
-          {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} Save policy
-        </button>
-        {saved && <span className="text-xs text-green-600">Saved ✓</span>}
+        <button onClick={saveFw} className="flex items-center gap-1.5 px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save framework</button>
+        {savedFw && <span className="text-xs text-green-600">Saved ✓</span>}
       </div>
+
+      {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); loadPolicies() }} onClose={() => setInterviewing(false)} />}
+      {viewing && <TranscriptViewer policy={viewing} onClose={() => setViewing(null)} />}
     </div>
   )
 }
@@ -247,100 +305,6 @@ function RegisterTab() {
   )
 }
 
-// ── Policies tab (interview-built, matchable, with a default) ──────────────────
-function PoliciesTab() {
-  const [policies, setPolicies] = useState(null)
-  const [editing, setEditing] = useState(null)        // manual editor
-  const [interviewing, setInterviewing] = useState(false)
-  const [viewing, setViewing] = useState(null)        // policy whose interview to view
-
-  const load = () => fetch('/api/risk/policies').then(r => r.json()).then(setPolicies).catch(() => setPolicies([]))
-  useEffect(() => { load() }, [])
-
-  async function saveManual(p) {
-    await fetch('/api/risk/policies', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: p.id, name: p.name, body: p.body, threshold: p.threshold ?? 10, enabled: p.enabled ?? true }),
-    })
-    setEditing(null); load()
-  }
-  async function remove(id) {
-    if (!confirm('Delete this policy?')) return
-    await fetch(`/api/risk/policies/${id}`, { method: 'DELETE' }); load()
-  }
-  async function setDefault(id) {
-    await fetch(`/api/risk/policies/${id}/default`, { method: 'POST' }); load()
-  }
-
-  if (!policies) return <Loading />
-
-  // First-run: no policies → big Start call-to-action.
-  if (policies.length === 0) {
-    return (
-      <div className="max-w-xl mx-auto px-6 py-16 text-center">
-        <ShieldCheck size={36} className="mx-auto mb-3 text-indigo-400" />
-        <h2 className="text-base font-bold text-gray-800">Build your risk policy</h2>
-        <p className="text-sm text-gray-500 mt-1 mb-5">
-          The Manager will interview you — one question at a time — about your organisation and risk
-          appetite, then draft a detailed policy with a suggested block-at-score threshold you can adjust.
-        </p>
-        <button onClick={() => setInterviewing(true)}
-          className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
-          <MessageSquareText size={16} /> Start the interview
-        </button>
-        {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); load() }} onClose={() => setInterviewing(false)} />}
-      </div>
-    )
-  }
-
-  const defaultId = policies.find(p => p.is_default)?.id
-  return (
-    <div className="max-w-3xl mx-auto px-6 py-6 space-y-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-500 shrink-0">Default policy:</span>
-          <select value={defaultId || ''} onChange={e => setDefault(e.target.value)}
-            className="input py-1 text-sm flex-1 min-w-0">
-            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold})</option>)}
-          </select>
-        </div>
-        <button onClick={() => setInterviewing(true)}
-          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shrink-0">
-          <MessageSquareText size={14} /> New policy
-        </button>
-      </div>
-      <p className="text-[11px] text-gray-400">The default policy drives the org baseline; in "Only matched" mode the Manager links tasks to whichever policy applies.</p>
-
-      {policies.map(p => (
-        <div key={p.id} className="border border-gray-200 rounded-xl p-3">
-          <div className="flex items-start gap-2">
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-semibold text-gray-800">{p.name || 'Untitled'}</span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">block ≥ {p.threshold}</span>
-                {p.is_default ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-600">default</span> : null}
-                {!p.enabled && <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-400">disabled</span>}
-              </div>
-              {p.summary && <p className="text-[11px] text-gray-500 mt-0.5">{p.summary}</p>}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {JSON.parse(p.transcript || '[]').length > 0 &&
-                <button onClick={() => setViewing(p)} className="text-[11px] text-gray-500 hover:underline">View interview</button>}
-              <button onClick={() => setEditing(p)} className="text-[11px] text-indigo-600 hover:underline">Edit</button>
-              <button onClick={() => remove(p.id)} className="p-1 text-gray-300 hover:text-red-500"><Trash2 size={14} /></button>
-            </div>
-          </div>
-        </div>
-      ))}
-
-      {editing && <PolicyEditor policy={editing} onSave={saveManual} onClose={() => setEditing(null)} />}
-      {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); load() }} onClose={() => setInterviewing(false)} />}
-      {viewing && <TranscriptViewer policy={viewing} onClose={() => setViewing(null)} />}
-    </div>
-  )
-}
-
-// Chat-style interview: the Manager asks one question at a time, then drafts the policy.
 function PolicyInterview({ onDone, onClose }) {
   const [msgs, setMsgs] = useState([])          // {role, content}
   const [input, setInput] = useState('')
@@ -359,7 +323,8 @@ function PolicyInterview({ onDone, onClose }) {
       })
       const d = await r.json()
       if (d.type === 'final') {
-        setFinal({ name: d.name || 'Risk Policy', appetite: d.appetite || '', threshold: d.threshold || 10, rationale: d.rationale || '' })
+        setFinal({ name: d.name || 'Risk Policy', appetite: d.appetite || '', threshold: d.threshold || 10,
+          review_frequency_months: d.review_frequency_months || 12, rationale: d.rationale || '' })
       } else {
         setMsgs(m => [...m, { role: 'assistant', content: d.question || '…' }])
       }
@@ -379,9 +344,10 @@ function PolicyInterview({ onDone, onClose }) {
     setSaving(true)
     await fetch('/api/risk/policies', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      // The backend makes the FIRST policy default automatically; otherwise the
-      // user chooses the default from the dropdown.
-      body: JSON.stringify({ name: final.name, body: final.appetite, threshold: final.threshold, transcript: msgs }),
+      // A freshly interviewed policy becomes the active global policy (the user can
+      // switch back via the selector).
+      body: JSON.stringify({ name: final.name, body: final.appetite, threshold: final.threshold,
+        review_frequency_months: final.review_frequency_months || 12, transcript: msgs, make_default: true }),
     })
     setSaving(false); onDone()
   }
@@ -465,36 +431,6 @@ function TranscriptViewer({ policy, onClose }) {
   )
 }
 
-function PolicyEditor({ policy, onSave, onClose }) {
-  const [p, setP] = useState(policy)
-  const set = (k, v) => setP(x => ({ ...x, [k]: v }))
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg" onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
-          <h3 className="text-sm font-bold text-gray-900">{p.id ? 'Edit policy' : 'New policy'}</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
-        </div>
-        <div className="p-5 space-y-3">
-          <input className="input" placeholder="Policy name (e.g. Customer Data Handling)" value={p.name} onChange={e => set('name', e.target.value)} />
-          <textarea className="input resize-y" rows={6} placeholder="Describe what this policy governs — the kinds of work, data, or actions it covers and the rules…" value={p.body} onChange={e => set('body', e.target.value)} />
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-600">Block at score</span>
-            <input type="number" min={1} max={25} className="input w-20 text-right" value={p.threshold} onChange={e => set('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))} />
-            <label className="flex items-center gap-1.5 text-sm text-gray-600 ml-2">
-              <input type="checkbox" checked={p.enabled} onChange={e => set('enabled', e.target.checked)} /> Enabled
-            </label>
-          </div>
-          <p className="text-[11px] text-gray-400">On save, an agent generates a one-line summary used to match tasks to this policy.</p>
-        </div>
-        <div className="px-5 py-3 border-t border-gray-100 flex justify-end gap-2">
-          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-xl">Cancel</button>
-          <button onClick={() => onSave(p)} disabled={!p.name.trim()} className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl disabled:opacity-40">Save policy</button>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 function Section({ title, hint, children }) {
   return (

@@ -1295,7 +1295,9 @@ async def set_risk_policy(req: RiskPolicyReq):
 
 @router.get("/risk/policies")
 async def list_named_policies():
-    return await database.list_risk_policies()
+    from .. import compliance
+    rows = await database.list_risk_policies()
+    return [{**p, **compliance.review_status(p)} for p in rows]
 
 
 class NamedPolicyReq(BaseModel):
@@ -1306,6 +1308,7 @@ class NamedPolicyReq(BaseModel):
     enabled: bool = True
     transcript: list = []     # the interview Q&A this policy was derived from
     make_default: bool = False
+    review_frequency_months: int = 12
 
 
 @router.post("/risk/policies")
@@ -1320,13 +1323,21 @@ async def save_named_policy(req: NamedPolicyReq):
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
-        "transcript": req.transcript or [],
+        "transcript": req.transcript or [], "review_frequency_months": req.review_frequency_months,
     })
-    # First policy becomes default automatically; or if explicitly requested.
+    # First policy becomes the active (default) global policy; or if requested.
     existing = await database.list_risk_policies()
     if req.make_default or len(existing) == 1:
         await database.set_default_risk_policy(pid)
     return await database.get_risk_policy_row(pid)
+
+
+@router.post("/risk/policies/{policy_id}/reviewed")
+async def mark_policy_reviewed(policy_id: str):
+    if not await database.get_risk_policy_row(policy_id):
+        raise HTTPException(404, "Policy not found")
+    await database.mark_policy_reviewed(policy_id)
+    return {"ok": True}
 
 
 @router.post("/risk/policies/{policy_id}/default")

@@ -113,15 +113,25 @@ class Orchestrator:
         outcome and post it into a 'Daily update' chat conversation."""
         import uuid
         from datetime import date
+        from . import compliance
         sops = await database.get_daily_sop_tasks()
-        if not sops or not self._ceo:
+        due_policies = await compliance.policies_due_for_review()
+        if (not sops and not due_policies) or not self._ceo:
             return
         today = date.today().isoformat()
         names = {a.config.id: a.config.name for a in self.get_agents()}
         failed = [t for t in sops if t.get("status") == "failed"]
 
-        lines = [f"## Daily update — {today}", "",
-                 f"Tracking **{len(sops)}** daily SOP task(s) across the team."]
+        lines = [f"## Daily update — {today}", ""]
+        # Policy review reminders first — these need the user's action.
+        if due_policies:
+            lines.append("### 📋 Policy reviews due")
+            for p in due_policies:
+                why = (" — " + p["reason"]) if p.get("reason") else (
+                    f" — last reviewed {p.get('last_reviewed') or 'never'}" if p.get("last_reviewed") else " — never reviewed")
+                lines.append(f"- **{p['name']}** is due for review{why}. Please review and mark it reviewed in Risk & Compliance.")
+            lines.append("")
+        lines.append(f"Tracking **{len(sops)}** daily SOP task(s) across the team.")
         by_agent: dict[str, list] = {}
         for t in sops:
             by_agent.setdefault(t["agent_id"], []).append(t)
@@ -358,6 +368,14 @@ class Orchestrator:
         # Second time still over threshold → hold for human approval.
         await database.update_task(task["id"], {"status": "on_hold", "result": result[:2000]})
         await self._notify_risk_hold(task, rec)
+        # A compliance hold is a "major incident" — flag the governing policy for
+        # review (orgs review policies annually AND after an incident).
+        if named_policy and named_policy.get("id"):
+            try:
+                await database.flag_policy_for_review(
+                    named_policy["id"], f"After incident: '{task.get('title','')[:60]}' held at {rec['level']} risk")
+            except Exception:
+                pass
         logger.info("[compliance] Task '%s' HELD for human approval (%s)",
                     task.get("title", "")[:40], rec["level"])
         return "hold"

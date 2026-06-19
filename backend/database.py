@@ -249,6 +249,10 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agent_tasks ADD COLUMN daily_sop INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE risk_policies ADD COLUMN transcript TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE risk_policies ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE risk_policies ADD COLUMN review_frequency_months INTEGER NOT NULL DEFAULT 12",
+        "ALTER TABLE risk_policies ADD COLUMN last_reviewed TEXT",
+        "ALTER TABLE risk_policies ADD COLUMN review_due INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE risk_policies ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
     ]:
         try:
             await _db.execute(migration)
@@ -892,16 +896,35 @@ async def get_risk_policy_row(policy_id: str) -> dict | None:
 
 
 async def save_risk_policy(p: dict) -> None:
+    from datetime import date
     await _conn().execute(
-        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled, transcript)
-           VALUES(?, ?, ?, ?, ?, ?, ?)
+        """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled, transcript,
+              review_frequency_months, last_reviewed)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET name=excluded.name, body=excluded.body,
              summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled,
-             transcript=excluded.transcript""",
+             transcript=excluded.transcript, review_frequency_months=excluded.review_frequency_months""",
         (p["id"], p.get("name", ""), p.get("body", ""), p.get("summary", ""),
          int(p.get("threshold", 10)), int(p.get("enabled", 1)),
-         json.dumps(p.get("transcript", [])) if not isinstance(p.get("transcript"), str) else p.get("transcript", "[]")),
+         json.dumps(p.get("transcript", [])) if not isinstance(p.get("transcript"), str) else p.get("transcript", "[]"),
+         int(p.get("review_frequency_months", 12)),
+         p.get("last_reviewed") or date.today().isoformat()),  # new policy counts as reviewed today
     )
+    await _conn().commit()
+
+
+async def mark_policy_reviewed(policy_id: str) -> None:
+    from datetime import date
+    await _conn().execute(
+        "UPDATE risk_policies SET last_reviewed = ?, review_due = 0, review_reason = '' WHERE id = ?",
+        (date.today().isoformat(), policy_id))
+    await _conn().commit()
+
+
+async def flag_policy_for_review(policy_id: str, reason: str) -> None:
+    await _conn().execute(
+        "UPDATE risk_policies SET review_due = 1, review_reason = ? WHERE id = ?",
+        (reason[:200], policy_id))
     await _conn().commit()
 
 
