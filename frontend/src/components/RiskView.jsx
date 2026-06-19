@@ -348,6 +348,7 @@ function PolicyInterview({ onDone, onClose }) {
   const [final, setFinal] = useState(null)      // {name, appetite, threshold, rationale}
   const [saving, setSaving] = useState(false)
   const endRef = useRef(null)
+  const started = useRef(false)
 
   async function step(history) {
     setBusy(true)
@@ -364,7 +365,7 @@ function PolicyInterview({ onDone, onClose }) {
       }
     } finally { setBusy(false) }
   }
-  useEffect(() => { step([]) }, [])
+  useEffect(() => { if (started.current) return; started.current = true; step([]) }, [])  // once, even under StrictMode
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, final])
 
   function send() {
