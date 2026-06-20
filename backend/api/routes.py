@@ -1309,6 +1309,7 @@ class NamedPolicyReq(BaseModel):
     transcript: list = []     # the interview Q&A this policy was derived from
     make_default: bool = False
     review_frequency_months: int = 12
+    rationale: str = ""       # how the block-at-score was derived
 
 
 @router.post("/risk/policies")
@@ -1320,10 +1321,16 @@ async def save_named_policy(req: NamedPolicyReq):
     summary = await compliance.summarise_policy(mgr, req.name, req.body)
     if not summary:  # fall back to the policy text so matching still works
         summary = (req.body or "").strip()[:240]
+    # Preserve the rationale on edits if the client didn't resend it.
+    rationale = req.rationale
+    if not rationale and req.id:
+        existing = await database.get_risk_policy_row(req.id)
+        rationale = (existing or {}).get("rationale", "")
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
         "transcript": req.transcript or [], "review_frequency_months": req.review_frequency_months,
+        "rationale": rationale,
     })
     # First policy becomes the active (default) global policy; or if requested.
     existing = await database.list_risk_policies()
@@ -1350,7 +1357,14 @@ async def set_default_policy(policy_id: str):
 
 @router.delete("/risk/policies/{policy_id}")
 async def delete_named_policy(policy_id: str):
+    row = await database.get_risk_policy_row(policy_id)
+    was_default = bool(row and row.get("is_default"))
     await database.delete_risk_policy(policy_id)
+    # If we deleted the active policy, promote another so the agent still has one.
+    if was_default:
+        remaining = await database.list_risk_policies()
+        if remaining:
+            await database.set_default_risk_policy(remaining[0]["id"])
     return {"ok": True}
 
 

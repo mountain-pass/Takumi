@@ -104,7 +104,8 @@ function PolicyTab() {
     await fetch('/api/risk/policies', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: active.id, name: active.name, body: active.body,
-        threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12 }),
+        threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12,
+        rationale: active.rationale || '' }),
     })
     setSavedPol(true); setTimeout(() => setSavedPol(false), 2500); loadPolicies()
   }
@@ -118,24 +119,40 @@ function PolicyTab() {
   }
   async function setDefault(id) { await fetch(`/api/risk/policies/${id}/default`, { method: 'POST' }); loadPolicies() }
   async function markReviewed() { await fetch(`/api/risk/policies/${active.id}/reviewed`, { method: 'POST' }); loadPolicies() }
+  function viewPolicy(id) { setActive(policies.find(p => p.id === id) || null); setSavedPol(false) }
+  async function deletePolicy() {
+    if (!active || !confirm(`Delete policy "${active.name || 'Untitled'}"? This cannot be undone.`)) return
+    await fetch(`/api/risk/policies/${active.id}`, { method: 'DELETE' }); loadPolicies()
+  }
 
   const threshold = active?.threshold || 10
   const lvl = LEVELS.find(l => l.key === levelOf(threshold))
   return (
     <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
-      {/* Active policy selector */}
-      <div className="flex items-center justify-between gap-3">
+      {/* Policy selector — view/edit any policy; the agent follows whichever is active */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-500 shrink-0">Active policy the agent follows:</span>
-          <select value={active?.id || ''} onChange={e => setDefault(e.target.value)} className="input py-1 text-sm flex-1 min-w-0">
-            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold})</option>)}
+          <span className="text-xs text-gray-500 shrink-0">Policy:</span>
+          <select value={active?.id || ''} onChange={e => viewPolicy(e.target.value)} className="input py-1 text-sm min-w-0">
+            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold}){p.is_default ? ' • active' : ''}</option>)}
           </select>
         </div>
-        <button onClick={() => setInterviewing(true)}
-          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shrink-0">
-          <MessageSquareText size={14} /> New policy
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {active && !active.is_default &&
+            <button onClick={() => setDefault(active.id)}
+              className="px-3 py-2 text-sm font-medium rounded-xl border border-indigo-300 text-indigo-700 hover:bg-indigo-50">Set as active</button>}
+          {active && policies.length > 1 &&
+            <button onClick={deletePolicy} title="Delete this policy"
+              className="px-3 py-2 text-sm font-medium rounded-xl border border-red-200 text-red-600 hover:bg-red-50">Delete</button>}
+          <button onClick={() => setInterviewing(true)}
+            className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+            <MessageSquareText size={14} /> New policy
+          </button>
+        </div>
       </div>
+      {active && active.is_default
+        ? <p className="text-[11px] text-green-600 -mt-3">✓ The agent follows this policy.</p>
+        : <p className="text-[11px] text-gray-400 -mt-3">Viewing an inactive policy — "Set as active" to make the agent follow it.</p>}
 
       {active && (
         <>
@@ -147,8 +164,8 @@ function PolicyTab() {
                 {active.overdue && <span className="ml-2 text-amber-700 font-semibold">⚠ review due{active.reason ? ` (${active.reason})` : ''}</span>}
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                {JSON.parse(active.transcript || '[]').length > 0 &&
-                  <button onClick={() => setViewing(active)} className="text-[11px] text-gray-500 hover:underline">View interview</button>}
+                {(JSON.parse(active.transcript || '[]').length > 0 || active.rationale) &&
+                  <button onClick={() => setViewing(active)} className="text-[11px] text-gray-500 hover:underline">Review policy</button>}
                 <button onClick={markReviewed} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white">Mark reviewed</button>
               </div>
             </div>
@@ -347,7 +364,8 @@ function PolicyInterview({ onDone, onClose }) {
       // A freshly interviewed policy becomes the active global policy (the user can
       // switch back via the selector).
       body: JSON.stringify({ name: final.name, body: final.appetite, threshold: final.threshold,
-        review_frequency_months: final.review_frequency_months || 12, transcript: msgs, make_default: true }),
+        review_frequency_months: final.review_frequency_months || 12, rationale: final.rationale || '',
+        transcript: msgs, make_default: true }),
     })
     setSaving(false); onDone()
   }
@@ -414,8 +432,16 @@ function TranscriptViewer({ policy, onClose }) {
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
           <div className="flex flex-wrap gap-2 text-[11px] mb-1">
             <span className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">block ≥ {policy.threshold}</span>
+            <span className="px-2 py-0.5 rounded bg-gray-100 text-gray-500">review every {policy.review_frequency_months || 12} months</span>
           </div>
+          {policy.rationale && (
+            <div className="rounded-lg bg-amber-50 border border-amber-100 p-3">
+              <p className="text-[11px] font-semibold text-amber-700 uppercase mb-1">How the block-at-score was derived</p>
+              <p className="text-sm text-gray-700 whitespace-pre-wrap">{policy.rationale}</p>
+            </div>
+          )}
           {transcript.length === 0 && <p className="text-sm text-gray-400">No interview transcript (created manually).</p>}
+          {transcript.length > 0 && <p className="text-[11px] font-semibold text-gray-400 uppercase">Interview</p>}
           {transcript.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
               <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-700'}`}>{m.content}</div>
