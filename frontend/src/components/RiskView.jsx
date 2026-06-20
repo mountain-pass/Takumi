@@ -581,7 +581,7 @@ function PolicyInterview({ onDone, onClose }) {
                 return (
                   <div key={i} className="space-y-2">
                     <div className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>
+                      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm text-left ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>
                         {m.scenario && <span className="block text-[10px] font-semibold text-indigo-500 uppercase mb-1">Scenario — would this be acceptable?</span>}
                         {m.content}
                       </div>
@@ -671,7 +671,7 @@ function TranscriptViewer({ policy, onClose }) {
           {transcript.length > 0 && <p className="text-[11px] font-semibold text-gray-400 uppercase">Interview</p>}
           {transcript.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-700'}`}>{m.content}</div>
+              <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm text-left ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-700'}`}>{m.content}</div>
             </div>
           ))}
           <div className="border-t border-gray-100 pt-3">
