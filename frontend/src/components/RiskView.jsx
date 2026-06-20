@@ -5,7 +5,7 @@
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
 import React, { useState, useEffect, useRef } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History, Info } from 'lucide-react'
+import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History, Info, Lock } from 'lucide-react'
 import { useBackdropDismiss } from './useBackdropDismiss'
 
 const MODES = [
@@ -439,29 +439,62 @@ function ImpactTableView({ table }) {
 
 function RiskMatrix({ threshold, like = [], cons = [] }) {
   const rows = [5, 4, 3, 2, 1] // consequence high → low
+  const cols = [1, 2, 3, 4, 5]
+  const gridCols = { display: 'grid', gridTemplateColumns: '6rem repeat(5, 3.25rem)', gap: '0.25rem' }
   return (
-    <div className="inline-block text-[10px]">
-      <div className="flex">
-        <div className="w-24" />
-        {[1, 2, 3, 4, 5].map(l => (
-          <div key={l} className="w-12 text-center text-gray-400 truncate" title={like[l - 1]?.definition || like[l - 1]?.label}>{l}</div>
-        ))}
+    <div className="inline-flex items-stretch gap-1.5 text-[10px] select-none">
+      {/* Consequence axis (vertical) */}
+      <div className="flex items-center pb-8">
+        <span className="font-semibold uppercase tracking-wider text-gray-400 whitespace-nowrap"
+          style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>Consequence →</span>
       </div>
-      {rows.map(c => (
-        <div key={c} className="flex items-center">
-          <div className="w-24 text-right pr-2 text-gray-400 truncate" title={cons[c - 1]?.definition || ''}>{c} {cons[c - 1]?.label || ''}</div>
-          {[1, 2, 3, 4, 5].map(l => {
-            const s = l * c
-            const blocked = s >= threshold
-            return (
-              <div key={l} className={`w-12 h-9 m-px rounded flex items-center justify-center font-semibold text-gray-800 ${cellTone(s)} ${blocked ? 'ring-2 ring-gray-800/40' : ''}`}>
-                {s}
+
+      <div>
+        <div style={gridCols}>
+          {/* corner + likelihood headers */}
+          <div />
+          {cols.map(l => (
+            <div key={l} className="text-center leading-tight pb-0.5" title={like[l - 1]?.definition || like[l - 1]?.label}>
+              <div className="font-bold text-gray-600">{l}</div>
+              <div className="text-gray-400 truncate">{like[l - 1]?.label || ''}</div>
+            </div>
+          ))}
+
+          {/* rows: consequence label + cells */}
+          {rows.map(c => (
+            <React.Fragment key={c}>
+              <div className="flex flex-col items-end justify-center pr-2 text-right leading-tight" title={cons[c - 1]?.definition || ''}>
+                <span className="font-bold text-gray-600">{c}</span>
+                <span className="text-gray-400">{cons[c - 1]?.label || ''}</span>
               </div>
-            )
-          })}
+              {cols.map(l => {
+                const s = l * c
+                const blocked = s >= threshold
+                return (
+                  <div key={l}
+                    className={`h-10 rounded-lg flex items-center justify-center font-bold text-gray-800 transition-shadow ${cellTone(s)} ${
+                      blocked ? 'ring-2 ring-gray-900/70 shadow-sm' : 'opacity-80'}`}
+                    title={`Likelihood ${l} × Consequence ${c} = ${s}${blocked ? ' — blocked' : ''}`}>
+                    {blocked
+                      ? <span className="flex items-center gap-0.5"><Lock size={9} className="opacity-60" />{s}</span>
+                      : <span className="text-[11px]">{s}</span>}
+                  </div>
+                )
+              })}
+            </React.Fragment>
+          ))}
+
+          {/* bottom likelihood axis (aligned under the cells) */}
+          <div />
+          <div className="col-span-5 text-center font-semibold uppercase tracking-wider text-gray-400 pt-1">Likelihood →</div>
         </div>
-      ))}
-      <div className="flex mt-1"><div className="w-24" /><div className="text-gray-400">Likelihood → · ⬛ ring = at/above threshold</div></div>
+
+        {/* legend */}
+        <div className="flex items-center gap-1.5 text-gray-400 mt-2" style={{ paddingLeft: '6.25rem' }}>
+          <span className="inline-flex items-center justify-center w-4 h-4 rounded ring-2 ring-gray-900/70 bg-gray-100"><Lock size={8} /></span>
+          at / above the block-at-score ({threshold}) — blocked
+        </div>
+      </div>
     </div>
   )
 }
