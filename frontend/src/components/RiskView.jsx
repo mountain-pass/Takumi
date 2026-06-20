@@ -90,6 +90,9 @@ function PolicyTab() {
   const [viewing, setViewing] = useState(null)
   const [savedFw, setSavedFw] = useState(false)
   const [savedPol, setSavedPol] = useState(false)
+  const [savingFw, setSavingFw] = useState(false)
+  const [savingPol, setSavingPol] = useState(false)
+  const [reviewing, setReviewing] = useState(false)
 
   const loadFw = () => fetch('/api/risk/policy').then(r => r.json()).then(setFw).catch(() => setFw({}))
   const loadPolicies = () => fetch('/api/risk/policies').then(r => r.json()).then(list => {
@@ -126,24 +129,37 @@ function PolicyTab() {
     setFwField('categories', cats.includes(c) ? cats.filter(x => x !== c) : [...cats, c])
   }
   async function savePolicy() {
-    await fetch('/api/risk/policies', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: active.id, name: active.name, body: active.body,
-        threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12,
-        rationale: active.rationale || '', impact_table: normImpactTable(active.impact_table) }),
-    })
-    setSavedPol(true); setTimeout(() => setSavedPol(false), 2500); loadPolicies()
+    setSavingPol(true)
+    try {
+      await fetch('/api/risk/policies', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: active.id, name: active.name, body: active.body,
+          threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12,
+          rationale: active.rationale || '', impact_table: normImpactTable(active.impact_table) }),
+      })
+      await loadPolicies()
+      setSavedPol(true); setTimeout(() => setSavedPol(false), 2500)
+    } finally { setSavingPol(false) }
   }
   async function saveFw() {
-    await fetch('/api/risk/policy', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ categories: fw.categories, likelihood_scale: fw.likelihood_scale,
-        consequence_scale: fw.consequence_scale, mode: fw.mode }),
-    })
-    setSavedFw(true); setTimeout(() => setSavedFw(false), 2500)
+    setSavingFw(true)
+    try {
+      await fetch('/api/risk/policy', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categories: fw.categories, likelihood_scale: fw.likelihood_scale,
+          consequence_scale: fw.consequence_scale, mode: fw.mode }),
+      })
+      setSavedFw(true); setTimeout(() => setSavedFw(false), 2500)
+    } finally { setSavingFw(false) }
   }
   async function setDefault(id) { await fetch(`/api/risk/policies/${id}/default`, { method: 'POST' }); loadPolicies() }
-  async function markReviewed() { await fetch(`/api/risk/policies/${active.id}/reviewed`, { method: 'POST' }); loadPolicies() }
+  async function markReviewed() {
+    setReviewing(true)
+    try {
+      await fetch(`/api/risk/policies/${active.id}/reviewed`, { method: 'POST' })
+      await loadPolicies()
+    } finally { setReviewing(false) }
+  }
   function viewPolicy(id) { setActive(policies.find(p => p.id === id) || null); setSavedPol(false) }
   async function deletePolicy() {
     if (!active || !confirm(`Delete policy "${active.name || 'Untitled'}"? This cannot be undone.`)) return
@@ -193,7 +209,8 @@ function PolicyTab() {
                 <b className="text-gray-800">Review:</b> last {active.last_reviewed || 'never'} · next due {active.next_review || '—'} · every {active.review_frequency_months || 12} months
                 {active.overdue && <span className="ml-2 text-amber-700 font-semibold">⚠ review due{active.reason ? ` (${active.reason})` : ''}</span>}
               </div>
-              <button onClick={markReviewed} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shrink-0">Mark reviewed</button>
+              <button onClick={markReviewed} disabled={reviewing} className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shrink-0 disabled:opacity-60">
+                {reviewing && <Loader2 size={12} className="animate-spin" />}{reviewing ? 'Saving…' : 'Mark reviewed'}</button>
             </div>
           </div>
         )}
@@ -233,7 +250,8 @@ function PolicyTab() {
           </Section>
 
           <div className="flex items-center gap-3 pt-1">
-            <button onClick={savePolicy} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save policy</button>
+            <button onClick={savePolicy} disabled={savingPol} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-60">
+              {savingPol ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} {savingPol ? 'Saving…' : 'Save policy'}</button>
             {savedPol && <span className="text-xs text-green-600">Saved ✓</span>}
           </div>
         </Card>
@@ -285,7 +303,8 @@ function PolicyTab() {
         </Section>
 
         <div className="flex items-center gap-3 pt-1">
-          <button onClick={saveFw} className="flex items-center gap-1.5 px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save framework</button>
+          <button onClick={saveFw} disabled={savingFw} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-60">
+            {savingFw ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} {savingFw ? 'Saving…' : 'Save framework'}</button>
           {savedFw && <span className="text-xs text-green-600">Saved ✓</span>}
         </div>
       </Card>
