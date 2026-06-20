@@ -334,6 +334,16 @@ function PolicyInterview({ onDone, onClose }) {
   const [saving, setSaving] = useState(false)
   const endRef = useRef(null)
   const started = useRef(false)
+  const taRef = useRef(null)
+
+  // Auto-grow the answer box with content, up to half the viewport, then scroll.
+  function autosize() {
+    const el = taRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, window.innerHeight * 0.5) + 'px'
+  }
+  useEffect(() => { autosize() }, [input])
 
   async function step(history) {
     setBusy(true)
@@ -393,10 +403,12 @@ function PolicyInterview({ onDone, onClose }) {
               {busy && <div className="flex justify-start"><div className="bg-gray-100 rounded-2xl px-3.5 py-2"><Loader2 size={14} className="animate-spin text-gray-400" /></div></div>}
               <div ref={endRef} />
             </div>
-            <div className="px-4 py-3 border-t border-gray-100 flex gap-2">
-              <input className="input flex-1" placeholder="Type your answer…" value={input}
-                onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} disabled={busy} />
-              <button onClick={send} disabled={busy || !input.trim()} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-40">Send</button>
+            <div className="px-4 py-3 border-t border-gray-100 flex gap-2 items-end">
+              <textarea ref={taRef} rows={1} className="input flex-1 resize-none overflow-y-auto leading-relaxed"
+                placeholder="Type your answer… (Enter to send, Shift+Enter for a new line)" value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} disabled={busy} />
+              <button onClick={send} disabled={busy || !input.trim()} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium disabled:opacity-40 shrink-0">Send</button>
             </div>
           </>
         ) : (
