@@ -6,6 +6,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { Plus, X, Trash2, Check, Network, Pencil, KeyRound } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import { useBackdropDismiss } from './useBackdropDismiss'
 import {
   useAgents, useConnections,
   useUpdateAgent, useRemoveAgent,
@@ -95,8 +96,8 @@ function DotGrid() {
 function LabelModal({ title, initial, onConfirm, onCancel }) {
   const [label, setLabel] = useState(initial || '')
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onMouseDown={onCancel}>
-      <div className="bg-white rounded-2xl shadow-2xl p-6 w-80 space-y-4" onMouseDown={e => e.stopPropagation()}>
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" {...useBackdropDismiss(onCancel)}>
+      <div className="bg-white rounded-2xl shadow-2xl p-6 w-80 space-y-4">
         <h3 className="font-semibold text-gray-900">{title || 'Label this connection'}</h3>
         <p className="text-xs text-gray-400">Describe the relationship (e.g. "delegates research to")</p>
         <input

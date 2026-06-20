@@ -11,6 +11,7 @@ import {
 import AgentDesk from './AgentDesk'
 import { useOrgStore } from '../stores/orgStore'
 import { useAgentTasks, useCreateTask, useUpdateTask, useDeleteTask } from '../hooks/useApi'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 // Tokens in plain English (no locale-specific grouping like "万").
 const fmtTokens = (n) => (n || 0).toLocaleString('en-US')
@@ -778,7 +779,7 @@ function CreateTaskModal({ agents, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" {...useBackdropDismiss(onClose)}>
       <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-base font-bold text-gray-900">Create Task</h2>

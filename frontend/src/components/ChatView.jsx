@@ -5,6 +5,7 @@ import {
   ExternalLink, LayoutDashboard, AlertTriangle,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 const API = '/api'
 const apiFetch = (url, opts) => fetch(url, opts).then(async r => {
@@ -603,6 +604,7 @@ function ChatBubble({ message }) {
   const artifacts = message.artifacts || []
   const openArtifact = useOrgStore(s => s.openArtifact)
   const [lightbox, setLightbox] = useState(null)
+  const lightboxDismiss = useBackdropDismiss(() => setLightbox(null))
 
   if (message.selfHeal) return <SelfHealCard sh={message.selfHeal} />
   if (message.riskHold) return <RiskHoldCard rh={message.riskHold} />
@@ -682,7 +684,7 @@ function ChatBubble({ message }) {
           </div>
         )}
         {lightbox && (
-          <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-6" onClick={() => setLightbox(null)}>
+          <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-6" {...lightboxDismiss}>
             <img src={lightbox} alt="" className="max-w-full max-h-full object-contain" onClick={e => e.stopPropagation()} />
             <button onClick={() => setLightbox(null)} className="absolute top-4 right-4 text-white/80 hover:text-white"><X size={24} /></button>
             <a href={lightbox} download="image.png" onClick={e => e.stopPropagation()}

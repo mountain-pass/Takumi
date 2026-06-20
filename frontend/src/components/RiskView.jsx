@@ -6,6 +6,7 @@
  */
 import React, { useState, useEffect, useRef } from 'react'
 import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText } from 'lucide-react'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 const MODES = [
   { id: 'all', label: 'All tasks', hint: 'Every task is reviewed against the org policy.' },
@@ -481,8 +482,8 @@ function PolicyInterview({ onDone, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className={`bg-white rounded-2xl shadow-2xl w-full ${final ? 'max-w-3xl' : 'max-w-xl'} max-h-[88vh] flex flex-col`} onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" {...useBackdropDismiss(onClose)}>
+      <div className={`bg-white rounded-2xl shadow-2xl w-full ${final ? 'max-w-3xl' : 'max-w-xl'} max-h-[88vh] flex flex-col`}>
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
           <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2"><MessageSquareText size={16} className="text-indigo-500" /> Policy interview</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
@@ -560,8 +561,8 @@ function PolicyInterview({ onDone, onClose }) {
 function TranscriptViewer({ policy, onClose }) {
   const transcript = JSON.parse(policy.transcript || '[]')
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" {...useBackdropDismiss(onClose)}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
           <h3 className="text-sm font-bold text-gray-900">How "{policy.name}" was derived</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>

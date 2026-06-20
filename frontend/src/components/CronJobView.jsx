@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import { useAgentTasks, useCreateTask, useUpdateTask, useDeleteTask } from '../hooks/useApi'
 import { useOrgStore } from '../stores/orgStore'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 const SCHEDULE_OPTIONS = [
   { value: '@hourly', label: 'Every hour' },
@@ -469,8 +470,8 @@ function CreateSOPModal({ agents, onClose }) {
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }))
 
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6" onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" {...useBackdropDismiss(onClose)}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6">
         <div className="flex items-center justify-between mb-5">
           <div>
             <h2 className="text-base font-bold text-gray-900">New SOP / Scheduled Job</h2>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { Plug, Plus, Trash2, RefreshCw, X, CheckCircle2, AlertCircle, Loader2, Server, Lock, LogIn, LogOut } from 'lucide-react'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 const API = '/api'
 const apiFetch = (url, opts) => fetch(url, opts).then(async r => {
@@ -223,8 +224,8 @@ function ServerModal({ server, onClose, onSaved }) {
 
   const isStdio = form.transport === 'stdio'
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5" onClick={e => e.stopPropagation()}>
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4" {...useBackdropDismiss(onClose)}>
+      <div className="bg-white rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-semibold text-gray-800">{server.id ? 'Edit MCP Server' : 'Add MCP Server'}</h3>
           <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
