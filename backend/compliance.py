@@ -493,11 +493,111 @@ _INTERVIEW_SYSTEM = (
     "\"impact_table\":[{\"category\":\"financial\",\"definitions\":[\"<sev1>\",\"<sev2>\",\"<sev3>\","
     "\"<sev4>\",\"<sev5>\"]}, ... one row per category: financial, data_privacy, security, "
     "legal_compliance, reputational, operational],"
-    "\"threshold\":<int 1-25 block-at-score, applied uniformly>,"
+    "\"threshold\":<int 1-25 block-at-score, applied uniformly. HIGHER = MORE risk-tolerant "
+    "(only the most severe work is blocked); LOWER = cautious. Set it to MATCH how tolerant their "
+    "answers were — a very risk-tolerant person should get a HIGH threshold (18-22), a cautious "
+    "person a LOW one (5-8); 10-13 is balanced>,"
     "\"review_frequency_months\":<int, e.g. 12 for annual>,"
     "\"rationale\":\"<why this threshold and how the impact table reflects their scenario answers>\"}\n"
-    "Each impact cell is a short concrete definition tuned to their answers. Output JSON and nothing else."
+    "In 'appetite', FIX all spelling, typos and grammar from the user's answers and write it cleanly "
+    "and professionally — do NOT quote their raw text. Each impact cell is a short concrete definition "
+    "tuned to their answers. Output JSON and nothing else."
 )
+
+
+# Dedicated, retried finalisation — isolating the heavy JSON from the per-turn prompt
+# makes it far more reliable than asking for "next turn OR final" in one shot.
+_FINALIZE_SYSTEM = (
+    "You are writing a company's ISO 31000 risk policy from a COMPLETED interview. Respond with "
+    "STRICT JSON only, keys: name, appetite, threshold, impact_table, review_frequency_months, "
+    "rationale.\n"
+    "- appetite: a clean, professional 2-4 sentence summary of their risk appetite. FIX every "
+    "spelling mistake, typo and grammar error from the user; do NOT quote their raw words.\n"
+    "- threshold: the block-at-score on the 5×5 matrix (1-25), applied uniformly. HIGHER = MORE "
+    "risk-tolerant (only the most severe risks are blocked); LOWER = cautious. Choose it to MATCH "
+    "their tolerance: very tolerant → 18-22, balanced → 10-13, cautious → 5-8.\n"
+    "- impact_table: one row per category [financial, data_privacy, security, legal_compliance, "
+    "reputational, operational], each with 5 short severity definitions (levels 1-5) tuned to them.\n"
+    "- review_frequency_months: integer (12 = annual).\n"
+    "- rationale: 1-2 sentences on why this threshold, referencing their tolerance.\n"
+    "Output JSON and nothing else."
+)
+
+
+# Risk-tolerance signal phrases for the heuristic block-at-score (last resort only).
+_TOLERANT_HINTS = (
+    "acceptable", "not a concern", "not a major concern", "not a big deal", "tolerable",
+    "part of doing business", "i can live with", "live with it", "wait it out", "wait out",
+    "low concern", "not worried", "fine by me", "yolo", "manageable", "move on", "earn it back",
+    "pay the fine", "hold the position", "not a problem",
+)
+_AVERSE_HINTS = (
+    "never", "unacceptable", "not acceptable", "must not", "must never", "avoid at all costs",
+    "zero tolerance", "prevent", "sign-off", "sign off", "explicit approval", "approval required",
+    "cannot happen", "can't happen", "at all costs", "critical that",
+)
+
+
+def _infer_threshold(answers: list[str]) -> int:
+    """Heuristic block-at-score from interview answers: more tolerant answers → higher
+    threshold (block only the worst); more risk-averse → lower threshold (block sooner)."""
+    tol = av = 0
+    for a in answers:
+        low = (a or "").lower()
+        if any(h in low for h in _AVERSE_HINTS):
+            av += 1
+        elif any(h in low for h in _TOLERANT_HINTS):
+            tol += 1
+    return max(5, min(22, 10 + 3 * (tol - av)))
+
+
+def _scripted_synthesise(history: list[dict]) -> dict:
+    """Heuristic final policy when no LLM is available — derives the block-at-score from
+    the answers and writes a clean (typo-free) summary instead of echoing raw text."""
+    answers = [m.get("content", "") for m in (history or []) if m.get("role") == "user"]
+    threshold = _infer_threshold(answers)
+    appetite_level = "high" if threshold >= 16 else "moderate" if threshold >= 10 else "low"
+    appetite = (
+        f"This organisation has a {appetite_level} appetite for risk. Impact severities are tuned per "
+        f"category below, and a single block-at-score of {threshold} applies uniformly across every "
+        f"category. The policy is reviewed at least annually and after any major incident."
+    )
+    rationale = (
+        f"Block-at-score set to {threshold} to match the {appetite_level} risk tolerance expressed in "
+        f"the interview. A higher score blocks only the most severe risks; a lower one is more cautious."
+    )
+    return {"type": "final", "name": "Risk Policy", "appetite": appetite, "threshold": threshold,
+            "review_frequency_months": 12,
+            "impact_table": [dict(r) for r in DEFAULT_IMPACT_TABLE], "rationale": rationale}
+
+
+async def _finalize_policy(manager_agent, history: list[dict]) -> dict:
+    """Build the final policy from the full transcript with a dedicated, retried call.
+    Falls back to the heuristic synthesis if the model can't produce valid JSON."""
+    transcript = "\n".join(
+        f'{"Interviewer" if m.get("role") == "assistant" else "User"}: {m.get("content", "")}'
+        for m in (history or []))
+    if manager_agent is not None and transcript.strip():
+        for _ in range(3):
+            try:
+                resp = await manager_agent._adapter.complete(
+                    system_prompt=_FINALIZE_SYSTEM,
+                    messages=[{"role": "user", "content": transcript[:6000]}],
+                    model=manager_agent.config.llm_model, max_tokens=1200)
+                data = _parse_json(resp.content)
+                if isinstance(data, dict) and (data.get("appetite") or data.get("impact_table")):
+                    return {
+                        "type": "final",
+                        "name": str(data.get("name") or "Risk Policy")[:80],
+                        "appetite": str(data.get("appetite") or "").strip(),
+                        "threshold": max(1, min(25, int(data.get("threshold", 10) or 10))),
+                        "review_frequency_months": max(1, min(60, int(data.get("review_frequency_months", 12) or 12))),
+                        "impact_table": _norm_impact_table(data.get("impact_table")),
+                        "rationale": str(data.get("rationale") or "").strip(),
+                    }
+            except Exception as e:
+                logger.warning("[compliance] finalize failed: %s", e)
+    return _scripted_synthesise(history)
 
 
 # Scripted turns used when the Manager's LLM can't return parseable JSON, so the
@@ -534,19 +634,7 @@ def _scripted_step(history: list[dict]) -> dict:
     asked = sum(1 for m in (history or []) if m.get("role") == "assistant")
     if asked < len(_FALLBACK_TURNS):
         return dict(_FALLBACK_TURNS[asked])
-    answers = [m.get("content", "") for m in (history or []) if m.get("role") == "user"]
-    joined = "; ".join(a.strip() for a in answers if a.strip())
-    appetite = (
-        "Risk appetite calibrated from your interview answers" +
-        (f": {joined}." if joined else ".") +
-        " Impact severities are tuned per category below; a single block-at-score applies "
-        "uniformly. Reviewed at least annually and after any major incident."
-    )
-    return {"type": "final", "name": "Risk Policy", "appetite": appetite, "threshold": 10,
-            "review_frequency_months": 12,
-            "impact_table": [dict(r) for r in DEFAULT_IMPACT_TABLE],
-            "rationale": "Block-at-score set to 10 (start of the High band) as a balanced default; "
-                         "appetite is encoded in the impact table so the block applies uniformly."}
+    return _scripted_synthesise(history)
 
 
 async def policy_interview(manager_agent, history: list[dict]) -> dict:
@@ -592,7 +680,13 @@ async def policy_interview(manager_agent, history: list[dict]) -> dict:
             last_err = e
     if last_err:
         logger.warning("[compliance] interview step failed: %s", last_err)
-    # LLM unavailable or stuck repeating — use the scripted sequence so we progress.
+    # The per-turn prompt failed. If the user has answered enough, finalise with the
+    # dedicated (retried) builder so the block-at-score reflects their answers and the
+    # summary is cleaned up — rather than the fixed-10 scripted default. Otherwise ask
+    # the next scripted question so the interview keeps moving.
+    answered = sum(1 for m in (history or []) if m.get("role") == "user")
+    if answered >= 5:
+        return await _finalize_policy(manager_agent, history)
     return _scripted_step(history)
 
 
