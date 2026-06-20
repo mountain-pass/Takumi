@@ -5,7 +5,7 @@
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
 import React, { useState, useEffect, useRef } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History } from 'lucide-react'
+import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History, Info } from 'lucide-react'
 import { useBackdropDismiss } from './useBackdropDismiss'
 
 const MODES = [
@@ -202,13 +202,19 @@ function PolicyTab() {
       {/* ── The policy document: appetite (impact table) → matrix → summary ── */}
       {active && (
         <Card>
-          <CardHeader title="The policy" subtitle="Your risk appetite, expressed as the impact table. The likelihood scale and 5×5 matrix are generic — appetite is set here, so one block-at-score applies uniformly." />
+          <CardHeader title="The policy"
+            subtitle="Your risk appetite, expressed as the impact table. The likelihood scale and 5×5 matrix are generic — appetite is set here, so one block-at-score applies uniformly."
+            info="A policy is YOUR organisation's risk appetite — how much risk you're willing to accept. You can save several, but only one is active (the one the agent follows). It owns the impact table, the block-at-score, the review cadence, and the interview it was derived from. This is the opinionated 'where you draw the line' part — change it per organisation, re-interview, overwrite or delete it freely." />
 
-          <Section title="Impact table — your risk appetite" hint="Tune what each severity means per category. Lowering a category's impact lowers its appetite.">
+          <Section title="Impact table — your risk appetite"
+            hint="Tune what each severity means per category. Lowering a category's impact lowers its appetite."
+            info="The heart of the policy. For each category, it defines what severity 1–5 actually MEANS for you. This is where appetite lives: making 'a large financial loss' only count as Moderate lowers your financial appetite. Because every category is tuned onto the same 1–5 axis, a single block-at-score can apply uniformly — a '5' is equally unacceptable whether it's financial or operational.">
             <ImpactTableEditor table={active.impact_table} onChange={t => setA('impact_table', t)} />
           </Section>
 
-          <Section title="Block-at-score & risk matrix" hint="A single uniform threshold across every category. The matrix shows where it bites.">
+          <Section title="Block-at-score & risk matrix"
+            hint="A single uniform threshold across every category. The matrix shows where it bites."
+            info="The block-at-score is the single threshold (1–25) at or above which work is blocked. Higher = more risk-tolerant (only the most severe work is blocked); lower = cautious. The 5×5 matrix (likelihood × consequence) is the generic measuring instrument — it shows which cells fall at or above your threshold.">
             <div className="flex items-center gap-3 flex-wrap">
               <span className="text-sm text-gray-700">Block at score</span>
               <input type="number" min={1} max={25} value={threshold} onChange={e => setA('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))} className="w-20 input text-right" />
@@ -220,7 +226,9 @@ function PolicyTab() {
             <div className="mt-4 flex justify-center"><RiskMatrix threshold={threshold} like={GENERIC_LIKELIHOOD} cons={SEVERITY_SCALE} /></div>
           </Section>
 
-          <Section title="Summary (optional prose)" hint="A plain-language summary. Keep it consistent with the impact table above.">
+          <Section title="Summary (optional prose)"
+            hint="A plain-language summary. Keep it consistent with the impact table above."
+            info="An optional human-readable summary of the policy. It's for people to read — the agent scores against the impact table, not this text — so keep it consistent with the table above.">
             <textarea rows={4} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
           </Section>
 
@@ -233,9 +241,13 @@ function PolicyTab() {
 
       {/* ── Org-wide scoring framework: mode, generic scale, categories ── */}
       <Card>
-        <CardHeader title="Scoring framework" subtitle="Org-wide settings shared by every policy — how much work is reviewed, the generic likelihood scale, and which categories are scored." />
+        <CardHeader title="Scoring framework"
+          subtitle="Org-wide settings shared by every policy — how much work is reviewed, the generic likelihood scale, and which categories are scored."
+          info="The framework is the shared, generic scoring machinery every policy is measured with — the ruler, not where you draw the line. It holds the likelihood scale, the 5×5 matrix maths, the categories, and the review mode. It doesn't express appetite; swap policies and the framework stays identical. In short: the framework is HOW risk is measured; the policy is WHERE you decide it's too much." />
 
-        <Section title="Compliance review mode" hint="How much work the Risk & Compliance agent gates (requires a Risk & Compliance agent).">
+        <Section title="Compliance review mode"
+          hint="How much work the Risk & Compliance agent gates (requires a Risk & Compliance agent)."
+          info="Controls HOW MUCH work goes through compliance review. 'All tasks' reviews everything; 'All tasks, unless excluded' reviews everything unless you explicitly tell the Manager to skip a task (each bypass is logged in the Audit tab); 'Off' disables review entirely.">
           <div className="space-y-2">
             {MODES.map(m => (
               <button key={m.id} onClick={() => setFwField('mode', m.id)}
@@ -250,11 +262,15 @@ function PolicyTab() {
           </div>
         </Section>
 
-        <Section title="Likelihood scale (1–5) — generic" hint="The same generic likelihood scale applies to every policy. Consequence severity lives in each policy's impact table.">
+        <Section title="Likelihood scale (1–5) — generic"
+          hint="The same generic likelihood scale applies to every policy. Consequence severity lives in each policy's impact table."
+          info="Defines how PROBABLE something is, from Rare (1) to Almost certain (5). It's generic and shared by every policy — it almost never changes. Likelihood × consequence gives the 1–25 score. Note: consequence severity is NOT set here; that lives in each policy's impact table.">
           <ScaleEditor scale={fw.likelihood_scale} onChange={s => setFwField('likelihood_scale', s)} />
         </Section>
 
-        <Section title="Risk categories" hint="Which categories the agent scores against.">
+        <Section title="Risk categories"
+          hint="Which categories the agent scores against."
+          info="The set of risk categories the agent scores every task against (financial, data privacy, security, legal/compliance, reputational, operational). The overall score is the highest category risk, so turning a category off means it's no longer considered.">
           <div className="flex flex-wrap gap-2">
             {(fw.all_categories || fw.categories || []).map(c => {
               const on = (fw.categories || []).includes(c)
@@ -284,10 +300,37 @@ function Card({ children }) {
   return <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-5">{children}</div>
 }
 
-function CardHeader({ title, subtitle }) {
+// Click-to-open (i) tooltip explaining what a section is for.
+function InfoTip({ text }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+  return (
+    <span ref={ref} className="relative inline-flex align-middle">
+      <button type="button" onClick={() => setOpen(o => !o)} title="What's this?"
+        className={`text-gray-300 hover:text-indigo-500 transition-colors ${open ? 'text-indigo-500' : ''}`}>
+        <Info size={13} />
+      </button>
+      {open && (
+        <span className="absolute left-1/2 -translate-x-1/2 top-6 z-30 w-64 rounded-xl border border-gray-200 bg-white p-3 text-[11px] leading-relaxed text-gray-600 shadow-lg normal-case font-normal tracking-normal">
+          {text}
+        </span>
+      )}
+    </span>
+  )
+}
+
+function CardHeader({ title, subtitle, info }) {
   return (
     <div className="border-b border-gray-100 pb-3">
-      <h2 className="text-base font-bold text-gray-900">{title}</h2>
+      <h2 className="text-base font-bold text-gray-900 flex items-center gap-1.5">
+        {title}{info && <InfoTip text={info} />}
+      </h2>
       {subtitle && <p className="text-xs text-gray-400 mt-0.5">{subtitle}</p>}
     </div>
   )
@@ -685,11 +728,13 @@ function TranscriptViewer({ policy, onClose }) {
 }
 
 
-function Section({ title, hint, children }) {
+function Section({ title, hint, info, children }) {
   return (
     <div className="space-y-2">
       <div>
-        <h2 className="text-sm font-semibold text-gray-700">{title}</h2>
+        <h2 className="text-sm font-semibold text-gray-700 flex items-center gap-1.5">
+          {title}{info && <InfoTip text={info} />}
+        </h2>
         {hint && <p className="text-[11px] text-gray-400">{hint}</p>}
       </div>
       {children}
