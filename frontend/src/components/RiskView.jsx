@@ -172,7 +172,7 @@ function PolicyTab() {
             {active && !active.is_default &&
               <button onClick={() => setDefault(active.id)}
                 className="px-3 py-2 text-sm font-medium rounded-xl border border-indigo-300 text-indigo-700 hover:bg-indigo-50">Set as active</button>}
-            {active && policies.length > 1 &&
+            {active &&
               <button onClick={deletePolicy} title="Delete this policy"
                 className="px-3 py-2 text-sm font-medium rounded-xl border border-red-200 text-red-600 hover:bg-red-50">Delete</button>}
             <button onClick={() => setInterviewing(true)}
