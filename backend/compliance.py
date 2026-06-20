@@ -343,32 +343,76 @@ _INTERVIEW_SYSTEM = (
 )
 
 
+# Scripted questions used when the Manager's LLM can't return parseable JSON, so the
+# interview still progresses (and finalises) instead of repeating one question forever.
+_FALLBACK_QUESTIONS = [
+    "What industry does your organisation operate in, and are there any regulations or "
+    "standards (e.g. GDPR, HIPAA, SOX, APRA CPS 234) you must comply with?",
+    "How would you describe your appetite for risk overall — cautious, balanced, or aggressive — "
+    "and in which areas are you most willing to take risks?",
+    "What outcomes must NEVER happen (e.g. losing more than a set share of capital, a data breach, "
+    "a regulatory breach)?",
+    "Where do you want a human to sign off before something proceeds?",
+    "How often should this policy be reviewed (most orgs review annually and after any major incident)?",
+]
+
+
+def _scripted_step(history: list[dict]) -> dict:
+    """Deterministic fallback: advance through a fixed question list, then synthesise
+    a policy from the answers. Guarantees the interview always makes progress."""
+    asked = sum(1 for m in (history or []) if m.get("role") == "assistant")
+    if asked < len(_FALLBACK_QUESTIONS):
+        return {"type": "question", "question": _FALLBACK_QUESTIONS[asked]}
+    answers = [m.get("content", "") for m in (history or []) if m.get("role") == "user"]
+    joined = "\n".join(f"- {a}" for a in answers if a.strip())
+    appetite = (
+        "Risk appetite derived from your interview answers:\n" + (joined or "(no answers captured)") +
+        "\n\nThis policy is reviewed at least annually and after any major incident."
+    )
+    return {"type": "final", "name": "Risk Policy", "appetite": appetite, "threshold": 10,
+            "review_frequency_months": 12,
+            "rationale": "Block-at-score set to 10 (start of the High band) as a balanced default; "
+                         "adjust based on the appetite above."}
+
+
 async def policy_interview(manager_agent, history: list[dict]) -> dict:
     """Drive one turn of the policy interview. `history` is the prior Q&A
     (assistant=question, user=answer). Returns {type:'question'|'final', ...}."""
     if manager_agent is None:
-        return {"type": "final", "name": "Risk Policy",
-                "appetite": "Default conservative risk appetite (no interviewer available).",
-                "threshold": 10, "rationale": "Fallback default."}
+        return _scripted_step(history)
     msgs = [{"role": ("assistant" if m.get("role") == "assistant" else "user"),
              "content": m.get("content", "")} for m in (history or [])]
     if not msgs:
         msgs = [{"role": "user", "content": "Begin the interview. Ask your first question."}]
-    try:
-        resp = await manager_agent._adapter.complete(
-            system_prompt=_INTERVIEW_SYSTEM, messages=msgs,
-            model=manager_agent.config.llm_model, max_tokens=900)
-        data = _parse_json(resp.content)
-        if isinstance(data, dict) and data.get("type") in ("question", "final"):
-            if data["type"] == "final":
-                data["threshold"] = max(1, min(25, int(data.get("threshold", 10) or 10)))
-                data["review_frequency_months"] = max(1, min(60, int(data.get("review_frequency_months", 12) or 12)))
-            return data
-        # Fallback: treat raw text as the next question.
-        return {"type": "question", "question": (resp.content or "Tell me about your organisation's risk appetite.").strip()[:500]}
-    except Exception as e:
-        logger.warning("[compliance] interview step failed: %s", e)
-        return {"type": "question", "question": "Could you describe your organisation and the kinds of risk you most want to control?"}
+    # The user has already answered this many questions; never re-ask one.
+    asked_already = {m.get("content", "").strip()
+                     for m in (history or []) if m.get("role") == "assistant"}
+    last_err = None
+    for attempt in range(2):  # glm-5.1 is flaky; one retry before falling back
+        try:
+            resp = await manager_agent._adapter.complete(
+                system_prompt=_INTERVIEW_SYSTEM, messages=msgs,
+                model=manager_agent.config.llm_model, max_tokens=900)
+            data = _parse_json(resp.content)
+            if isinstance(data, dict) and data.get("type") in ("question", "final"):
+                if data["type"] == "final":
+                    data["threshold"] = max(1, min(25, int(data.get("threshold", 10) or 10)))
+                    data["review_frequency_months"] = max(1, min(60, int(data.get("review_frequency_months", 12) or 12)))
+                    return data
+                q = (data.get("question") or "").strip()
+                # Guard against the model repeating a question it already asked.
+                if q and q not in asked_already:
+                    return {"type": "question", "question": q}
+            else:
+                raw = (resp.content or "").strip()
+                if raw and raw not in asked_already and len(raw) < 400:
+                    return {"type": "question", "question": raw[:500]}
+        except Exception as e:
+            last_err = e
+    if last_err:
+        logger.warning("[compliance] interview step failed: %s", last_err)
+    # LLM unavailable or stuck repeating — use the scripted sequence so we progress.
+    return _scripted_step(history)
 
 
 async def match_policies(manager_agent, task_text: str, policies: list[dict]) -> list[dict]:
