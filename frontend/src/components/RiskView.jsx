@@ -246,7 +246,7 @@ function PolicyTab() {
           <Section title="Summary (optional prose)"
             hint="A plain-language summary. Keep it consistent with the impact table above."
             info="An optional human-readable summary of the policy. It's for people to read — the agent scores against the impact table, not this text — so keep it consistent with the table above.">
-            <textarea rows={4} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
+            <AutoTextarea minRows={8} value={active.body || ''} onChange={e => setA('body', e.target.value)} />
           </Section>
 
           <div className="flex items-center gap-3 pt-1">
@@ -317,6 +317,22 @@ function PolicyTab() {
 
 function Card({ children }) {
   return <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-5">{children}</div>
+}
+
+// Textarea that grows with its content up to half the viewport, then scrolls.
+function AutoTextarea({ value, onChange, minRows = 6, className = '', ...rest }) {
+  const ref = useRef(null)
+  const resize = () => {
+    const el = ref.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, window.innerHeight * 0.5) + 'px'
+  }
+  useEffect(() => { resize() }, [value])
+  return (
+    <textarea ref={ref} rows={minRows} value={value} onChange={onChange}
+      className={`input resize-none overflow-y-auto leading-relaxed ${className}`} {...rest} />
+  )
 }
 
 // Click-to-open (i) tooltip explaining what a section is for.
@@ -440,12 +456,12 @@ function ImpactTableView({ table }) {
 function RiskMatrix({ threshold, like = [], cons = [] }) {
   const rows = [5, 4, 3, 2, 1] // consequence high → low
   const cols = [1, 2, 3, 4, 5]
-  const gridCols = { display: 'grid', gridTemplateColumns: '6rem repeat(5, 3.25rem)', gap: '0.25rem' }
+  const gridCols = { display: 'grid', gridTemplateColumns: '6.5rem repeat(5, 4.25rem)', gap: '0.4rem' }
   return (
-    <div className="inline-flex items-stretch gap-1.5 text-[10px] select-none">
+    <div className="inline-flex items-stretch gap-2 text-[11px] select-none">
       {/* Consequence axis (vertical) */}
-      <div className="flex items-center pb-8">
-        <span className="font-semibold uppercase tracking-wider text-gray-400 whitespace-nowrap"
+      <div className="flex items-center pb-9">
+        <span className="font-semibold uppercase tracking-widest text-gray-400 whitespace-nowrap"
           style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>Consequence →</span>
       </div>
 
@@ -454,30 +470,30 @@ function RiskMatrix({ threshold, like = [], cons = [] }) {
           {/* corner + likelihood headers */}
           <div />
           {cols.map(l => (
-            <div key={l} className="text-center leading-tight pb-0.5" title={like[l - 1]?.definition || like[l - 1]?.label}>
-              <div className="font-bold text-gray-600">{l}</div>
-              <div className="text-gray-400 truncate">{like[l - 1]?.label || ''}</div>
+            <div key={l} className="text-center leading-tight pb-1" title={like[l - 1]?.definition || like[l - 1]?.label}>
+              <div className="font-bold text-gray-600 text-xs">{l}</div>
+              <div className="text-gray-400 text-[10px] truncate">{like[l - 1]?.label || ''}</div>
             </div>
           ))}
 
           {/* rows: consequence label + cells */}
           {rows.map(c => (
             <React.Fragment key={c}>
-              <div className="flex flex-col items-end justify-center pr-2 text-right leading-tight" title={cons[c - 1]?.definition || ''}>
-                <span className="font-bold text-gray-600">{c}</span>
-                <span className="text-gray-400">{cons[c - 1]?.label || ''}</span>
+              <div className="flex flex-col items-end justify-center pr-2.5 text-right leading-tight" title={cons[c - 1]?.definition || ''}>
+                <span className="font-bold text-gray-600 text-xs">{c}</span>
+                <span className="text-gray-400 text-[10px]">{cons[c - 1]?.label || ''}</span>
               </div>
               {cols.map(l => {
                 const s = l * c
                 const blocked = s >= threshold
                 return (
                   <div key={l}
-                    className={`h-10 rounded-lg flex items-center justify-center font-bold text-gray-800 transition-shadow ${cellTone(s)} ${
-                      blocked ? 'ring-2 ring-gray-900/70 shadow-sm' : 'opacity-80'}`}
+                    className={`h-14 rounded-xl flex items-center justify-center font-bold text-gray-800 transition-all ${cellTone(s)} ${
+                      blocked ? 'ring-2 ring-gray-900/75 shadow-md scale-[1.02]' : 'opacity-75'}`}
                     title={`Likelihood ${l} × Consequence ${c} = ${s}${blocked ? ' — blocked' : ''}`}>
                     {blocked
-                      ? <span className="flex items-center gap-0.5"><Lock size={9} className="opacity-60" />{s}</span>
-                      : <span className="text-[11px]">{s}</span>}
+                      ? <span className="flex items-center gap-0.5 text-sm"><Lock size={11} className="opacity-60" />{s}</span>
+                      : <span className="text-sm">{s}</span>}
                   </div>
                 )
               })}
@@ -486,12 +502,12 @@ function RiskMatrix({ threshold, like = [], cons = [] }) {
 
           {/* bottom likelihood axis (aligned under the cells) */}
           <div />
-          <div className="col-span-5 text-center font-semibold uppercase tracking-wider text-gray-400 pt-1">Likelihood →</div>
+          <div className="col-span-5 text-center font-semibold uppercase tracking-widest text-gray-400 pt-1.5">Likelihood →</div>
         </div>
 
         {/* legend */}
-        <div className="flex items-center gap-1.5 text-gray-400 mt-2" style={{ paddingLeft: '6.25rem' }}>
-          <span className="inline-flex items-center justify-center w-4 h-4 rounded ring-2 ring-gray-900/70 bg-gray-100"><Lock size={8} /></span>
+        <div className="flex items-center gap-1.5 text-gray-400 mt-2.5" style={{ paddingLeft: '6.9rem' }}>
+          <span className="inline-flex items-center justify-center w-4 h-4 rounded ring-2 ring-gray-900/75 bg-gray-100"><Lock size={9} /></span>
           at / above the block-at-score ({threshold}) — blocked
         </div>
       </div>
