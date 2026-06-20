@@ -480,10 +480,18 @@ _INTERVIEW_SYSTEM = (
     "2) Then CALIBRATE with role-play SCENARIOS. Invent a concrete, realistic scenario for "
     "THIS organisation and ask whether that outcome is acceptable. Offer 3-4 options so the "
     "user just picks their view (they can also type their own). This reveals TRUE appetite, "
-    "not what they think it is. Run 3-5 scenarios spanning financial, data/privacy, "
-    "legal/compliance, reputational and operational outcomes.\n"
+    "not what they think it is. Cover financial, data/privacy, legal/compliance, reputational "
+    "and operational outcomes.\n"
     "3) Also ask how often the policy should be reviewed (most orgs: annually, and after "
     "any major incident).\n\n"
+    "ADAPT THE DEPTH to the business — do not use a fixed number of questions:\n"
+    "- Highly regulated / complex (finance, healthcare, handling client money or large PII, "
+    "multiple jurisdictions): probe DEEPER. Ask sharper follow-ups and more scenarios to pin "
+    "down each regulated area. Aim ~7-10 calibration turns, but never exceed 12 total.\n"
+    "- Simple, low-risk, unregulated (e.g. a solo operator): ask only ENOUGH to set the impact "
+    "table and threshold — roughly 3-5 calibration turns — then finish. Don't pad it out.\n"
+    "Whenever you can responsibly fill the impact table and choose a block-at-score, STOP and "
+    "return the final policy — do not keep asking once you have enough.\n\n"
     "Respond with STRICT JSON only, ONE of:\n"
     "- a plain question: {\"type\":\"question\",\"question\":\"<one question>\"}\n"
     "- a calibration scenario: {\"type\":\"scenario\",\"scenario\":\"<one concrete scenario>\","
@@ -684,9 +692,19 @@ def _scripted_step(history: list[dict]) -> dict:
     return _scripted_synthesise(history)
 
 
+# Hard bounds on interview length so it adapts but can never run forever.
+MAX_INTERVIEW_QUESTIONS = 12
+
+
 async def policy_interview(manager_agent, history: list[dict]) -> dict:
     """Drive one turn of the policy interview. `history` is the prior Q&A
-    (assistant=question, user=answer). Returns {type:'question'|'final', ...}."""
+    (assistant=question, user=answer). Returns {type:'question'|'final', ...}.
+    The LLM decides how many questions to ask (deeper for regulated/complex orgs,
+    fewer for simple ones); this caps it at MAX_INTERVIEW_QUESTIONS regardless."""
+    answered = sum(1 for m in (history or []) if m.get("role") == "user")
+    if answered >= MAX_INTERVIEW_QUESTIONS:
+        # Cap reached — finalise now even if the model wanted to keep going.
+        return await _finalize_policy(manager_agent, history)
     if manager_agent is None:
         return _scripted_step(history)
     msgs = [{"role": ("assistant" if m.get("role") == "assistant" else "user"),
