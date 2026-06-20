@@ -254,6 +254,7 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE risk_policies ADD COLUMN review_due INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE risk_policies ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE risk_policies ADD COLUMN rationale TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE risk_policies ADD COLUMN impact_table TEXT NOT NULL DEFAULT '[]'",
     ]:
         try:
             await _db.execute(migration)
@@ -900,18 +901,19 @@ async def save_risk_policy(p: dict) -> None:
     from datetime import date
     await _conn().execute(
         """INSERT INTO risk_policies(id, name, body, summary, threshold, enabled, transcript,
-              review_frequency_months, last_reviewed, rationale)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              review_frequency_months, last_reviewed, rationale, impact_table)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET name=excluded.name, body=excluded.body,
              summary=excluded.summary, threshold=excluded.threshold, enabled=excluded.enabled,
              transcript=excluded.transcript, review_frequency_months=excluded.review_frequency_months,
-             rationale=excluded.rationale""",
+             rationale=excluded.rationale, impact_table=excluded.impact_table""",
         (p["id"], p.get("name", ""), p.get("body", ""), p.get("summary", ""),
          int(p.get("threshold", 10)), int(p.get("enabled", 1)),
          json.dumps(p.get("transcript", [])) if not isinstance(p.get("transcript"), str) else p.get("transcript", "[]"),
          int(p.get("review_frequency_months", 12)),
          p.get("last_reviewed") or date.today().isoformat(),  # new policy counts as reviewed today
-         p.get("rationale", "")[:2000]),
+         p.get("rationale", "")[:2000],
+         json.dumps(p.get("impact_table", [])) if not isinstance(p.get("impact_table"), str) else p.get("impact_table", "[]")),
     )
     await _conn().commit()
 

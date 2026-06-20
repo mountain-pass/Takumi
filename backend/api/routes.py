@@ -1310,6 +1310,7 @@ class NamedPolicyReq(BaseModel):
     make_default: bool = False
     review_frequency_months: int = 12
     rationale: str = ""       # how the block-at-score was derived
+    impact_table: list = []   # per-category severity (1-5) definitions = the appetite
 
 
 @router.post("/risk/policies")
@@ -1321,16 +1322,25 @@ async def save_named_policy(req: NamedPolicyReq):
     summary = await compliance.summarise_policy(mgr, req.name, req.body)
     if not summary:  # fall back to the policy text so matching still works
         summary = (req.body or "").strip()[:240]
-    # Preserve the rationale on edits if the client didn't resend it.
+    # Preserve rationale/impact_table on edits if the client didn't resend them.
     rationale = req.rationale
-    if not rationale and req.id:
+    impact_table = compliance._norm_impact_table(req.impact_table) if req.impact_table else []
+    if req.id:
         existing = await database.get_risk_policy_row(req.id)
-        rationale = (existing or {}).get("rationale", "")
+        if not rationale:
+            rationale = (existing or {}).get("rationale", "")
+        if not impact_table:
+            try:
+                impact_table = compliance._norm_impact_table(_json.loads((existing or {}).get("impact_table") or "[]"))
+            except Exception:
+                impact_table = []
+    if not impact_table:  # always store a full table so the document renders
+        impact_table = compliance._norm_impact_table([])
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
         "transcript": req.transcript or [], "review_frequency_months": req.review_frequency_months,
-        "rationale": rationale,
+        "rationale": rationale, "impact_table": impact_table,
     })
     # First policy becomes the active (default) global policy; or if requested.
     existing = await database.list_risk_policies()

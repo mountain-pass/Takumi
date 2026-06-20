@@ -44,6 +44,85 @@ DEFAULT_CONSEQUENCE = [
     {"label": "Severe", "definition": "Critical impact; major breach, legal/regulatory action, large financial loss, or serious reputational damage."},
 ]
 
+# ── Impact table (the heart of a policy) ──────────────────────────────────────
+# The likelihood scale and the 5×5 matrix are GENERIC and never change. Risk
+# *appetite* is expressed entirely by the impact table: for each category, what
+# counts as Insignificant…Severe. Tuning a category's thresholds down (e.g. making
+# a large financial loss only "Moderate") lowers its effective appetite, so a
+# single uniform block-at-score can apply to every category.
+SEVERITY_LABELS = ["Insignificant", "Minor", "Moderate", "Major", "Severe"]
+
+# Generic, appetite-neutral starting point — the interview tunes these cells.
+DEFAULT_IMPACT_TABLE = [
+    {"category": "financial", "definitions": [
+        "Negligible cost, easily absorbed.",
+        "Minor cost; no effect on viability.",
+        "Noticeable loss, recoverable in normal operations.",
+        "Material loss affecting the viability of the activity.",
+        "Catastrophic loss; threatens the whole organisation."]},
+    {"category": "data_privacy", "definitions": [
+        "No personal or sensitive data involved.",
+        "Internal data only; no external exposure.",
+        "Limited personal-data exposure, contained.",
+        "Significant personal-data exposure or loss.",
+        "Large-scale breach of sensitive personal data."]},
+    {"category": "security", "definitions": [
+        "No security relevance.",
+        "Low-risk, well-contained exposure.",
+        "Exploitable weakness with limited blast radius.",
+        "Serious vulnerability; sensitive systems at risk.",
+        "Critical compromise; secrets or keys exposed."]},
+    {"category": "legal_compliance", "definitions": [
+        "Fully compliant; no legal exposure.",
+        "Minor process deviation; no breach.",
+        "Technical breach; low regulatory interest.",
+        "Clear regulatory breach; penalties likely.",
+        "Serious breach; enforcement action or litigation."]},
+    {"category": "reputational", "definitions": [
+        "No visibility.",
+        "Internal awareness only.",
+        "Limited external notice; quickly forgotten.",
+        "Sustained negative coverage or customer loss.",
+        "Widespread coverage; lasting brand damage."]},
+    {"category": "operational", "definitions": [
+        "No disruption.",
+        "Brief, self-correcting disruption.",
+        "Noticeable disruption; manual workaround needed.",
+        "Major disruption; core activity halted for a time.",
+        "Sustained outage; unable to operate."]},
+]
+
+
+def _norm_impact_table(items) -> list[dict]:
+    """Coerce an impact table to one row per category, each with 5 cell definitions."""
+    by_cat = {}
+    for row in (items or []):
+        if isinstance(row, dict) and row.get("category"):
+            by_cat[str(row["category"])] = row.get("definitions") or []
+        elif isinstance(row, dict):  # tolerate {category_key: [..]} style
+            for k, v in row.items():
+                by_cat[str(k)] = v
+    out = []
+    for d in DEFAULT_IMPACT_TABLE:
+        cat = d["category"]
+        defs = by_cat.get(cat) or []
+        cells = [str(defs[i])[:300] if i < len(defs) and str(defs[i]).strip()
+                 else d["definitions"][i] for i in range(5)]
+        out.append({"category": cat, "definitions": cells})
+    return out
+
+
+def impact_table_text(table) -> str:
+    """Render the impact table as plain text for injection into assessments."""
+    table = _norm_impact_table(table)
+    lines = ["Impact table (defines consequence severity 1-5 per category):"]
+    for row in table:
+        cat = row["category"].replace("_", " ")
+        cells = " | ".join(f"{i+1} {SEVERITY_LABELS[i]}: {row['definitions'][i]}" for i in range(5))
+        lines.append(f"- {cat}: {cells}")
+    return "\n".join(lines)
+
+
 # The organisation's risk policy — editable in the app, consumed by every
 # assessment so the agent scores against the company's actual specification.
 DEFAULT_POLICY = {
@@ -227,6 +306,18 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
                 "\n".join(f"  {i+1} = {s['label']}: {s['definition']}" for i, s in enumerate(lscale)) +
                 "\nCONSEQUENCE levels (score 1-5):\n" +
                 "\n".join(f"  {i+1} = {s['label']}: {s['definition']}" for i, s in enumerate(cscale)))
+            # The policy's impact table IS its appetite — score consequence per category from it.
+            itable = None
+            if named_policy:
+                try:
+                    raw = named_policy.get("impact_table")
+                    itable = raw if isinstance(raw, list) else json.loads(raw or "[]")
+                except Exception:
+                    itable = None
+            if itable:
+                scale_txt += ("\n\nThis policy's IMPACT TABLE defines consequence severity per "
+                              "category (use it as the source of truth for consequence):\n" +
+                              impact_table_text(itable))
             system = (
                 "You are an ISO 31000 risk & compliance assessor for this organisation. Score the work "
                 f"against the POLICY below ({policy_label}), across these categories: {', '.join(cats)}.\n\n"
@@ -323,56 +414,84 @@ async def summarise_policy(agent, name: str, body: str) -> str:
 
 
 _INTERVIEW_SYSTEM = (
-    "You are the Manager of an AI organisation acting as a RISK & COMPLIANCE policy "
-    "interviewer. Interview the user — ONE QUESTION AT A TIME — to build this "
-    "organisation's risk appetite and a block-at-score threshold for the ISO 31000 5×5 "
-    "matrix (likelihood×consequence, score 1-25; bands: Low 1-4, Medium 5-9, High 10-15, "
-    "Critical 16-25).\n\n"
-    "Cover: industry & regulatory context; appetite for security, data-privacy, financial, "
-    "legal/compliance, reputational and operational risk; what work or outcomes must NEVER "
-    "happen; where human sign-off is required; and HOW OFTEN the policy should be reviewed "
-    "(most orgs review annually, and always after a major incident). Ask 6-9 short questions "
-    "total, ONE per turn — never ask the next until the user has answered. Be warm and concrete.\n\n"
-    "Respond with STRICT JSON only:\n"
-    "- next question: {\"type\":\"question\",\"question\":\"<one question>\"}\n"
-    "- when you have enough: {\"type\":\"final\",\"name\":\"<short policy name>\","
-    "\"appetite\":\"<detailed company risk appetite / policy, 1-3 paragraphs, including the review "
-    "cadence>\",\"threshold\":<int 1-25>,\"review_frequency_months\":<int, e.g. 12 for annual>,"
-    "\"rationale\":\"<why this threshold, referencing their answers>\"}\n"
-    "Output JSON and nothing else."
+    "You are the Manager of an AI organisation running a RISK & COMPLIANCE policy "
+    "interview. The output is NOT prose — it is an IMPACT TABLE. The likelihood scale "
+    "and the 5×5 matrix are GENERIC and never change; appetite is expressed ENTIRELY by "
+    "the impact table: for each category, what counts as Insignificant(1)…Severe(5). "
+    "Tuning a category down (e.g. a large financial loss is only 'Moderate') lowers its "
+    "appetite, so ONE uniform block-at-score can apply to EVERY category.\n\n"
+    "Run the interview ONE TURN AT A TIME — never advance until the user has answered.\n"
+    "1) First 1-2 turns: learn what kind of organisation this is and any regulations.\n"
+    "2) Then CALIBRATE with role-play SCENARIOS. Invent a concrete, realistic scenario for "
+    "THIS organisation and ask whether that outcome is acceptable. Offer 3-4 options so the "
+    "user just picks their view (they can also type their own). This reveals TRUE appetite, "
+    "not what they think it is. Run 3-5 scenarios spanning financial, data/privacy, "
+    "legal/compliance, reputational and operational outcomes.\n"
+    "3) Also ask how often the policy should be reviewed (most orgs: annually, and after "
+    "any major incident).\n\n"
+    "Respond with STRICT JSON only, ONE of:\n"
+    "- a plain question: {\"type\":\"question\",\"question\":\"<one question>\"}\n"
+    "- a calibration scenario: {\"type\":\"scenario\",\"scenario\":\"<one concrete scenario>\","
+    "\"options\":[\"<view A>\",\"<view B>\",\"<view C>\"]}\n"
+    "- the finished policy: {\"type\":\"final\",\"name\":\"<short policy name>\","
+    "\"appetite\":\"<2-4 sentence plain-language summary that MATCHES the impact table>\","
+    "\"impact_table\":[{\"category\":\"financial\",\"definitions\":[\"<sev1>\",\"<sev2>\",\"<sev3>\","
+    "\"<sev4>\",\"<sev5>\"]}, ... one row per category: financial, data_privacy, security, "
+    "legal_compliance, reputational, operational],"
+    "\"threshold\":<int 1-25 block-at-score, applied uniformly>,"
+    "\"review_frequency_months\":<int, e.g. 12 for annual>,"
+    "\"rationale\":\"<why this threshold and how the impact table reflects their scenario answers>\"}\n"
+    "Each impact cell is a short concrete definition tuned to their answers. Output JSON and nothing else."
 )
 
 
-# Scripted questions used when the Manager's LLM can't return parseable JSON, so the
-# interview still progresses (and finalises) instead of repeating one question forever.
-_FALLBACK_QUESTIONS = [
-    "What industry does your organisation operate in, and are there any regulations or "
-    "standards (e.g. GDPR, HIPAA, SOX, APRA CPS 234) you must comply with?",
-    "How would you describe your appetite for risk overall — cautious, balanced, or aggressive — "
-    "and in which areas are you most willing to take risks?",
-    "What outcomes must NEVER happen (e.g. losing more than a set share of capital, a data breach, "
-    "a regulatory breach)?",
-    "Where do you want a human to sign off before something proceeds?",
-    "How often should this policy be reviewed (most orgs review annually and after any major incident)?",
+# Scripted turns used when the Manager's LLM can't return parseable JSON, so the
+# interview still progresses (and finalises) instead of repeating one turn forever.
+# A turn is either a plain question or a calibration scenario with options.
+_FALLBACK_TURNS = [
+    {"type": "question", "question":
+        "What industry does your organisation operate in, and are there any regulations or "
+        "standards (e.g. GDPR, HIPAA, SOX, APRA CPS 234) you must comply with?"},
+    {"type": "scenario",
+     "scenario": "A single decision wipes out a large share of the capital tied to that activity. "
+                 "How acceptable is that outcome?",
+     "options": ["Never acceptable — must be prevented", "Acceptable only with sign-off",
+                 "Acceptable — it's part of doing business"]},
+    {"type": "scenario",
+     "scenario": "Personal or sensitive data is exposed externally, even briefly. "
+                 "How do you view that?",
+     "options": ["Unacceptable under any circumstances", "Tolerable if quickly contained",
+                 "Low concern for us"]},
+    {"type": "scenario",
+     "scenario": "An action puts you in clear breach of a regulation or the law. Your view?",
+     "options": ["Must never happen", "Only with explicit human approval", "A risk we'd accept"]},
+    {"type": "scenario",
+     "scenario": "Something goes public and attracts sustained negative attention. How acceptable?",
+     "options": ["Avoid at all costs", "Manageable if handled well", "Not a major concern"]},
+    {"type": "question", "question":
+        "How often should this policy be reviewed? Most orgs review annually and after any major incident."},
 ]
 
 
 def _scripted_step(history: list[dict]) -> dict:
-    """Deterministic fallback: advance through a fixed question list, then synthesise
-    a policy from the answers. Guarantees the interview always makes progress."""
+    """Deterministic fallback: advance through fixed turns, then synthesise a policy
+    (with a generic impact table). Guarantees the interview always makes progress."""
     asked = sum(1 for m in (history or []) if m.get("role") == "assistant")
-    if asked < len(_FALLBACK_QUESTIONS):
-        return {"type": "question", "question": _FALLBACK_QUESTIONS[asked]}
+    if asked < len(_FALLBACK_TURNS):
+        return dict(_FALLBACK_TURNS[asked])
     answers = [m.get("content", "") for m in (history or []) if m.get("role") == "user"]
-    joined = "\n".join(f"- {a}" for a in answers if a.strip())
+    joined = "; ".join(a.strip() for a in answers if a.strip())
     appetite = (
-        "Risk appetite derived from your interview answers:\n" + (joined or "(no answers captured)") +
-        "\n\nThis policy is reviewed at least annually and after any major incident."
+        "Risk appetite calibrated from your interview answers" +
+        (f": {joined}." if joined else ".") +
+        " Impact severities are tuned per category below; a single block-at-score applies "
+        "uniformly. Reviewed at least annually and after any major incident."
     )
     return {"type": "final", "name": "Risk Policy", "appetite": appetite, "threshold": 10,
             "review_frequency_months": 12,
+            "impact_table": [dict(r) for r in DEFAULT_IMPACT_TABLE],
             "rationale": "Block-at-score set to 10 (start of the High band) as a balanced default; "
-                         "adjust based on the appetite above."}
+                         "appetite is encoded in the impact table so the block applies uniformly."}
 
 
 async def policy_interview(manager_agent, history: list[dict]) -> dict:
@@ -394,11 +513,18 @@ async def policy_interview(manager_agent, history: list[dict]) -> dict:
                 system_prompt=_INTERVIEW_SYSTEM, messages=msgs,
                 model=manager_agent.config.llm_model, max_tokens=900)
             data = _parse_json(resp.content)
-            if isinstance(data, dict) and data.get("type") in ("question", "final"):
+            if isinstance(data, dict) and data.get("type") in ("question", "scenario", "final"):
                 if data["type"] == "final":
                     data["threshold"] = max(1, min(25, int(data.get("threshold", 10) or 10)))
                     data["review_frequency_months"] = max(1, min(60, int(data.get("review_frequency_months", 12) or 12)))
+                    data["impact_table"] = _norm_impact_table(data.get("impact_table"))
                     return data
+                if data["type"] == "scenario":
+                    sc = (data.get("scenario") or "").strip()
+                    if sc and sc not in asked_already:
+                        opts = [str(o).strip() for o in (data.get("options") or []) if str(o).strip()][:4]
+                        return {"type": "scenario", "scenario": sc, "options": opts}
+                    continue
                 q = (data.get("question") or "").strip()
                 # Guard against the model repeating a question it already asked.
                 if q and q not in asked_already:

@@ -22,6 +22,26 @@ const LEVELS = [
 const levelOf = (s) => s >= 16 ? 'critical' : s >= 10 ? 'high' : s >= 5 ? 'medium' : 'low'
 const cellTone = (s) => s >= 16 ? 'bg-red-400/80' : s >= 10 ? 'bg-orange-400/80' : s >= 5 ? 'bg-yellow-300/80' : 'bg-green-300/70'
 
+// Generic — never change. Appetite lives in the per-policy impact table only.
+const SEVERITY_LABELS = ['Insignificant', 'Minor', 'Moderate', 'Major', 'Severe']
+const LIKELIHOOD_LABELS = ['Rare', 'Unlikely', 'Possible', 'Likely', 'Almost certain']
+const GENERIC_LIKELIHOOD = LIKELIHOOD_LABELS.map(label => ({ label }))
+const SEVERITY_SCALE = SEVERITY_LABELS.map(label => ({ label }))
+const IMPACT_CATEGORIES = ['financial', 'data_privacy', 'security', 'legal_compliance', 'reputational', 'operational']
+const catLabel = (c) => (c || '').replace(/_/g, ' ')
+
+// Coerce any stored impact_table (JSON string or array) into editable rows.
+function normImpactTable(raw) {
+  let items = raw
+  if (typeof raw === 'string') { try { items = JSON.parse(raw || '[]') } catch { items = [] } }
+  const byCat = {}
+  for (const r of (items || [])) if (r && r.category) byCat[r.category] = r.definitions || []
+  return IMPACT_CATEGORIES.map(cat => ({
+    category: cat,
+    definitions: Array.from({ length: 5 }, (_, i) => (byCat[cat] && byCat[cat][i]) || ''),
+  }))
+}
+
 export default function RiskView() {
   const [tab, setTab] = useState('policy')
   return (
@@ -105,7 +125,7 @@ function PolicyTab() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: active.id, name: active.name, body: active.body,
         threshold: active.threshold, review_frequency_months: active.review_frequency_months || 12,
-        rationale: active.rationale || '' }),
+        rationale: active.rationale || '', impact_table: normImpactTable(active.impact_table) }),
     })
     setSavedPol(true); setTimeout(() => setSavedPol(false), 2500); loadPolicies()
   }
@@ -128,7 +148,7 @@ function PolicyTab() {
   const threshold = active?.threshold || 10
   const lvl = LEVELS.find(l => l.key === levelOf(threshold))
   return (
-    <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
+    <div className="max-w-5xl mx-auto px-6 py-6 space-y-6">
       {/* Policy selector — view/edit any policy; the agent follows whichever is active */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
@@ -175,25 +195,29 @@ function PolicyTab() {
             </div>
           </div>
 
-          {/* Appetite + threshold (per active policy) */}
-          <Section title="Risk appetite / policy" hint="Injected into every assessment so the agent scores against your specification.">
-            <textarea rows={6} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
+          {/* Impact table — the policy itself; this is where appetite is set */}
+          <Section title="Impact table — your risk appetite" hint="The likelihood scale and 5×5 matrix are generic; appetite is set here. Tune what each severity means per category so one block-at-score applies uniformly.">
+            <ImpactTableEditor table={active.impact_table} onChange={t => setA('impact_table', t)} />
           </Section>
           <Section title="Block at score & review cadence">
             <div className="flex items-center gap-3 flex-wrap">
-              <span className="text-sm text-gray-700">Block at score</span>
+              <span className="text-sm text-gray-700">Block at score (uniform)</span>
               <input type="number" min={1} max={25} value={threshold} onChange={e => setA('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))} className="w-20 input text-right" />
               <span className={`text-[11px] px-2 py-0.5 rounded border ${lvl.cls}`}>{lvl.label}+ blocked</span>
               <span className="text-sm text-gray-700 ml-3">Review every</span>
               <input type="number" min={1} max={60} value={active.review_frequency_months || 12} onChange={e => setA('review_frequency_months', Math.max(1, Math.min(60, parseInt(e.target.value || '12', 10) || 12)))} className="w-20 input text-right" />
               <span className="text-sm text-gray-700">months</span>
             </div>
-            <div className="mt-3"><RiskMatrix threshold={threshold} like={fw.likelihood_scale} cons={fw.consequence_scale} /></div>
-            <div className="flex items-center gap-3 mt-3">
-              <button onClick={savePolicy} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save policy</button>
-              {savedPol && <span className="text-xs text-green-600">Saved ✓</span>}
-            </div>
+            <div className="mt-3"><RiskMatrix threshold={threshold} like={GENERIC_LIKELIHOOD} cons={SEVERITY_SCALE} /></div>
           </Section>
+          {/* Optional prose summary — should reflect the impact table */}
+          <Section title="Summary (optional prose)" hint="A plain-language summary. Keep it consistent with the impact table above.">
+            <textarea rows={4} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
+          </Section>
+          <div className="flex items-center gap-3">
+            <button onClick={savePolicy} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save policy</button>
+            {savedPol && <span className="text-xs text-green-600">Saved ✓</span>}
+          </div>
         </>
       )}
 
@@ -212,11 +236,8 @@ function PolicyTab() {
           ))}
         </div>
       </Section>
-      <Section title="Likelihood scale (1–5)" hint="Define what each level means so scoring is consistent and auditable.">
+      <Section title="Likelihood scale (1–5) — generic" hint="The same generic likelihood scale applies to every policy. Consequence severity is NOT set here — it lives in each policy's impact table above.">
         <ScaleEditor scale={fw.likelihood_scale} onChange={s => setFwField('likelihood_scale', s)} />
-      </Section>
-      <Section title="Consequence / impact scale (1–5)" hint="Define the impact at each level (financial, data, legal, reputational…).">
-        <ScaleEditor scale={fw.consequence_scale} onChange={s => setFwField('consequence_scale', s)} />
       </Section>
       <Section title="Risk categories" hint="Which categories the agent scores against.">
         <div className="flex flex-wrap gap-2">
@@ -256,6 +277,70 @@ function ScaleEditor({ scale = [], onChange }) {
             onChange={e => setField(i, 'definition', e.target.value)} />
         </div>
       ))}
+    </div>
+  )
+}
+
+// The impact table IS the policy: per category, what each severity 1–5 means.
+// Editing the cells tunes appetite so one block-at-score applies uniformly.
+function ImpactTableEditor({ table, onChange }) {
+  const rows = normImpactTable(table)
+  const setCell = (ri, ci, v) => onChange(rows.map((r, i) => i === ri
+    ? { ...r, definitions: r.definitions.map((d, j) => (j === ci ? v : d)) } : r))
+  return (
+    <div className="overflow-x-auto border border-gray-200 rounded-xl">
+      <table className="text-[11px] border-collapse w-full">
+        <thead>
+          <tr className="bg-gray-50">
+            <th className="text-left px-2 py-1.5 font-semibold text-gray-500 sticky left-0 bg-gray-50">Category</th>
+            {SEVERITY_LABELS.map((s, i) => (
+              <th key={i} className="px-2 py-1.5 font-semibold text-gray-500 text-left min-w-[140px]">{i + 1} · {s}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, ri) => (
+            <tr key={r.category} className="border-t border-gray-100 align-top">
+              <td className="px-2 py-1.5 font-medium text-gray-700 capitalize sticky left-0 bg-white">{catLabel(r.category)}</td>
+              {r.definitions.map((d, ci) => (
+                <td key={ci} className="px-1 py-1">
+                  <textarea rows={2} className="w-full text-[11px] leading-snug border border-gray-200 rounded p-1 resize-y focus:border-indigo-300 focus:outline-none"
+                    value={d} onChange={e => setCell(ri, ci, e.target.value)} />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// Read-only impact table for the policy document.
+function ImpactTableView({ table }) {
+  const rows = normImpactTable(table)
+  return (
+    <div className="overflow-x-auto border border-gray-200 rounded-xl">
+      <table className="text-[11px] border-collapse w-full">
+        <thead>
+          <tr className="bg-gray-50">
+            <th className="text-left px-2 py-1.5 font-semibold text-gray-500 sticky left-0 bg-gray-50">Category</th>
+            {SEVERITY_LABELS.map((s, i) => (
+              <th key={i} className="px-2 py-1.5 font-semibold text-gray-500 text-left min-w-[130px]">{i + 1} · {s}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.category} className="border-t border-gray-100 align-top">
+              <td className="px-2 py-1.5 font-medium text-gray-700 capitalize sticky left-0 bg-white">{catLabel(r.category)}</td>
+              {r.definitions.map((d, ci) => (
+                <td key={ci} className="px-2 py-1.5 text-gray-600">{d || '—'}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -355,7 +440,10 @@ function PolicyInterview({ onDone, onClose }) {
       const d = await r.json()
       if (d.type === 'final') {
         setFinal({ name: d.name || 'Risk Policy', appetite: d.appetite || '', threshold: d.threshold || 10,
-          review_frequency_months: d.review_frequency_months || 12, rationale: d.rationale || '' })
+          review_frequency_months: d.review_frequency_months || 12, rationale: d.rationale || '',
+          impact_table: d.impact_table || [] })
+      } else if (d.type === 'scenario') {
+        setMsgs(m => [...m, { role: 'assistant', content: d.scenario || '…', options: d.options || [], scenario: true }])
       } else {
         setMsgs(m => [...m, { role: 'assistant', content: d.question || '…' }])
       }
@@ -364,12 +452,20 @@ function PolicyInterview({ onDone, onClose }) {
   useEffect(() => { if (started.current) return; started.current = true; step([]) }, [])  // once, even under StrictMode
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs, final])
 
+  // Strip UI-only fields before sending history to the backend.
+  const asHistory = (list) => list.map(({ role, content }) => ({ role, content }))
+  function answer(text) {
+    if (!text || busy) return
+    const next = [...msgs, { role: 'user', content: text }]
+    setMsgs(next); setInput('')
+    step(asHistory(next))
+  }
   function send() {
     const text = input.trim()
     if (!text || busy) return
     const next = [...msgs, { role: 'user', content: text }]
     setMsgs(next); setInput('')
-    step(next)
+    step(asHistory(next))
   }
   async function save() {
     setSaving(true)
@@ -379,14 +475,14 @@ function PolicyInterview({ onDone, onClose }) {
       // switch back via the selector).
       body: JSON.stringify({ name: final.name, body: final.appetite, threshold: final.threshold,
         review_frequency_months: final.review_frequency_months || 12, rationale: final.rationale || '',
-        transcript: msgs, make_default: true }),
+        impact_table: final.impact_table || [], transcript: msgs, make_default: true }),
     })
     setSaving(false); onDone()
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+      <div className={`bg-white rounded-2xl shadow-2xl w-full ${final ? 'max-w-3xl' : 'max-w-xl'} max-h-[88vh] flex flex-col`} onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
           <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2"><MessageSquareText size={16} className="text-indigo-500" /> Policy interview</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
@@ -395,11 +491,28 @@ function PolicyInterview({ onDone, onClose }) {
         {!final ? (
           <>
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-              {msgs.map((m, i) => (
-                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
-                </div>
-              ))}
+              {msgs.map((m, i) => {
+                const isLast = i === msgs.length - 1
+                return (
+                  <div key={i} className="space-y-2">
+                    <div className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2 text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>
+                        {m.scenario && <span className="block text-[10px] font-semibold text-indigo-500 uppercase mb-1">Scenario — would this be acceptable?</span>}
+                        {m.content}
+                      </div>
+                    </div>
+                    {/* Calibration choices — pick your view, or type your own below. */}
+                    {m.scenario && isLast && !busy && (m.options || []).length > 0 && (
+                      <div className="flex flex-wrap gap-2 pl-1">
+                        {m.options.map((o, j) => (
+                          <button key={j} onClick={() => answer(o)}
+                            className="px-3 py-1.5 rounded-full border border-indigo-200 text-indigo-700 text-xs hover:bg-indigo-50">{o}</button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
               {busy && <div className="flex justify-start"><div className="bg-gray-100 rounded-2xl px-3.5 py-2"><Loader2 size={14} className="animate-spin text-gray-400" /></div></div>}
               <div ref={endRef} />
             </div>
@@ -413,18 +526,26 @@ function PolicyInterview({ onDone, onClose }) {
           </>
         ) : (
           <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-            <p className="text-xs text-gray-500">The Manager drafted this from your answers. Review and adjust the block-at-score before saving.</p>
+            <p className="text-xs text-gray-500">The Manager drafted this from your answers. The <b>impact table</b> is the policy — it encodes your appetite per category. Adjust any cell, then save.</p>
             <label className="block space-y-1"><span className="text-[11px] font-semibold text-gray-400 uppercase">Name</span>
               <input className="input" value={final.name} onChange={e => setFinal({ ...final, name: e.target.value })} /></label>
-            <label className="block space-y-1"><span className="text-[11px] font-semibold text-gray-400 uppercase">Risk appetite / policy</span>
-              <textarea className="input resize-y" rows={7} value={final.appetite} onChange={e => setFinal({ ...final, appetite: e.target.value })} /></label>
-            <div className="flex items-center gap-3">
-              <span className="text-sm text-gray-700">Block at score</span>
+
+            <div className="space-y-1">
+              <span className="text-[11px] font-semibold text-gray-400 uppercase">Impact table (your risk appetite)</span>
+              <ImpactTableEditor table={final.impact_table} onChange={t => setFinal({ ...final, impact_table: t })} />
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-sm text-gray-700">Block at score (applies uniformly)</span>
               <input type="number" min={1} max={25} className="input w-20 text-right" value={final.threshold}
                 onChange={e => setFinal({ ...final, threshold: Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)) })} />
-              <span className="text-[11px] text-gray-400">Manager suggested {final.threshold} — override if you prefer.</span>
+              <span className={`text-[11px] px-2 py-0.5 rounded border ${LEVELS.find(l => l.key === levelOf(final.threshold)).cls}`}>{LEVELS.find(l => l.key === levelOf(final.threshold)).label}+ blocked</span>
             </div>
-            {final.rationale && <p className="text-[11px] text-gray-500 bg-amber-50 border border-amber-100 rounded-lg p-2"><b>Why:</b> {final.rationale}</p>}
+            <div><RiskMatrix threshold={final.threshold} like={GENERIC_LIKELIHOOD} cons={SEVERITY_SCALE} /></div>
+
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-gray-400 uppercase">Summary (optional prose — should match the table)</span>
+              <textarea className="input resize-y" rows={4} value={final.appetite} onChange={e => setFinal({ ...final, appetite: e.target.value })} /></label>
+            {final.rationale && <p className="text-[11px] text-gray-500 bg-amber-50 border border-amber-100 rounded-lg p-2"><b>Why this block-at:</b> {final.rationale}</p>}
             <div className="flex justify-end gap-2 pt-1">
               <button onClick={() => setFinal(null)} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-xl">Back to interview</button>
               <button onClick={save} disabled={saving || !final.name.trim()} className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl disabled:opacity-40">{saving ? 'Saving…' : 'Save policy'}</button>
@@ -440,7 +561,7 @@ function TranscriptViewer({ policy, onClose }) {
   const transcript = JSON.parse(policy.transcript || '[]')
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
           <h3 className="text-sm font-bold text-gray-900">How "{policy.name}" was derived</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
@@ -449,6 +570,10 @@ function TranscriptViewer({ policy, onClose }) {
           <div className="flex flex-wrap gap-2 text-[11px] mb-1">
             <span className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">block ≥ {policy.threshold}</span>
             <span className="px-2 py-0.5 rounded bg-gray-100 text-gray-500">review every {policy.review_frequency_months || 12} months</span>
+          </div>
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase mb-1">Impact table (the appetite)</p>
+            <ImpactTableView table={policy.impact_table} />
           </div>
           {policy.rationale && (
             <div className="rounded-lg bg-amber-50 border border-amber-100 p-3">
