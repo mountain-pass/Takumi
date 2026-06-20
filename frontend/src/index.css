@@ -87,8 +87,9 @@ html.dark code, html.dark pre { background-color: #11141d !important; color: var
 html.dark ::-webkit-scrollbar-thumb { background: #2c3044; }
 
 /* Office floor + Organisation canvas (custom backgrounds the utility overrides miss) */
-.office-floor { background: linear-gradient(135deg, #f8f7f5 0%, #ede9e3 100%); }
-html.dark .office-floor { background: linear-gradient(135deg, #14161f 0%, #0c0e15 100%) !important; }
+/* Match the standard page background (bg-gray-50 / dark surface) for consistency. */
+.office-floor { background: #f9fafb; }
+html.dark .office-floor { background: var(--dk-bg) !important; }
 html.dark .bg-slate-50,
 html.dark .bg-slate-100 { background-color: var(--dk-bg) !important; }
 
