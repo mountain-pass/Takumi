@@ -390,9 +390,64 @@ async def finalize(subject: str, categories: dict, content: str = "", *,
 # ── Compliance mode + named policies ──────────────────────────────────────────
 
 def get_mode() -> str:
-    """How strict the compliance gate is: 'all', 'match', or 'off'."""
+    """How strict the compliance gate is:
+      - 'all'             → every finished task is reviewed.
+      - 'unless_excluded' → every task is reviewed UNLESS the user explicitly tells
+                            the Manager to exclude it (the bypass is logged for audit).
+      - 'off'             → no review.
+    """
     m = (runtime_settings.get().get("compliance_mode") or "all").lower()
-    return m if m in ("all", "match", "off") else "all"
+    if m == "match":  # legacy mode → closest new semantic
+        m = "unless_excluded"
+    return m if m in ("all", "unless_excluded", "off") else "all"
+
+
+# Phrases that signal the user explicitly wants to skip the compliance review.
+_EXCLUDE_HINTS = (
+    "no compliance", "skip compliance", "bypass compliance", "without compliance",
+    "exclude from compliance", "no compliance review", "skip the compliance review",
+    "no risk review", "skip risk review", "bypass review", "exclude from risk review",
+    "without risk review", "no risk and compliance", "skip risk and compliance",
+)
+
+
+async def should_exclude(manager_agent, text: str) -> tuple[bool, str]:
+    """In 'unless_excluded' mode, decide if the user explicitly asked to bypass the
+    compliance review for this task. Heuristic first (cheap, deterministic, auditable),
+    then a bounded LLM confirmation only when the wording is ambiguous."""
+    low = (text or "").lower()
+    for h in _EXCLUDE_HINTS:
+        if h in low:
+            return True, f"User explicitly requested exclusion (\"{h}\")."
+    # Only spend an LLM call when the text actually talks about compliance/bypassing.
+    triggers = ("complian", "risk review", "bypass", "exclude", "skip", "without review")
+    if manager_agent is None or not any(t in low for t in triggers):
+        return False, ""
+    try:
+        system = ("Does the user EXPLICITLY ask to skip, exclude, or bypass the risk & compliance "
+                  "review for this task? Only 'true' if they clearly opt out — not merely because "
+                  "the task seems low-risk. Return ONLY JSON {\"exclude\": true|false, \"reason\": \"...\"}.")
+        resp = await manager_agent._adapter.complete(
+            system_prompt=system, messages=[{"role": "user", "content": (text or "")[:1000]}],
+            model=manager_agent.config.llm_model, max_tokens=120)
+        data = _parse_json(resp.content)
+        if isinstance(data, dict) and data.get("exclude"):
+            return True, str(data.get("reason") or "User explicitly requested exclusion.")[:200]
+    except Exception as e:
+        logger.warning("[compliance] exclusion check failed: %s", e)
+    return False, ""
+
+
+async def log_audit(*, action: str, summary: str, ok: int = 1, task_id: str | None = None,
+                    agent_id: str = "", agent_name: str = "Manager", kind: str = "compliance") -> None:
+    """Append a compliance/governance event to the audit trail (activity_log)."""
+    try:
+        await database.log_activity({
+            "agent_id": agent_id, "agent_name": agent_name, "kind": kind,
+            "action": action, "summary": summary, "ok": int(ok), "task_id": task_id,
+        })
+    except Exception:
+        pass  # audit logging must never break the workflow
 
 
 async def summarise_policy(agent, name: str, body: str) -> str:

@@ -314,8 +314,14 @@ class Orchestrator:
         comp = ctx.get("compliance") or {}
         if mode == "off":
             return "proceed"
-        # In 'match' mode only gate tasks the Manager flagged as policy-relevant.
-        if mode == "match" and not comp.get("required"):
+        # 'unless_excluded': the user explicitly opted this task out of review. Record
+        # the bypass in the audit trail so it can be reviewed later, then proceed.
+        if mode == "unless_excluded" and comp.get("excluded"):
+            await compliance.log_audit(
+                action="compliance_bypassed", task_id=task.get("id"), ok=1,
+                agent_id=from_agent_id,
+                summary=(f"Task '{task.get('title','')[:80]}' bypassed compliance review by user "
+                         f"request. {comp.get('exclude_reason','')}".strip()))
             return "proceed"
         # Use the strictest matched named policy (lowest threshold), else baseline.
         named_policy = None
@@ -337,6 +343,11 @@ class Orchestrator:
             logger.error("[compliance] gate assessment failed: %s", e)
             return "proceed"  # fail-open so a broken assessor can't block all work
         if rec["verdict"] == "proceed":
+            await compliance.log_audit(
+                action="compliance_passed", task_id=task.get("id"), ok=1, agent_id=rc.config.id,
+                agent_name=rc.config.name,
+                summary=(f"Task '{task.get('title','')[:80]}' passed compliance review "
+                         f"({rec['level']} risk, score {rec['score']}/25, threshold {rec['threshold']})."))
             return "proceed"
 
         details = rec.get("rationale", "")
@@ -376,6 +387,11 @@ class Orchestrator:
                     named_policy["id"], f"After incident: '{task.get('title','')[:60]}' held at {rec['level']} risk")
             except Exception:
                 pass
+        await compliance.log_audit(
+            action="compliance_held", task_id=task.get("id"), ok=0, agent_id=rc.config.id,
+            agent_name=rc.config.name,
+            summary=(f"Task '{task.get('title','')[:80]}' HELD for human approval "
+                     f"({rec['level']} risk, score {rec['score']}/25, threshold {rec['threshold']})."))
         logger.info("[compliance] Task '%s' HELD for human approval (%s)",
                     task.get("title", "")[:40], rec["level"])
         return "hold"
@@ -399,6 +415,7 @@ class Orchestrator:
         if not task or task["status"] != "on_hold":
             return {"ok": False, "error": "Task is not awaiting approval"}
         from datetime import datetime as _dt
+        from . import compliance
         rec = await database.get_latest_risk_for_task(task_id)
         if approve:
             now = _dt.utcnow().isoformat()
@@ -409,6 +426,9 @@ class Orchestrator:
             fresh = await database.get_task(task_id)
             await self._handoff_to_dependents(fresh, fresh.get("result", ""), fresh["agent_id"])
             await self._present_if_plan_complete(fresh)
+            await compliance.log_audit(
+                action="compliance_approved", task_id=task_id, ok=1, agent_name="Human reviewer",
+                summary=f"User APPROVED held task '{task.get('title','')[:80]}' to complete.")
             logger.info("[compliance] Held task '%s' APPROVED by user", task.get("title", "")[:40])
         else:
             await database.update_task(task_id, {
@@ -418,6 +438,9 @@ class Orchestrator:
             if rec:
                 rec["decision"] = "rejected"; rec["id"] = __import__("uuid").uuid4().hex
                 await database.save_risk_assessment(rec)
+            await compliance.log_audit(
+                action="compliance_rejected", task_id=task_id, ok=0, agent_name="Human reviewer",
+                summary=f"User REJECTED held task '{task.get('title','')[:80]}' on compliance review.")
             logger.info("[compliance] Held task '%s' REJECTED by user", task.get("title", "")[:40])
         return {"ok": True, "decision": "approved" if approve else "rejected"}
 

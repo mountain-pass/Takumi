@@ -1258,6 +1258,14 @@ async def risk_register(limit: int = 50):
     return await database.get_risk_assessments(limit)
 
 
+@router.get("/risk/audit")
+async def risk_audit(days: float = 30, limit: int = 500):
+    """Audit trail of executed tasks and compliance governance events."""
+    from datetime import datetime, timedelta
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    return await database.get_activity(since_iso=since, limit=limit)
+
+
 @router.get("/risk/policy")
 async def get_risk_policy():
     from .. import compliance
@@ -1272,7 +1280,7 @@ class RiskPolicyReq(BaseModel):
     categories: list[str] | None = None
     likelihood_scale: list | None = None       # [{label, definition}]
     consequence_scale: list | None = None       # [{label, definition}]
-    mode: str | None = None   # 'all' | 'match' | 'off'
+    mode: str | None = None   # 'all' | 'unless_excluded' | 'off'
 
 
 @router.post("/risk/policy")
@@ -1282,7 +1290,9 @@ async def set_risk_policy(req: RiskPolicyReq):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if "mode" in updates:
         m = updates.pop("mode")
-        if m in ("all", "match", "off"):
+        if m == "match":  # legacy alias
+            m = "unless_excluded"
+        if m in ("all", "unless_excluded", "off"):
             runtime_settings.update({"compliance_mode": m})
     if "threshold" in updates:
         updates["threshold"] = max(1, min(25, int(updates["threshold"])))

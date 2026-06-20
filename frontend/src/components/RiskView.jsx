@@ -5,14 +5,16 @@
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
 import React, { useState, useEffect, useRef } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText } from 'lucide-react'
+import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History } from 'lucide-react'
 import { useBackdropDismiss } from './useBackdropDismiss'
 
 const MODES = [
-  { id: 'all', label: 'All tasks', hint: 'Every task is reviewed against the org policy.' },
-  { id: 'match', label: 'Only matched', hint: 'Only tasks the Manager matches to a policy are reviewed.' },
+  { id: 'all', label: 'All tasks', hint: 'Every finished task is reviewed against the policy.' },
+  { id: 'unless_excluded', label: 'All tasks, unless excluded', hint: 'Review everything unless you explicitly tell the Manager to exclude a task. Every bypass is recorded in the Audit trail.' },
   { id: 'off', label: 'Off', hint: 'No compliance review.' },
 ]
+// Legacy 'match' value maps to the new bypass mode.
+const normMode = (m) => (m === 'match' ? 'unless_excluded' : (m || 'all'))
 
 const LEVELS = [
   { key: 'low', label: 'Low', cls: 'bg-green-100 text-green-700 border-green-200' },
@@ -55,11 +57,13 @@ export default function RiskView() {
         <div className="flex gap-1 mt-3">
           <TabBtn active={tab === 'policy'} onClick={() => setTab('policy')} icon={SlidersHorizontal}>Global Policy</TabBtn>
           <TabBtn active={tab === 'register'} onClick={() => setTab('register')} icon={ScrollText}>Risk Register</TabBtn>
+          <TabBtn active={tab === 'audit'} onClick={() => setTab('audit')} icon={History}>Audit</TabBtn>
         </div>
       </div>
       <div className="flex-1 overflow-y-auto">
         {tab === 'policy' && <PolicyTab />}
         {tab === 'register' && <RegisterTab />}
+        {tab === 'audit' && <AuditTab />}
       </div>
     </div>
   )
@@ -148,118 +152,143 @@ function PolicyTab() {
 
   const threshold = active?.threshold || 10
   const lvl = LEVELS.find(l => l.key === levelOf(threshold))
+  const mode = normMode(fw.mode)
   return (
     <div className="max-w-5xl mx-auto px-6 py-6 space-y-6">
-      {/* Policy selector — view/edit any policy; the agent follows whichever is active */}
-      <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-xs text-gray-500 shrink-0">Policy:</span>
-          <select value={active?.id || ''} onChange={e => viewPolicy(e.target.value)} className="input py-1 text-sm min-w-0">
-            {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold}){p.is_default ? ' • active' : ''}</option>)}
-          </select>
+      {/* ── Active policy header: which policy the agent follows, + actions ── */}
+      <Card>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-xs font-semibold text-gray-500 shrink-0">Active policy</span>
+            <select value={active?.id || ''} onChange={e => viewPolicy(e.target.value)} className="input py-1.5 text-sm min-w-0">
+              {policies.map(p => <option key={p.id} value={p.id}>{p.name || 'Untitled'} (block ≥ {p.threshold}){p.is_default ? ' • active' : ''}</option>)}
+            </select>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {active && (JSON.parse(active.transcript || '[]').length > 0 || active.rationale) &&
+              <button onClick={() => setViewing(active)} title="Read the full interview that produced this policy"
+                className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-xl border border-gray-300 text-gray-700 hover:bg-gray-50">
+                <MessageSquareText size={14} /> View interview</button>}
+            {active && !active.is_default &&
+              <button onClick={() => setDefault(active.id)}
+                className="px-3 py-2 text-sm font-medium rounded-xl border border-indigo-300 text-indigo-700 hover:bg-indigo-50">Set as active</button>}
+            {active && policies.length > 1 &&
+              <button onClick={deletePolicy} title="Delete this policy"
+                className="px-3 py-2 text-sm font-medium rounded-xl border border-red-200 text-red-600 hover:bg-red-50">Delete</button>}
+            <button onClick={() => setInterviewing(true)}
+              className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+              <MessageSquareText size={14} /> New policy
+            </button>
+          </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {active && (JSON.parse(active.transcript || '[]').length > 0 || active.rationale) &&
-            <button onClick={() => setViewing(active)} title="Read the full interview that produced this policy"
-              className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-xl border border-gray-300 text-gray-700 hover:bg-gray-50">
-              <MessageSquareText size={14} /> View interview</button>}
-          {active && !active.is_default &&
-            <button onClick={() => setDefault(active.id)}
-              className="px-3 py-2 text-sm font-medium rounded-xl border border-indigo-300 text-indigo-700 hover:bg-indigo-50">Set as active</button>}
-          {active && policies.length > 1 &&
-            <button onClick={deletePolicy} title="Delete this policy"
-              className="px-3 py-2 text-sm font-medium rounded-xl border border-red-200 text-red-600 hover:bg-red-50">Delete</button>}
-          <button onClick={() => setInterviewing(true)}
-            className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
-            <MessageSquareText size={14} /> New policy
-          </button>
-        </div>
-      </div>
-      {active && active.is_default
-        ? <p className="text-[11px] text-green-600 -mt-3">✓ The agent follows this policy.</p>
-        : <p className="text-[11px] text-gray-400 -mt-3">Viewing an inactive policy — "Set as active" to make the agent follow it.</p>}
+        {active && (active.is_default
+          ? <p className="text-[11px] text-green-600">✓ The agent follows this policy.</p>
+          : <p className="text-[11px] text-gray-400">Viewing an inactive policy — "Set as active" to make the agent follow it.</p>)}
 
-      {active && (
-        <>
-          {/* Review status banner */}
+        {/* Review lifecycle */}
+        {active && (
           <div className={`rounded-xl border p-3 ${active.overdue ? 'border-amber-300 bg-amber-50' : 'border-gray-200 bg-gray-50/60'}`}>
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="text-xs text-gray-600">
                 <b className="text-gray-800">Review:</b> last {active.last_reviewed || 'never'} · next due {active.next_review || '—'} · every {active.review_frequency_months || 12} months
                 {active.overdue && <span className="ml-2 text-amber-700 font-semibold">⚠ review due{active.reason ? ` (${active.reason})` : ''}</span>}
               </div>
-              <div className="flex items-center gap-2 shrink-0">
-                {(JSON.parse(active.transcript || '[]').length > 0 || active.rationale) &&
-                  <button onClick={() => setViewing(active)} className="text-[11px] text-gray-500 hover:underline">Review policy</button>}
-                <button onClick={markReviewed} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white">Mark reviewed</button>
-              </div>
+              <button onClick={markReviewed} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shrink-0">Mark reviewed</button>
             </div>
           </div>
+        )}
+      </Card>
 
-          {/* Impact table — the policy itself; this is where appetite is set */}
-          <Section title="Impact table — your risk appetite" hint="The likelihood scale and 5×5 matrix are generic; appetite is set here. Tune what each severity means per category so one block-at-score applies uniformly.">
+      {/* ── The policy document: appetite (impact table) → matrix → summary ── */}
+      {active && (
+        <Card>
+          <CardHeader title="The policy" subtitle="Your risk appetite, expressed as the impact table. The likelihood scale and 5×5 matrix are generic — appetite is set here, so one block-at-score applies uniformly." />
+
+          <Section title="Impact table — your risk appetite" hint="Tune what each severity means per category. Lowering a category's impact lowers its appetite.">
             <ImpactTableEditor table={active.impact_table} onChange={t => setA('impact_table', t)} />
           </Section>
-          <Section title="Block at score & review cadence">
+
+          <Section title="Block-at-score & risk matrix" hint="A single uniform threshold across every category. The matrix shows where it bites.">
             <div className="flex items-center gap-3 flex-wrap">
-              <span className="text-sm text-gray-700">Block at score (uniform)</span>
+              <span className="text-sm text-gray-700">Block at score</span>
               <input type="number" min={1} max={25} value={threshold} onChange={e => setA('threshold', Math.max(1, Math.min(25, parseInt(e.target.value || '1', 10) || 1)))} className="w-20 input text-right" />
               <span className={`text-[11px] px-2 py-0.5 rounded border ${lvl.cls}`}>{lvl.label}+ blocked</span>
               <span className="text-sm text-gray-700 ml-3">Review every</span>
               <input type="number" min={1} max={60} value={active.review_frequency_months || 12} onChange={e => setA('review_frequency_months', Math.max(1, Math.min(60, parseInt(e.target.value || '12', 10) || 12)))} className="w-20 input text-right" />
               <span className="text-sm text-gray-700">months</span>
             </div>
-            <div className="mt-3"><RiskMatrix threshold={threshold} like={GENERIC_LIKELIHOOD} cons={SEVERITY_SCALE} /></div>
+            <div className="mt-4 flex justify-center"><RiskMatrix threshold={threshold} like={GENERIC_LIKELIHOOD} cons={SEVERITY_SCALE} /></div>
           </Section>
-          {/* Optional prose summary — should reflect the impact table */}
+
           <Section title="Summary (optional prose)" hint="A plain-language summary. Keep it consistent with the impact table above.">
             <textarea rows={4} className="input resize-y" value={active.body || ''} onChange={e => setA('body', e.target.value)} />
           </Section>
-          <div className="flex items-center gap-3">
+
+          <div className="flex items-center gap-3 pt-1">
             <button onClick={savePolicy} className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save policy</button>
             {savedPol && <span className="text-xs text-green-600">Saved ✓</span>}
           </div>
-        </>
+        </Card>
       )}
 
-      <hr className="border-gray-200" />
-      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Scoring framework (org-wide)</p>
+      {/* ── Org-wide scoring framework: mode, generic scale, categories ── */}
+      <Card>
+        <CardHeader title="Scoring framework" subtitle="Org-wide settings shared by every policy — how much work is reviewed, the generic likelihood scale, and which categories are scored." />
 
-      {/* Compliance mode */}
-      <Section title="Compliance review mode" hint="How much work the Risk & Compliance agent gates (requires a Risk & Compliance agent).">
-        <div className="grid grid-cols-3 gap-2">
-          {MODES.map(m => (
-            <button key={m.id} onClick={() => setFwField('mode', m.id)}
-              className={`text-left px-3 py-2 rounded-xl border text-xs ${(fw.mode || 'all') === m.id ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:bg-gray-50'}`}>
-              <div className="font-semibold text-gray-800">{m.label}</div>
-              <div className="text-[10px] text-gray-400 mt-0.5">{m.hint}</div>
-            </button>
-          ))}
-        </div>
-      </Section>
-      <Section title="Likelihood scale (1–5) — generic" hint="The same generic likelihood scale applies to every policy. Consequence severity is NOT set here — it lives in each policy's impact table above.">
-        <ScaleEditor scale={fw.likelihood_scale} onChange={s => setFwField('likelihood_scale', s)} />
-      </Section>
-      <Section title="Risk categories" hint="Which categories the agent scores against.">
-        <div className="flex flex-wrap gap-2">
-          {(fw.all_categories || fw.categories || []).map(c => {
-            const on = (fw.categories || []).includes(c)
-            return (
-              <button key={c} onClick={() => toggleCat(c)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium border capitalize ${on ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
-                {c.replace('_', ' ')}
+        <Section title="Compliance review mode" hint="How much work the Risk & Compliance agent gates (requires a Risk & Compliance agent).">
+          <div className="space-y-2">
+            {MODES.map(m => (
+              <button key={m.id} onClick={() => setFwField('mode', m.id)}
+                className={`w-full text-left px-3.5 py-2.5 rounded-xl border transition-colors ${mode === m.id ? 'border-indigo-400 bg-indigo-50 ring-1 ring-indigo-200' : 'border-gray-200 hover:bg-gray-50'}`}>
+                <div className="flex items-center gap-2">
+                  <span className={`w-3.5 h-3.5 rounded-full border-2 shrink-0 ${mode === m.id ? 'border-indigo-500 bg-indigo-500' : 'border-gray-300'}`} />
+                  <span className="text-sm font-semibold text-gray-800">{m.label}</span>
+                </div>
+                <div className="text-[11px] text-gray-400 mt-0.5 ml-6">{m.hint}</div>
               </button>
-            )
-          })}
+            ))}
+          </div>
+        </Section>
+
+        <Section title="Likelihood scale (1–5) — generic" hint="The same generic likelihood scale applies to every policy. Consequence severity lives in each policy's impact table.">
+          <ScaleEditor scale={fw.likelihood_scale} onChange={s => setFwField('likelihood_scale', s)} />
+        </Section>
+
+        <Section title="Risk categories" hint="Which categories the agent scores against.">
+          <div className="flex flex-wrap gap-2">
+            {(fw.all_categories || fw.categories || []).map(c => {
+              const on = (fw.categories || []).includes(c)
+              return (
+                <button key={c} onClick={() => toggleCat(c)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border capitalize ${on ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
+                  {c.replace('_', ' ')}
+                </button>
+              )
+            })}
+          </div>
+        </Section>
+
+        <div className="flex items-center gap-3 pt-1">
+          <button onClick={saveFw} className="flex items-center gap-1.5 px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save framework</button>
+          {savedFw && <span className="text-xs text-green-600">Saved ✓</span>}
         </div>
-      </Section>
-      <div className="flex items-center gap-3">
-        <button onClick={saveFw} className="flex items-center gap-1.5 px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-xl text-sm font-medium"><Save size={14} /> Save framework</button>
-        {savedFw && <span className="text-xs text-green-600">Saved ✓</span>}
-      </div>
+      </Card>
 
       {interviewing && <PolicyInterview onDone={() => { setInterviewing(false); loadPolicies() }} onClose={() => setInterviewing(false)} />}
       {viewing && <TranscriptViewer policy={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  )
+}
+
+function Card({ children }) {
+  return <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-5">{children}</div>
+}
+
+function CardHeader({ title, subtitle }) {
+  return (
+    <div className="border-b border-gray-100 pb-3">
+      <h2 className="text-base font-bold text-gray-900">{title}</h2>
+      {subtitle && <p className="text-xs text-gray-400 mt-0.5">{subtitle}</p>}
     </div>
   )
 }
@@ -405,6 +434,61 @@ function RegisterTab() {
             </div>
             <span className={`text-[11px] font-medium shrink-0 ${decisionTone[r.decision] || 'text-gray-500'}`}>{r.decision}</span>
             <span className="text-[10px] text-gray-400 shrink-0 w-24 text-right">{(r.created_at || '').slice(0, 16).replace('T', ' ')}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Audit tab ─────────────────────────────────────────────────────────────────
+// A trail of executed tasks and compliance governance events (passes, holds,
+// approvals/rejections, and user-requested bypasses) for later review.
+const AUDIT_KINDS = {
+  compliance: { label: 'Compliance', cls: 'bg-indigo-50 text-indigo-600 border-indigo-200' },
+  task: { label: 'Task', cls: 'bg-gray-100 text-gray-600 border-gray-200' },
+  tool: { label: 'Tool', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+  web: { label: 'Web', cls: 'bg-sky-50 text-sky-600 border-sky-200' },
+  mcp: { label: 'MCP', cls: 'bg-violet-50 text-violet-600 border-violet-200' },
+  shell: { label: 'Shell', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  browser: { label: 'Browser', cls: 'bg-teal-50 text-teal-600 border-teal-200' },
+  risk: { label: 'Risk', cls: 'bg-rose-50 text-rose-600 border-rose-200' },
+  model: { label: 'Model', cls: 'bg-fuchsia-50 text-fuchsia-600 border-fuchsia-200' },
+}
+
+function AuditTab() {
+  const [rows, setRows] = useState(null)
+  const [onlyCompliance, setOnlyCompliance] = useState(false)
+  useEffect(() => {
+    fetch('/api/risk/audit?days=30&limit=500').then(r => r.json()).then(setRows).catch(() => setRows([]))
+  }, [])
+  if (!rows) return <Loading />
+  const shown = onlyCompliance ? rows.filter(r => r.kind === 'compliance') : rows
+  return (
+    <div className="max-w-4xl mx-auto px-6 py-5 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-gray-400">Audit trail of executed tasks and compliance decisions (last 30 days). Read-only.</p>
+        <label className="flex items-center gap-1.5 text-xs text-gray-600 shrink-0 cursor-pointer">
+          <input type="checkbox" checked={onlyCompliance} onChange={e => setOnlyCompliance(e.target.checked)} />
+          Compliance only
+        </label>
+      </div>
+      {shown.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <History size={28} className="mx-auto mb-2 opacity-40" />
+          <p className="text-sm">No audit entries yet.</p>
+        </div>
+      ) : shown.map(r => {
+        const k = AUDIT_KINDS[r.kind] || AUDIT_KINDS.tool
+        return (
+          <div key={r.id} className={`flex items-start gap-3 p-3 rounded-xl border ${r.ok ? 'border-gray-200' : 'border-amber-200 bg-amber-50/40'}`}>
+            <span className={`text-[10px] px-2 py-0.5 rounded border shrink-0 mt-0.5 ${k.cls}`}>{k.label}</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-gray-800">{(r.action || '').replace(/_/g, ' ') || 'event'}</p>
+              {r.summary && <p className="text-[12px] text-gray-500 break-words">{r.summary}</p>}
+              {r.agent_name && <p className="text-[10px] text-gray-400 mt-0.5">{r.agent_name}</p>}
+            </div>
+            <span className="text-[10px] text-gray-400 shrink-0 w-28 text-right">{(r.created_at || '').slice(0, 16).replace('T', ' ')}</span>
           </div>
         )
       })}
