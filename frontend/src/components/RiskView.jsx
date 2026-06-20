@@ -653,6 +653,7 @@ function TranscriptViewer({ policy, onClose }) {
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
           <div className="flex flex-wrap gap-2 text-[11px] mb-1">
+            {policy.created_at && <span className="px-2 py-0.5 rounded bg-gray-100 text-gray-500">interviewed {(policy.created_at || '').slice(0, 10)}</span>}
             <span className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">block ≥ {policy.threshold}</span>
             <span className="px-2 py-0.5 rounded bg-gray-100 text-gray-500">review every {policy.review_frequency_months || 12} months</span>
           </div>
