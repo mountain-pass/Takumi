@@ -7,6 +7,7 @@ import { useOrgStore } from '../stores/orgStore'
 import { useProviders, useProviderModels, useCreateAgent } from '../hooks/useApi'
 import AIPromptWizard from './AIPromptWizard'
 import InterviewWizard from './InterviewWizard'
+import { useBackdropDismiss } from './useBackdropDismiss'
 
 const COLORS = ['#4F46E5', '#DC2626', '#059669', '#D97706', '#7C3AED', '#0891B2', '#DB2777']
 const BROWSER_TOOLS = ['browser_navigate', 'browser_read', 'browser_click', 'browser_type', 'browser_back', 'browser_screenshot']
@@ -32,7 +33,7 @@ export default function AgentModal({ onClose }) {
   const [error, setError] = useState('')
   const [mcpServers, setMcpServers] = useState([])
   const [showInterview, setShowInterview] = useState(false)
-  const downOnBackdrop = useRef(false)
+  const backdropDismiss = useBackdropDismiss(onClose)
 
   // Wizard recommended a model — set it (+ the OpenRouter provider) on the form.
   async function applyInterviewPick(modelId) {
@@ -81,12 +82,10 @@ export default function AgentModal({ onClose }) {
   return (
     <div
       className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
-      onMouseDown={e => { downOnBackdrop.current = e.target === e.currentTarget }}
-      onClick={e => { if (e.target === e.currentTarget && downOnBackdrop.current) onClose() }}
+      {...backdropDismiss}
     >
       <div
         className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col"
-        onMouseDown={() => { downOnBackdrop.current = false }}
       >
         <h2 className="text-lg font-bold text-gray-900 px-6 pt-6 pb-4 border-b border-gray-100 shrink-0">Add Agent</h2>
 

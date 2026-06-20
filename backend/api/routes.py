@@ -1258,6 +1258,14 @@ async def risk_register(limit: int = 50):
     return await database.get_risk_assessments(limit)
 
 
+@router.get("/risk/audit")
+async def risk_audit(days: float = 30, limit: int = 500):
+    """Audit trail of executed tasks and compliance governance events."""
+    from datetime import datetime, timedelta
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    return await database.get_activity(since_iso=since, limit=limit)
+
+
 @router.get("/risk/policy")
 async def get_risk_policy():
     from .. import compliance
@@ -1272,7 +1280,7 @@ class RiskPolicyReq(BaseModel):
     categories: list[str] | None = None
     likelihood_scale: list | None = None       # [{label, definition}]
     consequence_scale: list | None = None       # [{label, definition}]
-    mode: str | None = None   # 'all' | 'match' | 'off'
+    mode: str | None = None   # 'all' | 'unless_excluded' | 'off'
 
 
 @router.post("/risk/policy")
@@ -1282,7 +1290,9 @@ async def set_risk_policy(req: RiskPolicyReq):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if "mode" in updates:
         m = updates.pop("mode")
-        if m in ("all", "match", "off"):
+        if m == "match":  # legacy alias
+            m = "unless_excluded"
+        if m in ("all", "unless_excluded", "off"):
             runtime_settings.update({"compliance_mode": m})
     if "threshold" in updates:
         updates["threshold"] = max(1, min(25, int(updates["threshold"])))
@@ -1295,7 +1305,9 @@ async def set_risk_policy(req: RiskPolicyReq):
 
 @router.get("/risk/policies")
 async def list_named_policies():
-    return await database.list_risk_policies()
+    from .. import compliance
+    rows = await database.list_risk_policies()
+    return [{**p, **compliance.review_status(p)} for p in rows]
 
 
 class NamedPolicyReq(BaseModel):
@@ -1304,6 +1316,11 @@ class NamedPolicyReq(BaseModel):
     body: str = ""
     threshold: int = 10
     enabled: bool = True
+    transcript: list = []     # the interview Q&A this policy was derived from
+    make_default: bool = False
+    review_frequency_months: int = 12
+    rationale: str = ""       # how the block-at-score was derived
+    impact_table: list = []   # per-category severity (1-5) definitions = the appetite
 
 
 @router.post("/risk/policies")
@@ -1315,17 +1332,72 @@ async def save_named_policy(req: NamedPolicyReq):
     summary = await compliance.summarise_policy(mgr, req.name, req.body)
     if not summary:  # fall back to the policy text so matching still works
         summary = (req.body or "").strip()[:240]
+    # Preserve rationale/impact_table on edits if the client didn't resend them.
+    rationale = req.rationale
+    impact_table = compliance._norm_impact_table(req.impact_table) if req.impact_table else []
+    if req.id:
+        existing = await database.get_risk_policy_row(req.id)
+        if not rationale:
+            rationale = (existing or {}).get("rationale", "")
+        if not impact_table:
+            try:
+                impact_table = compliance._norm_impact_table(_json.loads((existing or {}).get("impact_table") or "[]"))
+            except Exception:
+                impact_table = []
+    if not impact_table:  # always store a full table so the document renders
+        impact_table = compliance._norm_impact_table([])
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
+        "transcript": req.transcript or [], "review_frequency_months": req.review_frequency_months,
+        "rationale": rationale, "impact_table": impact_table,
     })
+    # First policy becomes the active (default) global policy; or if requested.
+    existing = await database.list_risk_policies()
+    if req.make_default or len(existing) == 1:
+        await database.set_default_risk_policy(pid)
     return await database.get_risk_policy_row(pid)
+
+
+@router.post("/risk/policies/{policy_id}/reviewed")
+async def mark_policy_reviewed(policy_id: str):
+    if not await database.get_risk_policy_row(policy_id):
+        raise HTTPException(404, "Policy not found")
+    await database.mark_policy_reviewed(policy_id)
+    return {"ok": True}
+
+
+@router.post("/risk/policies/{policy_id}/default")
+async def set_default_policy(policy_id: str):
+    if not await database.get_risk_policy_row(policy_id):
+        raise HTTPException(404, "Policy not found")
+    await database.set_default_risk_policy(policy_id)
+    return {"ok": True, "default": policy_id}
 
 
 @router.delete("/risk/policies/{policy_id}")
 async def delete_named_policy(policy_id: str):
+    row = await database.get_risk_policy_row(policy_id)
+    was_default = bool(row and row.get("is_default"))
     await database.delete_risk_policy(policy_id)
+    # If we deleted the active policy, promote another so the agent still has one.
+    if was_default:
+        remaining = await database.list_risk_policies()
+        if remaining:
+            await database.set_default_risk_policy(remaining[0]["id"])
     return {"ok": True}
+
+
+class InterviewReq(BaseModel):
+    history: list = []   # [{role:'assistant'|'user', content:str}]
+
+
+@router.post("/risk/interview")
+async def risk_interview(req: InterviewReq):
+    """One turn of the policy interview, driven by the Manager."""
+    from .. import compliance
+    mgr = next((a for a in orchestrator.get_agents() if a.config.is_ceo), None)
+    return await compliance.policy_interview(mgr, req.history)
 
 
 class RiskDecisionReq(BaseModel):

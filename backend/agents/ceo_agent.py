@@ -664,7 +664,8 @@ class CEOAgent(BaseAgent):
 
     async def _tag_compliance(self, title: str, instruction: str) -> dict | None:
         """Decide whether a task needs independent Risk & Compliance review.
-        'all' → always; 'match' → only if it matches a named policy; 'off' → never."""
+        'all' → always; 'unless_excluded' → always unless the user explicitly opts
+        the task out (the bypass is recorded for audit); 'off' → never."""
         from .. import compliance
         mode = compliance.get_mode()
         if mode == "off":
@@ -674,19 +675,13 @@ class CEOAgent(BaseAgent):
             return None
         if mode == "all":
             return {"required": True, "mode": "all", "policy_ids": [], "policy_names": []}
-        # mode == 'match': the Manager checks the task against named policies.
-        try:
-            policies = await database.list_risk_policies(enabled_only=True)
-        except Exception:
-            policies = []
-        if not policies:
-            return None
-        matched = await compliance.match_policies(self, f"{title}\n{instruction}", policies)
-        if not matched:
-            return None
-        return {"required": True, "mode": "match",
-                "policy_ids": [p["id"] for p in matched],
-                "policy_names": [p["name"] for p in matched]}
+        # mode == 'unless_excluded': review everything unless the user opted this task out.
+        excluded, reason = await compliance.should_exclude(self, f"{title}\n{instruction}")
+        if excluded:
+            return {"required": False, "mode": "unless_excluded",
+                    "excluded": True, "exclude_reason": reason,
+                    "policy_ids": [], "policy_names": []}
+        return {"required": True, "mode": "unless_excluded", "policy_ids": [], "policy_names": []}
 
     async def _build_sop_master_list(self) -> str:
         """The Manager's master list of daily SOP tasks across all agents."""

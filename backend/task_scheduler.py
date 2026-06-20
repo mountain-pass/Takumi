@@ -69,8 +69,10 @@ class TaskScheduler:
             today = now.date().isoformat()
             if await database.get_setting("_last_daily_update") == today:
                 return
+            from . import compliance
             sops = await database.get_daily_sop_tasks()
-            if not sops:
+            due = await compliance.policies_due_for_review()
+            if not sops and not due:
                 return
             if hasattr(self._orch, "post_daily_update"):
                 await self._orch.post_daily_update()

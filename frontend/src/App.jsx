@@ -18,6 +18,7 @@ import {
   Moon,
   Sun,
   ShieldCheck,
+  ChevronDown,
 } from 'lucide-react'
 import { useOrgStore } from './stores/orgStore'
 import SetupWizard from './components/SetupWizard'
@@ -107,6 +108,7 @@ function ChatHistory({ active }) {
   useEffect(() => { loadChatConversations() }, [])
 
   const newChat = useOrgStore(s => s.newChat)
+  const [collapsed, setCollapsed] = useState(false)
 
   async function remove(id, e) {
     e.stopPropagation()
@@ -117,9 +119,14 @@ function ChatHistory({ active }) {
   }
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col mt-4">
-      <p className="px-3 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400">History</p>
-      <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
+    <div className={`min-h-0 flex flex-col mt-4 ${collapsed ? '' : 'flex-1'}`}>
+      <button onClick={() => setCollapsed(c => !c)}
+        className="group flex items-center gap-1 px-3 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400 hover:text-gray-600">
+        <ChevronDown size={12} className={`transition-transform ${collapsed ? '-rotate-90' : ''}`} />
+        <span>History</span>
+        {conversations.length > 0 && <span className="ml-1 normal-case tracking-normal text-gray-300">({conversations.length})</span>}
+      </button>
+      <div className={`overflow-y-auto px-2 space-y-0.5 ${collapsed ? 'hidden' : 'flex-1'}`}>
         {conversations.length === 0 ? (
           <p className="px-3 py-2 text-[11px] text-gray-400">No conversations yet</p>
         ) : conversations.map(conv => (

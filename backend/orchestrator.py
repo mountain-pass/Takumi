@@ -113,15 +113,25 @@ class Orchestrator:
         outcome and post it into a 'Daily update' chat conversation."""
         import uuid
         from datetime import date
+        from . import compliance
         sops = await database.get_daily_sop_tasks()
-        if not sops or not self._ceo:
+        due_policies = await compliance.policies_due_for_review()
+        if (not sops and not due_policies) or not self._ceo:
             return
         today = date.today().isoformat()
         names = {a.config.id: a.config.name for a in self.get_agents()}
         failed = [t for t in sops if t.get("status") == "failed"]
 
-        lines = [f"## Daily update — {today}", "",
-                 f"Tracking **{len(sops)}** daily SOP task(s) across the team."]
+        lines = [f"## Daily update — {today}", ""]
+        # Policy review reminders first — these need the user's action.
+        if due_policies:
+            lines.append("### 📋 Policy reviews due")
+            for p in due_policies:
+                why = (" — " + p["reason"]) if p.get("reason") else (
+                    f" — last reviewed {p.get('last_reviewed') or 'never'}" if p.get("last_reviewed") else " — never reviewed")
+                lines.append(f"- **{p['name']}** is due for review{why}. Please review and mark it reviewed in Risk & Compliance.")
+            lines.append("")
+        lines.append(f"Tracking **{len(sops)}** daily SOP task(s) across the team.")
         by_agent: dict[str, list] = {}
         for t in sops:
             by_agent.setdefault(t["agent_id"], []).append(t)
@@ -304,8 +314,14 @@ class Orchestrator:
         comp = ctx.get("compliance") or {}
         if mode == "off":
             return "proceed"
-        # In 'match' mode only gate tasks the Manager flagged as policy-relevant.
-        if mode == "match" and not comp.get("required"):
+        # 'unless_excluded': the user explicitly opted this task out of review. Record
+        # the bypass in the audit trail so it can be reviewed later, then proceed.
+        if mode == "unless_excluded" and comp.get("excluded"):
+            await compliance.log_audit(
+                action="compliance_bypassed", task_id=task.get("id"), ok=1,
+                agent_id=from_agent_id,
+                summary=(f"Task '{task.get('title','')[:80]}' bypassed compliance review by user "
+                         f"request. {comp.get('exclude_reason','')}".strip()))
             return "proceed"
         # Use the strictest matched named policy (lowest threshold), else baseline.
         named_policy = None
@@ -314,6 +330,9 @@ class Orchestrator:
                                 for pid in (comp.get("policy_ids") or [])] if r]
             if rows:
                 named_policy = min(rows, key=lambda r: r.get("threshold", 10))
+            else:
+                # No specific match → assess against the default policy if one is set.
+                named_policy = await database.get_default_risk_policy()
         except Exception:
             named_policy = None
         attempt = int(comp.get("attempt", 0))
@@ -324,6 +343,11 @@ class Orchestrator:
             logger.error("[compliance] gate assessment failed: %s", e)
             return "proceed"  # fail-open so a broken assessor can't block all work
         if rec["verdict"] == "proceed":
+            await compliance.log_audit(
+                action="compliance_passed", task_id=task.get("id"), ok=1, agent_id=rc.config.id,
+                agent_name=rc.config.name,
+                summary=(f"Task '{task.get('title','')[:80]}' passed compliance review "
+                         f"({rec['level']} risk, score {rec['score']}/25, threshold {rec['threshold']})."))
             return "proceed"
 
         details = rec.get("rationale", "")
@@ -355,6 +379,19 @@ class Orchestrator:
         # Second time still over threshold → hold for human approval.
         await database.update_task(task["id"], {"status": "on_hold", "result": result[:2000]})
         await self._notify_risk_hold(task, rec)
+        # A compliance hold is a "major incident" — flag the governing policy for
+        # review (orgs review policies annually AND after an incident).
+        if named_policy and named_policy.get("id"):
+            try:
+                await database.flag_policy_for_review(
+                    named_policy["id"], f"After incident: '{task.get('title','')[:60]}' held at {rec['level']} risk")
+            except Exception:
+                pass
+        await compliance.log_audit(
+            action="compliance_held", task_id=task.get("id"), ok=0, agent_id=rc.config.id,
+            agent_name=rc.config.name,
+            summary=(f"Task '{task.get('title','')[:80]}' HELD for human approval "
+                     f"({rec['level']} risk, score {rec['score']}/25, threshold {rec['threshold']})."))
         logger.info("[compliance] Task '%s' HELD for human approval (%s)",
                     task.get("title", "")[:40], rec["level"])
         return "hold"
@@ -378,6 +415,7 @@ class Orchestrator:
         if not task or task["status"] != "on_hold":
             return {"ok": False, "error": "Task is not awaiting approval"}
         from datetime import datetime as _dt
+        from . import compliance
         rec = await database.get_latest_risk_for_task(task_id)
         if approve:
             now = _dt.utcnow().isoformat()
@@ -388,6 +426,9 @@ class Orchestrator:
             fresh = await database.get_task(task_id)
             await self._handoff_to_dependents(fresh, fresh.get("result", ""), fresh["agent_id"])
             await self._present_if_plan_complete(fresh)
+            await compliance.log_audit(
+                action="compliance_approved", task_id=task_id, ok=1, agent_name="Human reviewer",
+                summary=f"User APPROVED held task '{task.get('title','')[:80]}' to complete.")
             logger.info("[compliance] Held task '%s' APPROVED by user", task.get("title", "")[:40])
         else:
             await database.update_task(task_id, {
@@ -397,6 +438,9 @@ class Orchestrator:
             if rec:
                 rec["decision"] = "rejected"; rec["id"] = __import__("uuid").uuid4().hex
                 await database.save_risk_assessment(rec)
+            await compliance.log_audit(
+                action="compliance_rejected", task_id=task_id, ok=0, agent_name="Human reviewer",
+                summary=f"User REJECTED held task '{task.get('title','')[:80]}' on compliance review.")
             logger.info("[compliance] Held task '%s' REJECTED by user", task.get("title", "")[:40])
         return {"ok": True, "decision": "approved" if approve else "rejected"}
 
