@@ -489,7 +489,9 @@ _INTERVIEW_SYSTEM = (
     "- a calibration scenario: {\"type\":\"scenario\",\"scenario\":\"<one concrete scenario>\","
     "\"options\":[\"<view A>\",\"<view B>\",\"<view C>\"]}\n"
     "- the finished policy: {\"type\":\"final\",\"name\":\"<short policy name>\","
-    "\"appetite\":\"<2-4 sentence plain-language summary that MATCHES the impact table>\","
+    "\"appetite\":\"<DETAILED plain-language summary that MATCHES the impact table — keep the "
+    "specifics (concrete amounts, what is acceptable vs not, the scenarios) so an agent can use it "
+    "for risk decisions; fix typos/grammar but do not over-summarise>\","
     "\"impact_table\":[{\"category\":\"financial\",\"definitions\":[\"<sev1>\",\"<sev2>\",\"<sev3>\","
     "\"<sev4>\",\"<sev5>\"]}, ... one row per category: financial, data_privacy, security, "
     "legal_compliance, reputational, operational],"
@@ -497,7 +499,8 @@ _INTERVIEW_SYSTEM = (
     "(only the most severe work is blocked); LOWER = cautious. Set it to MATCH how tolerant their "
     "answers were — a very risk-tolerant person should get a HIGH threshold (18-22), a cautious "
     "person a LOW one (5-8); 10-13 is balanced>,"
-    "\"review_frequency_months\":<int, e.g. 12 for annual>,"
+    "\"review_frequency_months\":<int — use the cadence the USER stated: quarterly=3, every 6 "
+    "months=6, annually=12; do NOT default to 12 if they said otherwise>,"
     "\"rationale\":\"<why this threshold and how the impact table reflects their scenario answers>\"}\n"
     "In 'appetite', FIX all spelling, typos and grammar from the user's answers and write it cleanly "
     "and professionally — do NOT quote their raw text. Each impact cell is a short concrete definition "
@@ -511,14 +514,17 @@ _FINALIZE_SYSTEM = (
     "You are writing a company's ISO 31000 risk policy from a COMPLETED interview. Respond with "
     "STRICT JSON only, keys: name, appetite, threshold, impact_table, review_frequency_months, "
     "rationale.\n"
-    "- appetite: a clean, professional 2-4 sentence summary of their risk appetite. FIX every "
-    "spelling mistake, typo and grammar error from the user; do NOT quote their raw words.\n"
+    "- appetite: a clean, professional but DETAILED summary of their risk appetite. FIX every "
+    "spelling mistake, typo and grammar error, but KEEP the specifics — concrete amounts, what is "
+    "acceptable vs unacceptable, the scenarios they reacted to — so an agent can use it to make risk "
+    "decisions later. Do not over-summarise or drop details; do NOT quote their raw words.\n"
     "- threshold: the block-at-score on the 5×5 matrix (1-25), applied uniformly. HIGHER = MORE "
     "risk-tolerant (only the most severe risks are blocked); LOWER = cautious. Choose it to MATCH "
     "their tolerance: very tolerant → 18-22, balanced → 10-13, cautious → 5-8.\n"
     "- impact_table: one row per category [financial, data_privacy, security, legal_compliance, "
     "reputational, operational], each with 5 short severity definitions (levels 1-5) tuned to them.\n"
-    "- review_frequency_months: integer (12 = annual).\n"
+    "- review_frequency_months: integer — use the cadence the USER stated (e.g. quarterly = 3, "
+    "every 6 months = 6, annually = 12). Do NOT default to 12 if they said otherwise.\n"
     "- rationale: 1-2 sentences on why this threshold, referencing their tolerance.\n"
     "Output JSON and nothing else."
 )
@@ -551,23 +557,64 @@ def _infer_threshold(answers: list[str]) -> int:
     return max(5, min(22, 10 + 3 * (tol - av)))
 
 
+def _infer_review_months(answers: list[str]) -> int:
+    """Pull the review cadence the user actually stated (e.g. "every 3 months",
+    "quarterly", "annually") out of their answers. Defaults to 12 (annual)."""
+    text = " ".join(answers).lower()
+    m = re.search(r"every\s+(\d{1,2})\s*month", text) or re.search(r"(\d{1,2})\s*month", text)
+    if m:
+        return max(1, min(60, int(m.group(1))))
+    m = re.search(r"every\s+(\d{1,2})\s*year", text)
+    if m:
+        return max(1, min(60, int(m.group(1)) * 12))
+    if "quarter" in text:                       # quarterly
+        return 3
+    if "monthly" in text:
+        return 1
+    if "fortnight" in text or "every two weeks" in text or "biweekly" in text:
+        return 1
+    if "semi-annual" in text or "biannual" in text or "twice a year" in text or "every 6 months" in text:
+        return 6
+    if "annual" in text or "yearly" in text or "every year" in text or "once a year" in text:
+        return 12
+    return 12
+
+
+def _cadence_phrase(months: int) -> str:
+    if months == 12:
+        return "annually"
+    if months == 3:
+        return "every 3 months (quarterly)"
+    if months == 1:
+        return "monthly"
+    if months == 6:
+        return "every 6 months"
+    return f"every {months} months"
+
+
 def _scripted_synthesise(history: list[dict]) -> dict:
-    """Heuristic final policy when no LLM is available — derives the block-at-score from
-    the answers and writes a clean (typo-free) summary instead of echoing raw text."""
-    answers = [m.get("content", "") for m in (history or []) if m.get("role") == "user"]
+    """Heuristic final policy when the LLM isn't available — derives the block-at-score
+    AND the review cadence from the answers, and keeps the interview detail in the summary
+    so the assessing agent has the specifics (amounts, what's acceptable, etc.)."""
+    answers = [m.get("content", "").strip() for m in (history or []) if m.get("role") == "user"]
+    answers = [a for a in answers if a]
     threshold = _infer_threshold(answers)
+    review_months = _infer_review_months(answers)
     appetite_level = "high" if threshold >= 16 else "moderate" if threshold >= 10 else "low"
+    detail = " ".join(a if a.endswith((".", "!", "?")) else a + "." for a in answers)
     appetite = (
-        f"This organisation has a {appetite_level} appetite for risk. Impact severities are tuned per "
-        f"category below, and a single block-at-score of {threshold} applies uniformly across every "
-        f"category. The policy is reviewed at least annually and after any major incident."
+        f"This organisation has a {appetite_level} appetite for risk. A single block-at-score of "
+        f"{threshold} applies uniformly across every category (a higher score blocks only the most "
+        f"severe work). Details from the interview to guide assessment: {detail} "
+        f"The policy is reviewed {_cadence_phrase(review_months)} and after any major incident."
     )
     rationale = (
         f"Block-at-score set to {threshold} to match the {appetite_level} risk tolerance expressed in "
-        f"the interview. A higher score blocks only the most severe risks; a lower one is more cautious."
+        f"the interview; review cadence {_cadence_phrase(review_months)}. A higher score blocks only the "
+        f"most severe risks; a lower one is more cautious."
     )
     return {"type": "final", "name": "Risk Policy", "appetite": appetite, "threshold": threshold,
-            "review_frequency_months": 12,
+            "review_frequency_months": review_months,
             "impact_table": [dict(r) for r in DEFAULT_IMPACT_TABLE], "rationale": rationale}
 
 
