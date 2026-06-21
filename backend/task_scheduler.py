@@ -60,6 +60,9 @@ class TaskScheduler:
         # Once a day, have the Manager post a daily update across all SOPs.
         await self._maybe_daily_update(now)
 
+        # Dispatch any live, schedule-triggered workflows whose cron is due.
+        await self._dispatch_scheduled_workflows(now)
+
         due = await database.get_due_tasks(now.isoformat())
         if not due:
             return
@@ -84,6 +87,34 @@ class TaskScheduler:
             await database.set_setting("_last_daily_update", today)
         except Exception as e:
             logger.error("Daily update failed: %s", e, exc_info=True)
+
+    async def _dispatch_scheduled_workflows(self, now: datetime) -> None:
+        """Run live workflows whose schedule cron is due. next_run_at is stored in
+        the workflow's trigger_config; computed with the same cron helper as tasks."""
+        try:
+            from .workflows import run_workflow
+            workflows = await database.list_workflows()
+        except Exception as e:
+            logger.debug("workflow schedule scan skipped: %s", e)
+            return
+        for wf in workflows:
+            if wf.get("status") != "live" or wf.get("trigger_type") != "schedule":
+                continue
+            cfg = wf.get("trigger_config") or {}
+            cron = cfg.get("cron")
+            if not cron:
+                continue
+            next_run = cfg.get("next_run_at")
+            if next_run and now.isoformat() < next_run:
+                continue
+            try:
+                asyncio.create_task(run_workflow(wf, cfg.get("payload") or {}, mode="live",
+                                                 trigger_source="schedule", orchestrator=self._orch))
+            except Exception as e:
+                logger.error("scheduled workflow %s failed to dispatch: %s", wf["id"][:8], e)
+            new_next = self._compute_next_run(cron)
+            cfg["next_run_at"] = new_next or (now + timedelta(hours=1)).isoformat()
+            await database.update_workflow(wf["id"], {"trigger_config": cfg})
 
     async def _recover_stale_tasks(self, now: datetime) -> None:
         """Reset in_progress tasks that have been running too long (likely from a crashed process)."""

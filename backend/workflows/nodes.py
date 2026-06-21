@@ -1,0 +1,322 @@
+"""
+Workflow node handlers.
+
+Each handler is `async def handler(node, inputs, ctx) -> dict` where:
+  • node   — {id, type, data:{label, config}} from the saved graph
+  • inputs — the merged output of this node's upstream node(s) (a dict)
+  • ctx    — NodeContext (run_id, mode, orchestrator, context map of node_id→output)
+
+A handler returns a JSON-serialisable dict that becomes this node's output and
+is fed to its descendants. Control-flow nodes (`if`) additionally return a
+`_branch` key naming which source handle to follow.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Per-node soft timeout (seconds) so a hung node fails cleanly. Mirrors the
+# task-watchdog ethos used elsewhere in the platform.
+NODE_TIMEOUT = 120
+
+
+class NodeContext:
+    def __init__(self, *, run_id: str, mode: str, orchestrator, workflow: dict) -> None:
+        self.run_id = run_id
+        self.mode = mode
+        self.orchestrator = orchestrator
+        self.workflow = workflow
+        self.context: dict[str, Any] = {}   # node_id → output
+
+
+# ── templating ────────────────────────────────────────────────────────────────
+
+_TPL = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+
+
+def _resolve_path(path: str, ctx: NodeContext, inputs: dict) -> Any:
+    """Resolve a dotted path like 'nodeId.body.title' or '$.field' (current input)."""
+    parts = path.split(".")
+    if parts[0] in ("$", "input", "json"):
+        cur: Any = inputs
+        parts = parts[1:]
+    elif parts[0] in ctx.context:
+        cur = ctx.context[parts[0]]
+        parts = parts[1:]
+    else:
+        cur = ctx.context
+    for p in parts:
+        if isinstance(cur, dict):
+            cur = cur.get(p)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(p)]
+            except Exception:
+                return None
+        else:
+            return None
+    return cur
+
+
+def render(value: Any, ctx: NodeContext, inputs: dict) -> Any:
+    """Render {{...}} templates in strings (and recursively in dicts/lists)."""
+    if isinstance(value, str):
+        def sub(m):
+            r = _resolve_path(m.group(1), ctx, inputs)
+            return r if isinstance(r, str) else json.dumps(r) if r is not None else ""
+        # Whole-string single template → return the raw value (keeps types).
+        whole = _TPL.fullmatch(value.strip())
+        if whole:
+            return _resolve_path(whole.group(1), ctx, inputs)
+        return _TPL.sub(sub, value)
+    if isinstance(value, dict):
+        return {k: render(v, ctx, inputs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [render(v, ctx, inputs) for v in value]
+    return value
+
+
+def _cfg(node: dict) -> dict:
+    return (node.get("data") or {}).get("config") or {}
+
+
+# ── handlers ──────────────────────────────────────────────────────────────────
+
+async def trigger_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """The entry node — passes the incoming trigger payload through."""
+    return inputs or _cfg(node).get("sample") or {}
+
+
+async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    import httpx
+    cfg = render(_cfg(node), ctx, inputs)
+    method = (cfg.get("method") or "GET").upper()
+    url = cfg.get("url") or ""
+    if not url:
+        raise ValueError("HTTP node has no URL configured")
+    headers = cfg.get("headers") or {}
+    body = cfg.get("body")
+    async with httpx.AsyncClient(timeout=NODE_TIMEOUT, follow_redirects=True) as client:
+        kwargs: dict[str, Any] = {"headers": headers}
+        if body not in (None, ""):
+            if isinstance(body, (dict, list)):
+                kwargs["json"] = body
+            else:
+                kwargs["content"] = str(body)
+        resp = await client.request(method, url, **kwargs)
+    try:
+        parsed = resp.json()
+    except Exception:
+        parsed = resp.text
+    return {"status": resp.status_code, "headers": dict(resp.headers), "body": parsed}
+
+
+# A deliberately small, safe environment for the code node. No imports, no
+# builtins beyond a curated map. This is NOT a hardened sandbox — see plan.
+_SAFE_BUILTINS = {
+    "len": len, "range": range, "min": min, "max": max, "sum": sum, "sorted": sorted,
+    "abs": abs, "round": round, "str": str, "int": int, "float": float, "bool": bool,
+    "list": list, "dict": dict, "set": set, "tuple": tuple, "enumerate": enumerate,
+    "zip": zip, "map": map, "filter": filter, "any": any, "all": all, "json": json,
+}
+
+
+async def code_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Run a small script. Language 'python' (default) or 'javascript'.
+    `input` and `context` are in scope; assign to `output`."""
+    cfg = _cfg(node)
+    lang = (cfg.get("language") or "python").lower()
+    code = cfg.get("code") or ("output = input" if lang == "python" else "output = input;")
+    if lang in ("javascript", "js", "node"):
+        return await _run_js(code, inputs, ctx)
+    env = {"__builtins__": _SAFE_BUILTINS}
+    local = {"input": inputs, "context": ctx.context, "output": None}
+    try:
+        # Try as an expression first (so `input['x'] * 2` works directly).
+        local["output"] = eval(compile(code, "<code-node>", "eval"), env, local)
+    except SyntaxError:
+        exec(compile(code, "<code-node>", "exec"), env, local)
+    out = local.get("output")
+    return out if isinstance(out, dict) else {"result": out}
+
+
+async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
+    """Execute JS via a `node` subprocess. `input`/`context` are injected as JSON;
+    the script should assign `output`. Requires Node.js on PATH."""
+    import shutil
+    node_bin = shutil.which("node")
+    if not node_bin:
+        raise RuntimeError("JavaScript code node requires Node.js on PATH (not found)")
+    harness = (
+        "const input = JSON.parse(process.env.WF_INPUT || '{}');\n"
+        "const context = JSON.parse(process.env.WF_CONTEXT || '{}');\n"
+        "let output;\n" + code + "\n"
+        "process.stdout.write(JSON.stringify(output === undefined ? null : output));\n"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        node_bin, "-e", harness,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={"WF_INPUT": json.dumps(inputs), "WF_CONTEXT": json.dumps(ctx.context),
+             "PATH": __import__("os").environ.get("PATH", "")},
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=NODE_TIMEOUT - 5)
+    if proc.returncode != 0:
+        raise RuntimeError(f"JS error: {(err or b'').decode()[:300]}")
+    try:
+        parsed = json.loads((out or b"").decode() or "null")
+    except Exception:
+        parsed = (out or b"").decode()
+    return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+
+async def if_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Evaluate a boolean condition; route to the 'true' or 'false' handle."""
+    cfg = _cfg(node)
+    expr = cfg.get("condition") or "True"
+    rendered = render(expr, ctx, inputs)
+    try:
+        if isinstance(rendered, str):
+            result = bool(eval(compile(rendered, "<if-node>", "eval"),
+                              {"__builtins__": _SAFE_BUILTINS},
+                              {"input": inputs, "context": ctx.context}))
+        else:
+            result = bool(rendered)
+    except Exception as e:
+        logger.warning("[workflow] if-node eval failed: %s", e)
+        result = False
+    return {"result": result, "_branch": "true" if result else "false"}
+
+
+async def loop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Split an array field into items the downstream branch runs over.
+    Phase-1: returns the items list; the engine fans the downstream branch out."""
+    cfg = _cfg(node)
+    field = cfg.get("items_field") or "items"
+    items = _resolve_path(field, ctx, inputs)
+    if not isinstance(items, list):
+        items = inputs.get(field) if isinstance(inputs, dict) else None
+    items = items if isinstance(items, list) else []
+    return {"items": items, "count": len(items), "_loop": True}
+
+
+async def merge_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Combine all upstream outputs into one object (engine passes them via inputs._merged)."""
+    merged = inputs.get("_merged") if isinstance(inputs, dict) else None
+    if merged is None:
+        return inputs or {}
+    return {"merged": merged}
+
+
+async def llm_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Run a prompt against a chosen agent, optionally overriding which provider
+    and model run the task (like n8n's agent node). The compliance gate is applied
+    by the engine AFTER this returns (it needs the run/step context)."""
+    cfg = _cfg(node)
+    prompt = render(cfg.get("prompt") or "", ctx, inputs)
+    system = cfg.get("system") or "You are a helpful assistant inside an automated workflow."
+    agent_id = cfg.get("agent_id") or ""
+    orch = ctx.orchestrator
+
+    agent = None
+    if orch is not None:
+        agents = orch.get_agents()
+        if agent_id:
+            agent = next((a for a in agents if a.config.id == agent_id), None)
+        if agent is None:
+            agent = next((a for a in agents if not a.config.is_ceo), None) or (agents[0] if agents else None)
+    if agent is None:
+        raise ValueError("No agent available to run the LLM node")
+
+    # Provider/model override: build a fresh adapter for the chosen provider.
+    adapter = agent._adapter
+    model = cfg.get("model") or agent.config.llm_model
+    provider_id = cfg.get("api_provider_id")
+    if provider_id:
+        from ..llm_adapters.factory import get_adapter_for_provider
+        adapter = get_adapter_for_provider(provider_id, agent.settings)
+
+    if not prompt:
+        prompt = json.dumps(inputs)[:4000] if inputs else "Proceed."
+    resp = await adapter.complete(
+        system_prompt=system,
+        messages=[{"role": "user", "content": str(prompt)}],
+        model=model,
+        max_tokens=int(cfg.get("max_tokens") or 1024),
+    )
+    return {"text": resp.content, "agent": agent.config.name, "agent_id": agent.config.id, "model": model}
+
+
+async def wait_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Pause the workflow for a bounded number of seconds, then pass input through."""
+    cfg = _cfg(node)
+    try:
+        secs = float(cfg.get("seconds") or 1)
+    except Exception:
+        secs = 1
+    secs = max(0, min(secs, NODE_TIMEOUT - 5))   # bounded by the node timeout
+    await asyncio.sleep(secs)
+    return inputs if isinstance(inputs, dict) else {"value": inputs}
+
+
+async def noop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Do nothing — pass input straight through (useful as a join/placeholder)."""
+    return inputs if isinstance(inputs, dict) else {"value": inputs}
+
+
+async def respond_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Mark the payload to return to a webhook caller. The webhook route returns
+    the output of the (first) respond node in the run."""
+    cfg = _cfg(node)
+    body = render(cfg.get("body"), ctx, inputs) if cfg.get("body") not in (None, "") else inputs
+    return {"response": body}
+
+
+async def subworkflow_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Run another workflow by name/id and return its final output. Bounded depth
+    to prevent infinite recursion."""
+    from .. import database
+    from .engine import run_workflow
+
+    if getattr(ctx, "depth", 0) >= 3:
+        raise ValueError("Sub-workflow nesting too deep (max 3)")
+    cfg = _cfg(node)
+    target = None
+    wf_id = cfg.get("workflow_id")
+    name = cfg.get("workflow_name")
+    if wf_id:
+        target = await database.get_workflow(wf_id)
+    if target is None and name:
+        wfs = await database.list_workflows()
+        target = next((w for w in wfs if (w.get("name") or "").lower() == name.lower()), None)
+    if target is None:
+        raise ValueError("Sub-workflow not found (set workflow_id or workflow_name)")
+
+    child_depth = getattr(ctx, "depth", 0) + 1
+    run_id = await run_workflow(target, inputs if isinstance(inputs, dict) else {"value": inputs},
+                                mode=ctx.mode, trigger_source="subworkflow",
+                                orchestrator=ctx.orchestrator, _depth=child_depth)
+    run = await database.get_run(run_id)
+    steps = run.get("steps", []) if run else []
+    final = steps[-1]["output"] if steps else {}
+    return {"workflow": target["name"], "run_id": run_id,
+            "status": run.get("status") if run else "unknown", "output": final}
+
+
+NODE_HANDLERS = {
+    "trigger": trigger_node,
+    "http": http_node,
+    "code": code_node,
+    "if": if_node,
+    "loop": loop_node,
+    "merge": merge_node,
+    "llm": llm_node,
+    "wait": wait_node,
+    "noop": noop_node,
+    "respond": respond_node,
+    "subworkflow": subworkflow_node,
+}

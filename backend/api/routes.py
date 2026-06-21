@@ -1785,3 +1785,141 @@ async def mcp_oauth_callback(code: str = "", state: str = "", error: str = ""):
     if resolve_callback(state, code):
         return page("Authorized ✓", "You can close this window and return to Takumi.", True)
     return page("Authorization expired", "This request was not recognised. Please try connecting again.", False)
+
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+
+class WorkflowReq(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    graph: dict | None = None
+    status: str | None = None
+    require_compliance: bool | None = None
+    trigger_type: str | None = None
+    trigger_config: dict | None = None
+
+
+@router.get("/workflows")
+async def list_workflows_route():
+    workflows = await database.list_workflows()
+    # Attach last-run status for the list view.
+    for wf in workflows:
+        runs = await database.list_runs(wf["id"], limit=1)
+        wf["last_run"] = runs[0] if runs else None
+    return {"workflows": workflows}
+
+
+@router.post("/workflows")
+async def create_workflow_route(req: WorkflowReq):
+    import uuid as _uuid
+    wf = {
+        "id": _uuid.uuid4().hex,
+        "name": req.name or "Untitled workflow",
+        "description": req.description or "",
+        "graph": req.graph or {"nodes": [], "edges": []},
+        "status": "draft",
+        "require_compliance": True if req.require_compliance is None else req.require_compliance,
+        "trigger_type": req.trigger_type or "manual",
+        "trigger_config": req.trigger_config or {},
+    }
+    return await database.create_workflow(wf)
+
+
+@router.get("/workflows/{wf_id}")
+async def get_workflow_route(wf_id: str):
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    wf["runs"] = await database.list_runs(wf_id, limit=20)
+    return wf
+
+
+@router.put("/workflows/{wf_id}")
+async def update_workflow_route(wf_id: str, req: WorkflowReq):
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    wf = await database.update_workflow(wf_id, updates)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return wf
+
+
+@router.delete("/workflows/{wf_id}")
+async def delete_workflow_route(wf_id: str):
+    await database.delete_workflow(wf_id)
+    return {"ok": True}
+
+
+class WorkflowTestReq(BaseModel):
+    payload: dict | None = None
+
+
+@router.post("/workflows/{wf_id}/test")
+async def test_workflow_route(req: WorkflowTestReq, wf_id: str):
+    from ..workflows import run_workflow
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    run_id = await run_workflow(wf, req.payload or {}, mode="test",
+                                trigger_source="editor", orchestrator=orchestrator)
+    return {"run_id": run_id, "run": await database.get_run(run_id)}
+
+
+@router.get("/workflows/{wf_id}/runs")
+async def list_workflow_runs_route(wf_id: str):
+    return {"runs": await database.list_runs(wf_id, limit=30)}
+
+
+@router.get("/workflows/runs/{run_id}")
+async def get_workflow_run_route(run_id: str):
+    run = await database.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@router.post("/workflows/{wf_id}/publish")
+async def publish_workflow_route(wf_id: str):
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    cfg = dict(wf.get("trigger_config") or {})
+    ttype = wf.get("trigger_type")
+    # Webhook workflows get a stable secret token (used to build the public URL).
+    if ttype == "webhook" and not cfg.get("token"):
+        cfg["token"] = _uuid.uuid4().hex
+    # Schedule workflows start counting from publish time (don't fire instantly).
+    if ttype == "schedule" and cfg.get("cron"):
+        cfg["next_run_at"] = _dt.utcnow().isoformat()
+    wf = await database.update_workflow(wf_id, {"status": "live", "trigger_config": cfg})
+    return wf
+
+
+@router.post("/workflows/{wf_id}/unpublish")
+async def unpublish_workflow_route(wf_id: str):
+    wf = await database.update_workflow(wf_id, {"status": "draft"})
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return wf
+
+
+@router.post("/hooks/workflow/{wf_id}")
+async def workflow_webhook_route(wf_id: str, payload: dict | None = None, token: str = ""):
+    """Public webhook trigger. Only fires for live workflows with trigger_type=webhook,
+    guarded by the secret token minted at publish time (?token=...)."""
+    from ..workflows import run_workflow
+    wf = await database.get_workflow(wf_id)
+    if not wf or wf.get("status") != "live" or wf.get("trigger_type") != "webhook":
+        raise HTTPException(status_code=404, detail="No live webhook workflow here")
+    expected = (wf.get("trigger_config") or {}).get("token")
+    if expected and token != expected:
+        raise HTTPException(status_code=403, detail="Invalid webhook token")
+    run_id = await run_workflow(wf, payload or {}, mode="live",
+                                trigger_source="webhook", orchestrator=orchestrator)
+    # If the workflow has a "Respond to Webhook" node, return its payload to the caller.
+    run = await database.get_run(run_id)
+    for step in (run or {}).get("steps", []):
+        if step.get("node_type") == "respond" and step.get("status") == "success":
+            return (step.get("output") or {}).get("response", {"run_id": run_id})
+    return {"run_id": run_id, "status": (run or {}).get("status")}

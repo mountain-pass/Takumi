@@ -5,8 +5,9 @@
  *  - Register: the log of every risk assessment (score, level, verdict, decision).
  */
 import React, { useState, useEffect, useRef } from 'react'
-import { ShieldCheck, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History, Info, Lock } from 'lucide-react'
+import { ShieldCheck, ShieldAlert, Loader2, Save, ScrollText, SlidersHorizontal, Trash2, X, MessageSquareText, History, Info, Lock } from 'lucide-react'
 import { useBackdropDismiss } from './useBackdropDismiss'
+import { useOrgStore } from '../stores/orgStore'
 
 const MODES = [
   { id: 'all', label: 'All tasks', hint: 'Every finished task is reviewed against the policy.' },
@@ -45,8 +46,12 @@ function normImpactTable(raw) {
   }))
 }
 
+const RISK_SKILLS = ['assess_risk', 'scan_secrets', 'review_outbound', 'risk_register']
+
 export default function RiskView() {
   const [tab, setTab] = useState('policy')
+  const agents = useOrgStore(s => s.agents)
+  const hasRcAgent = (agents || []).some(a => !a.config.is_ceo && (a.config.skills || []).some(s => RISK_SKILLS.includes(s)))
   return (
     <div className="h-full flex flex-col">
       <div className="px-6 py-4 border-b border-gray-100 shrink-0">
@@ -54,6 +59,12 @@ export default function RiskView() {
           <ShieldCheck size={20} /> Risk &amp; Compliance
         </h1>
         <p className="text-xs text-gray-400 mt-0.5">ISO 31000 risk policy and the assessment register.</p>
+        {!hasRcAgent && (
+          <div className="mt-3 flex items-start gap-2 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>No Risk &amp; Compliance agent in this organisation. Agent and <b>workflow LLM</b> output runs <b>unchecked</b> — add an agent with the Risk &amp; Compliance skill to enable review.</span>
+          </div>
+        )}
         <div className="flex gap-1 mt-3">
           <TabBtn active={tab === 'policy'} onClick={() => setTab('policy')} icon={SlidersHorizontal}>Global Policy</TabBtn>
           <TabBtn active={tab === 'register'} onClick={() => setTab('register')} icon={ScrollText}>Risk Register</TabBtn>

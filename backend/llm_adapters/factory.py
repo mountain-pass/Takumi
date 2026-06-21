@@ -62,6 +62,24 @@ def get_adapter(provider: LLMProvider, settings, runtime: dict | None = None) ->
     raise ValueError(f"Unknown LLM provider: {provider}")
 
 
+def get_adapter_for_provider(provider_id: str, settings) -> BaseLLMAdapter:
+    """Build an adapter from a saved api_providers record (its provider type,
+    key and base_url). Used by workflow LLM nodes that override which provider
+    runs the task."""
+    import sqlite3
+    db_path = settings.data_dir + "/takumi.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT provider, api_key, base_url FROM api_providers WHERE id = ?", (provider_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise ValueError(f"api_provider '{provider_id}' not found")
+    rt = {"llm_api_key": row["api_key"], "llm_base_url": row["base_url"]}
+    return get_adapter(LLMProvider(row["provider"]), settings, rt)
+
+
 def get_adapter_for_agent(config, settings) -> BaseLLMAdapter:
     """Create an LLM adapter using the agent's linked api_provider record.
 
