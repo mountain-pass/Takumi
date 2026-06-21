@@ -191,10 +191,12 @@ class CEOAgent(BaseAgent):
             # Unparseable timestamp — treat as recent to avoid dropping real results.
             return True
 
-    async def present_results(self, completed_tasks: list[dict], conv_id: str | None) -> None:
-        """Present a finished plan's terminal deliverable(s) to the user.
+    async def present_results(self, completed_tasks: list[dict], conv_id: str | None,
+                              failed_tasks: list[dict] | None = None) -> None:
+        """Present a finished plan's outcome to the user — deliverables AND any
+        failures, so the user is never left hanging.
 
-        Called by the orchestrator once every task in a plan is complete. The
+        Called by the orchestrator once every task in a plan is terminal. The
         Manager does NOT redo the work — it forwards the specialists' output, only
         the terminal results (intermediate inputs in a chain are skipped).
         """
@@ -207,14 +209,20 @@ class CEOAgent(BaseAgent):
                 and t["id"] not in self._reported_task_ids
                 and self._completed_after_start(t.get("completed_at"))
             ]
-            if not new_completed:
+            # Failures we haven't yet told the user about (so a hung/failed plan still
+            # gets a reply rather than silence).
+            new_failed = [
+                t for t in (failed_tasks or [])
+                if t.get("status") == "failed" and t["id"] not in self._reported_task_ids
+            ]
+            if not new_completed and not new_failed:
                 return
             if self._synthesizing:
                 return
             self._synthesizing = True
             acquired = True
 
-            for t in new_completed:
+            for t in new_completed + new_failed:
                 self._reported_task_ids.add(t["id"])
 
             agents_by_id = {}
@@ -234,7 +242,7 @@ class CEOAgent(BaseAgent):
             # reporting near-instant.
             from ..api.routes import _strip_ceo_json
             await self._set_status(AgentStatus.THINKING, action="Presenting results...")
-            if len(new_completed) == 1:
+            if len(new_completed) == 1 and not new_failed:
                 display_content = (_strip_ceo_json(new_completed[0].get("result") or "")).strip() \
                     or "The task completed but didn't return any content."
             else:
@@ -244,6 +252,21 @@ class CEOAgent(BaseAgent):
                     body = (_strip_ceo_json(t.get("result") or "")).strip() or "(no content)"
                     parts.append(f"## {aname} — {t['title']}\n\n{body}")
                 display_content = "\n\n---\n\n".join(parts)
+
+            # Always tell the user about failures — otherwise a hung/failed plan
+            # produces silence and they keep waiting.
+            if new_failed:
+                lines = ["⚠️ **I couldn't finish part of this request:**"]
+                for t in new_failed:
+                    reason = (t.get("result") or "").strip() or "No further detail."
+                    lines.append(f"- **{t.get('title','(task)')}** — {reason[:300]}")
+                if new_completed:
+                    lines.append("\nWhat I did manage to complete is above. You can ask me to retry the rest.")
+                else:
+                    lines.append("\nNothing was completed. Please try again, or rephrase — and if an agent's "
+                                 "model is slow/unavailable, consider switching it to a faster one.")
+                failure_block = "\n".join(lines)
+                display_content = (display_content + "\n\n---\n\n" + failure_block).strip() if display_content else failure_block
 
             # Collect any rich artifacts the specialists produced for these tasks,
             # so the user gets a "View" button in the synthesized reply.
@@ -279,6 +302,30 @@ class CEOAgent(BaseAgent):
                         "artifacts": artifact_meta,
                     },
                 ))
+
+            # Notify the user — they may have navigated away from this chat while
+            # the specialists worked. Clicking "View result" routes back here.
+            try:
+                from .. import notifications
+                nc, nf = len(new_completed), len(new_failed)
+                if nc and not nf:
+                    titles = ", ".join(t.get("title", "") for t in new_completed if t.get("title"))
+                    ntype = "success"
+                    ntitle = "Task complete" if nc == 1 else f"{nc} tasks complete"
+                    nbody = titles[:140] or "Your request is ready to view."
+                elif nc and nf:
+                    ntype, ntitle = "info", "Request finished with issues"
+                    nbody = f"{nc} done, {nf} couldn't be completed. Open the chat for details."
+                else:
+                    ntype, ntitle = "alert", "Couldn't complete your request"
+                    nbody = "; ".join(t.get("title", "") for t in new_failed)[:140] or "See the chat for details."
+                await notifications.push(
+                    type=ntype, title=ntitle, body=nbody,
+                    action="View result", link_view="chat", link_id=conv_id or "",
+                    dedupe_key=f"taskdone:{conv_id}" if conv_id else "",
+                )
+            except Exception:
+                pass
 
             await self._set_status(AgentStatus.IDLE, action=None)
             logger.info("[CEO] Presented %d completed task result(s) to user", len(new_completed))

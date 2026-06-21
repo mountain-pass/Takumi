@@ -18,7 +18,7 @@ Run a full AI organisation on your machine. A **Manager** agent receives your re
 
 - 🧠 **Manager-led organisation** — one lead agent plans the work and delegates to specialists; you just chat.
 - 🔗 **System-level orchestration** — task completion, dependency chains, and **direct agent-to-agent hand-off** are enforced in code (not left to the LLM). The Manager presents only the final deliverable.
-- 🛠️ **Tools & skills** — web search/fetch (SearXNG), file read/write/list, shell, and rich-HTML artifact generation.
+- 🛠️ **Tools & skills** — web search/fetch (headless-browser search with Jina/DuckDuckGo fallbacks — no external service needed), file read/write/list, shell, and rich-HTML artifact generation.
 - 🔌 **MCP servers** — connect agents to Model Context Protocol tool servers (filesystem, GitHub, Xero, …) over **stdio, HTTP, or SSE**, including **OAuth 2.0** (PKCE + dynamic client registration) for hosted servers.
 - 🎨 **Multi-model agents** — give an agent a main "brain" plus optional specialist models (**text / vision / image / video**) it invokes as tools. Image/video tasks are **routed in code** to a capable agent.
 - 📊 **Rich output** — agents build **HTML dashboards/reports** shown in a resizable viewer pane; generated **images and videos render inline** in chat with expand & download.
@@ -34,7 +34,7 @@ Run a full AI organisation on your machine. A **Manager** agent receives your re
 
 - **Python 3.12+**
 - **Node.js 18+**
-- **Docker** — required for web search (SearXNG). Make sure Docker Desktop is running before starting Takumi.
+- **Playwright Chromium** — used for headless-browser web search; `start.sh` installs it automatically on first run.
 
 ---
 
@@ -47,9 +47,7 @@ chmod +x start.sh
 ./start.sh
 ```
 
-This starts SearXNG (web search), creates the Python venv, installs all dependencies, and launches both servers.
-
-> **Note:** Docker Desktop must be running first. If Docker is not available, Takumi still works but agents won't be able to search the web.
+This creates the Python venv, installs all dependencies (including the Playwright Chromium used for web search), and launches both servers.
 
 ### Option B — manual (run each in a separate terminal)
 
@@ -76,12 +74,6 @@ npm install
 
 # Start the dev server
 npm run dev
-```
-
-**Terminal 3 — SearXNG (web search engine)**
-
-```bash
-docker compose up -d
 ```
 
 Open **http://localhost:5173** in your browser.
@@ -118,7 +110,7 @@ Agents communicate **only through tasks** — there is no free-form agent chit-c
 
 ### Tools & skills
 Per-agent, toggle in the agent editor:
-- **Web Search / Web Fetch** — research via self-hosted SearXNG, then read the best pages.
+- **Web Search / Web Fetch** — research via a headless browser (Jina/DuckDuckGo fallbacks), then read the best pages.
 - **Read / Write / List Files**, **Run Shell** — local filesystem and command execution.
 - **Create Artifact** — produce a complete HTML document (dashboard, report, chart) rendered in the side viewer. (Agents can also just emit a fenced ```html block, which is auto-saved as an artifact.)
 
@@ -194,8 +186,6 @@ Keys can also be entered through the setup wizard or **Settings → API** — no
 
 ```
 takumi/
-├── docker-compose.yml            # SearXNG search engine
-├── searxng/                      # SearXNG config (settings.yml, limiter.toml)
 ├── backend/                      # Python / FastAPI
 │   ├── main.py                   # FastAPI app + WebSocket lifespan
 │   ├── orchestrator.py           # Engine: agent lifecycle + system-level task graph
@@ -216,7 +206,8 @@ takumi/
 │   │   └── model_tools.py        # Secondary models (text/vision/image/video) as tools
 │   ├── skills/                   # Built-in agent tools
 │   │   ├── registry.py           # Skill registry + tools-prompt builder
-│   │   ├── web_search.py         # web_search & web_fetch via SearXNG
+│   │   ├── web_search.py         # web_search & web_fetch (browser + Jina/DDG)
+│   │   ├── browser_search.py     # headless-browser search engine (primary)
 │   │   ├── files.py              # read_file / write_file / list_files
 │   │   └── shell.py              # run_shell
 │   ├── llm_adapters/             # One adapter per provider (+ factory, content converters)
@@ -245,4 +236,4 @@ takumi/
 
 - **Backend** — Python, FastAPI, WebSockets, SQLite (aiosqlite), the `mcp` SDK, httpx.
 - **Frontend** — React, Vite, Tailwind, Zustand, TanStack Query.
-- **Search** — self-hosted SearXNG (Docker).
+- **Search** — headless-browser search (Playwright) with Jina/DuckDuckGo fallbacks; optional Tavily/Brave via API keys.

@@ -68,7 +68,7 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
     # ── Browser control (drives a real, visible desktop Chrome window) ─────────
     "browser_navigate": {
         "name": "browser_navigate",
-        "description": "Open a URL in the controlled desktop Chrome browser and return the page's title, URL, visible text, and clickable links. Use this to browse real sites like a human (keeps your logins/cookies).",
+        "description": "Open a URL in the controlled desktop Chrome browser and return the page's title, URL, visible text, and clickable links. This browses real sites like a human (keeps your logins/cookies). Prefer web_search/web_fetch FIRST for plain information — only use the browser when those can't get the content: pages needing a login, multi-step interaction/clicks, or that are JS-heavy or blocked.",
         "parameters": {"url": "The URL to open"},
         "callable": browser_navigate,
     },

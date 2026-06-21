@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Callable, Awaitable
 
@@ -23,6 +24,18 @@ from .task_scheduler import TaskScheduler
 logger = logging.getLogger(__name__)
 
 BroadcastFn = Callable[[str], Awaitable[None]]
+
+# ── Task watchdog thresholds (seconds) ────────────────────────────────────────
+# A task heartbeats while it works (see BaseAgent). The watchdog uses the time
+# SINCE the last heartbeat to tell "slow but alive" from "wedged".
+WD_SOFT_TIMEOUT     = int(os.environ.get("TASK_SOFT_TIMEOUT", "180"))     # 3 min  → tell the user it's taking a while
+WD_HARD_TIMEOUT     = int(os.environ.get("TASK_HARD_TIMEOUT", "480"))     # 8 min  → retry once, then fail
+WD_ABSOLUTE_TIMEOUT = int(os.environ.get("TASK_ABSOLUTE_TIMEOUT", "1800"))# 30 min → fail regardless
+WD_MAX_ATTEMPTS     = int(os.environ.get("TASK_MAX_ATTEMPTS", "2"))       # total tries before hard-fail
+WD_PENDING_GRACE    = int(os.environ.get("TASK_PENDING_GRACE", "150"))    # pending but never picked up
+# An agent shown as working/thinking longer than this with no progress is stuck —
+# reset it to idle. Must exceed the agent work timeout (a single bounded LLM call).
+WD_STATUS_STALE     = int(os.environ.get("AGENT_STATUS_STALE", "1020"))   # 17 min
 
 # Fields that belong to AgentConfig (the agents table has extra columns like
 # created_at that pydantic should not receive).
@@ -408,6 +421,20 @@ class Orchestrator:
             "conversation_id": task.get("conversation_id"),
         }
         await self._ws_broadcast(WSEvent(type=WSEventType.RISK_HOLD, payload=payload).model_dump_json())
+        try:
+            from . import notifications
+            await notifications.push(
+                type="alert",
+                title="Action required: approve held task",
+                body=f"“{task.get('title', '')[:80]}” was held by compliance "
+                     f"({rec['level']}, score {rec['score']}/{rec['threshold']}). Review to proceed.",
+                action="Review now",
+                link_view="chat",
+                link_id=task.get("conversation_id") or "",
+                dedupe_key=f"riskhold:{task['id']}",
+            )
+        except Exception:
+            pass
 
     async def resolve_risk_hold(self, task_id: str, approve: bool) -> dict:
         """User approves or rejects a held task."""
@@ -443,6 +470,163 @@ class Orchestrator:
                 summary=f"User REJECTED held task '{task.get('title','')[:80]}' on compliance review.")
             logger.info("[compliance] Held task '%s' REJECTED by user", task.get("title", "")[:40])
         return {"ok": True, "decision": "approved" if approve else "rejected"}
+
+    async def run_task_watchdog(self) -> None:
+        """Heartbeat-based liveness check over every active task. Guarantees no task
+        hangs silently: slow tasks get a 'still working' notice (soft timeout); wedged
+        or crashed tasks are retried once then hard-failed (hard/absolute timeout);
+        orphaned blocked/pending tasks are resolved. Every terminal transition routes
+        through on_task_failed → cascade + present, so the user always hears back."""
+        now = datetime.utcnow()
+
+        def secs_since(ts: str | None) -> float | None:
+            if not ts:
+                return None
+            try:
+                return (now - datetime.fromisoformat(str(ts).replace("Z", ""))).total_seconds()
+            except Exception:
+                return None
+
+        try:
+            tasks = await database.get_all_tasks(limit=200)
+        except Exception:
+            return
+
+        by_id = {t["id"]: t for t in tasks}
+
+        def find_dependency(dep: str, self_id: str) -> dict | None:
+            dl = (dep or "").lower()
+            if not dl:
+                return None
+            for x in tasks:
+                if x["id"] == self_id:
+                    continue
+                tl = (x.get("title") or "").lower()
+                if tl and (tl in dl or dl in tl):
+                    return x
+            return None
+
+        for t in tasks:
+            st = t.get("status")
+            if st not in ("pending", "in_progress", "blocked"):
+                continue
+            # Recurring scheduled tasks manage their own cadence — leave them alone.
+            if t.get("task_type") in ("routine", "standing") and t.get("schedule_cron"):
+                continue
+            try:
+                flags = json.loads(t.get("watchdog_flags") or "{}")
+            except Exception:
+                flags = {}
+
+            try:
+                if st == "in_progress":
+                    await self._watch_in_progress(t, flags, secs_since)
+                elif st == "blocked":
+                    await self._watch_blocked(t, flags, secs_since, find_dependency)
+                elif st == "pending":
+                    await self._watch_pending(t, flags, secs_since)
+            except Exception as e:
+                logger.error("[watchdog] error on task %s: %s", t.get("id", "")[:8], e)
+
+        # Reset agents stuck "working/thinking" with no real progress — otherwise a
+        # finished/crashed run leaves a phantom busy status in the UI forever.
+        await self._reset_stale_agent_status(now, secs_since)
+
+    async def _reset_stale_agent_status(self, now: datetime, secs_since) -> None:
+        for agent in self.get_agents():
+            state = getattr(agent, "state", None)
+            if not state or state.status not in (AgentStatus.WORKING, AgentStatus.THINKING):
+                continue
+            stale = secs_since(getattr(state, "status_since", None))
+            if stale is not None and stale > WD_STATUS_STALE:
+                logger.warning("[watchdog] %s stuck in '%s' for ~%dm with no progress — resetting to idle",
+                               agent.config.name, state.status, int(stale // 60))
+                try:
+                    await agent._set_status(AgentStatus.IDLE, current_task=None, action=None)
+                except Exception as e:
+                    logger.error("[watchdog] could not reset %s: %s", agent.config.name, e)
+
+    async def _watch_in_progress(self, t: dict, flags: dict, secs_since) -> None:
+        hb = secs_since(t.get("last_heartbeat") or t.get("started_at"))
+        total = secs_since(t.get("started_at") or t.get("created_at"))
+        wedged = (hb is not None and hb > WD_HARD_TIMEOUT) or (total is not None and total > WD_ABSOLUTE_TIMEOUT)
+        if wedged:
+            attempts = (t.get("attempts", 0) or 0) + 1
+            mins = int((hb if hb is not None else total) // 60)
+            if attempts < WD_MAX_ATTEMPTS and (total is None or total < WD_ABSOLUTE_TIMEOUT):
+                # Likely a crashed/reloaded worker — give it one clean retry.
+                await database.set_task_attempts(t["id"], attempts)
+                await database.update_task(t["id"], {
+                    "status": "pending", "next_run_at": datetime.utcnow().isoformat(), "started_at": None,
+                })
+                await database.create_task_log({
+                    "id": __import__("uuid").uuid4().hex, "task_id": t["id"], "agent_id": t.get("agent_id", ""),
+                    "action": "recovered", "detail": f"No heartbeat for ~{mins} min — retry {attempts}/{WD_MAX_ATTEMPTS}",
+                })
+                logger.warning("[watchdog] Task '%s' unresponsive ~%dm — retry %d/%d",
+                               t.get("title", "")[:40], mins, attempts, WD_MAX_ATTEMPTS)
+            else:
+                logger.warning("[watchdog] Task '%s' wedged ~%dm after %d attempt(s) — failing",
+                               t.get("title", "")[:40], mins, attempts)
+                await self._notify_task_stuck(t, failed=True, mins=mins)
+                await self.on_task_failed(
+                    t["id"],
+                    f"No response from {self._agent_name(t.get('agent_id',''))} for ~{mins} minutes "
+                    f"after {attempts} attempt(s) — the task was stopped so it wouldn't hang.",
+                    t.get("agent_id", ""))
+        elif hb is not None and hb > WD_SOFT_TIMEOUT and not flags.get("soft_notified"):
+            flags["soft_notified"] = True
+            await database.set_watchdog_flags(t["id"], flags)
+            await self._notify_task_stuck(t, failed=False, mins=int(hb // 60))
+
+    async def _watch_blocked(self, t: dict, flags: dict, secs_since, find_dependency) -> None:
+        dep = t.get("depends_on") or ""
+        deptask = find_dependency(dep, t["id"]) if dep else None
+        if dep and not deptask:
+            await self.on_task_failed(t["id"], f"Prerequisite '{dep}' no longer exists.", t.get("agent_id", ""))
+        elif deptask and deptask.get("status") == "failed":
+            await self.on_task_failed(t["id"], f"Prerequisite '{deptask.get('title','')}' failed.", t.get("agent_id", ""))
+        elif deptask and deptask.get("status") == "completed":
+            # The dependency finished but the hand-off was missed — self-heal it now.
+            logger.warning("[watchdog] Blocked task '%s' had a completed prerequisite — re-running hand-off",
+                           t.get("title", "")[:40])
+            await self._handoff_to_dependents(deptask, deptask.get("result") or "", deptask.get("agent_id", ""))
+        else:
+            total = secs_since(t.get("created_at"))
+            if total is not None and total > WD_ABSOLUTE_TIMEOUT:
+                await self.on_task_failed(t["id"], "Prerequisite never completed in time.", t.get("agent_id", ""))
+
+    async def _watch_pending(self, t: dict, flags: dict, secs_since) -> None:
+        # A pending task is normally picked up by the scheduler's next tick. If it has
+        # sat well past its scheduled run with attempts exhausted, no agent will ever
+        # run it — fail it so the user isn't left waiting forever.
+        nr = secs_since(t.get("next_run_at"))
+        total = secs_since(t.get("created_at"))
+        attempts = t.get("attempts", 0) or 0
+        overdue = (nr is None or nr > WD_PENDING_GRACE) and (total is not None and total > WD_PENDING_GRACE)
+        if overdue and attempts >= WD_MAX_ATTEMPTS:
+            await self.on_task_failed(
+                t["id"], "Could not be started — no available agent picked it up.", t.get("agent_id", ""))
+
+    async def _notify_task_stuck(self, t: dict, failed: bool, mins: int) -> None:
+        """User-facing heads-up for a slow (soft) or stopped (hard) task."""
+        try:
+            from . import notifications
+            title = t.get("title", "")[:60]
+            if failed:
+                await notifications.push(
+                    type="alert", title="Task stopped — no response",
+                    body=f"“{title}” didn't respond for ~{mins} min and was stopped. See the chat for details.",
+                    action="View", link_view="chat", link_id=t.get("conversation_id") or "",
+                    dedupe_key=f"taskstuck:{t['id']}")
+            else:
+                await notifications.push(
+                    type="info", title="Still working…",
+                    body=f"“{title}” is taking longer than usual (~{mins} min). I'll let you know when it's done.",
+                    action="View", link_view="chat", link_id=t.get("conversation_id") or "",
+                    dedupe_key=f"taskslow:{t['id']}")
+        except Exception:
+            pass
 
     async def on_task_failed(self, task_id: str, error: str, from_agent_id: str) -> None:
         """A task errored. Record it, fail any tasks that depended on it (their
@@ -534,8 +718,9 @@ class Orchestrator:
         if any(t.get("status") in ("pending", "in_progress", "blocked") for t in plan):
             return  # plan still running
         completed = [t for t in plan if t.get("status") == "completed"]
-        if completed:
-            await self._ceo.present_results(completed, conv_id)
+        failed = [t for t in plan if t.get("status") == "failed"]
+        if completed or failed:
+            await self._ceo.present_results(completed, conv_id, failed_tasks=failed)
 
     # ── Task routing ──────────────────────────────────────────────────────────
 

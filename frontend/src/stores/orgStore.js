@@ -43,6 +43,48 @@ export const useOrgStore = create((set, get) => ({
   openArtifact(a) { set({ artifact: a }) },
   closeArtifact() { set({ artifact: null }) },
 
+  // ── Notifications ────────────────────────────────────────────────────────────
+  notifications: [],
+  notifUnread: 0,
+
+  async loadNotifications() {
+    try {
+      const res = await fetch(`${API}/notifications?limit=50`)
+      if (res.ok) {
+        const data = await res.json()
+        set({ notifications: data.notifications || [], notifUnread: data.unread || 0 })
+      }
+    } catch {}
+  },
+
+  // Route the user to wherever a notification points, then mark it read.
+  openNotification(n) {
+    if (n.link_view === 'chat' && n.link_id) get().openConversation(n.link_id)
+    else if (n.link_view) get().navigateTo(n.link_view)
+    get().markNotificationRead(n.id)
+  },
+
+  async markNotificationRead(id) {
+    set(s => ({
+      notifications: s.notifications.map(n => n.id === id ? { ...n, read: 1 } : n),
+      notifUnread: Math.max(0, s.notifUnread - (s.notifications.find(n => n.id === id && !n.read) ? 1 : 0)),
+    }))
+    try { await fetch(`${API}/notifications/${id}/read`, { method: 'POST' }) } catch {}
+  },
+
+  async dismissNotification(id) {
+    set(s => ({
+      notifications: s.notifications.filter(n => n.id !== id),
+      notifUnread: Math.max(0, s.notifUnread - (s.notifications.find(n => n.id === id && !n.read) ? 1 : 0)),
+    }))
+    try { await fetch(`${API}/notifications/${id}`, { method: 'DELETE' }) } catch {}
+  },
+
+  async clearNotifications() {
+    set({ notifications: [], notifUnread: 0 })
+    try { await fetch(`${API}/notifications`, { method: 'DELETE' }) } catch {}
+  },
+
   // ── Org / setup ────────────────────────────────────────────────────────────
   orgName: '',
   orgDescription: '',
@@ -173,6 +215,16 @@ export const useOrgStore = create((set, get) => ({
         id: `risk-${payload.task_id}`, role: 'assistant', riskHold: payload,
         timestamp: new Date().toISOString(),
       }] }))
+    } else if (type === 'notification') {
+      // Live push from the backend — prepend (or refresh a deduped one).
+      set(s => {
+        const existing = s.notifications.find(n => n.id === payload.id)
+        const list = existing
+          ? s.notifications.map(n => n.id === payload.id ? payload : n)
+          : [payload, ...s.notifications].slice(0, 50)
+        const unread = list.filter(n => !n.read).length
+        return { notifications: list, notifUnread: unread }
+      })
     } else if (type === 'agent_added') {
       // Reload agents list
       get().fetchAgents()

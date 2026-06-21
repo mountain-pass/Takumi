@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Default heartbeat: how often the platform checks for due tasks (seconds).
 # Configurable in Settings via runtime_settings['heartbeat_interval'].
-DEFAULT_HEARTBEAT = 300  # 5 minutes
+DEFAULT_HEARTBEAT = 30  # seconds — frequent enough for the task watchdog to react
 
 
 def _heartbeat_interval() -> int:
@@ -49,8 +49,13 @@ class TaskScheduler:
     async def _tick(self) -> None:
         now = datetime.utcnow()
 
-        # Recover stale in_progress tasks (stuck for >5 minutes)
-        await self._recover_stale_tasks(now)
+        # Heartbeat-based liveness watchdog over all active tasks (retries wedged
+        # tasks, fails hung ones, unblocks orphans, and always reports back to the
+        # user). Supersedes the old coarse stale-task reset.
+        if hasattr(self._orch, "run_task_watchdog"):
+            await self._orch.run_task_watchdog()
+        else:
+            await self._recover_stale_tasks(now)
 
         # Once a day, have the Manager post a daily update across all SOPs.
         await self._maybe_daily_update(now)
@@ -154,35 +159,42 @@ class TaskScheduler:
 
             tokens = response.input_tokens + response.output_tokens
             agent.state.token_count += tokens
-
-            # Update task
-            update = {
-                "status": "completed",
-                "result": response.content,
-                "last_run_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
+            await database.update_task(task_id, {
                 "token_count": task.get("token_count", 0) + tokens,
-                "run_count": task.get("run_count", 0) + 1,
-            }
+            })
 
-            # For routine/standing tasks, reschedule instead of completing
+            # Recurring tasks just reschedule — they're standalone, not part of a plan.
             if task["task_type"] in ("routine", "standing") and task.get("schedule_cron"):
-                update["status"] = "pending"
-                update["completed_at"] = None
+                update = {
+                    "status": "pending", "result": response.content,
+                    "last_run_at": datetime.utcnow().isoformat(),
+                    "run_count": task.get("run_count", 0) + 1,
+                }
                 next_run = self._compute_next_run(task["schedule_cron"])
                 if next_run:
                     update["next_run_at"] = next_run
+                await database.update_task(task_id, update)
+                await database.create_task_log({
+                    "id": str(uuid.uuid4()), "task_id": task_id, "agent_id": agent_id,
+                    "action": "completed", "detail": response.content[:500], "token_count": tokens,
+                })
+                logger.info("Task %s completed by agent %s (rescheduled)", task_id, agent.config.name)
+                return
 
-            await database.update_task(task_id, update)
-            await database.create_task_log({
-                "id": str(uuid.uuid4()),
-                "task_id": task_id,
-                "agent_id": agent_id,
-                "action": "completed",
-                "detail": response.content[:500],
-                "token_count": tokens,
-            })
-
+            # Adhoc tasks may be part of a multi-agent plan. Route completion through
+            # the orchestrator's normal post-completion handler (same as the live
+            # chat path) so the compliance gate runs, dependent tasks are handed off,
+            # and the finished plan is presented + a notification is raised. Marking
+            # the task completed directly here would orphan any blocked dependents.
+            if hasattr(self._orch, "on_task_completed"):
+                await self._orch.on_task_completed(task_id, response.content, agent_id)
+            else:
+                await database.update_task(task_id, {
+                    "status": "completed", "result": response.content,
+                    "last_run_at": datetime.utcnow().isoformat(),
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "run_count": task.get("run_count", 0) + 1,
+                })
             logger.info("Task %s completed by agent %s", task_id, agent.config.name)
 
         except Exception as e:

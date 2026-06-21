@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
@@ -32,6 +33,14 @@ MAX_TOOL_RESULT_CHARS = 4000
 # dashboard/report artifact (the 2048 default truncated them mid-document).
 AGENT_MAX_TOKENS = 8000
 
+# Hard wall-clock cap on a single agent's work on one task. Web tools have their
+# own short HTTP timeouts, but a slow/stalled LLM call (especially a large cloud
+# synthesis) could otherwise hang a task — and its dependents — indefinitely.
+# When this is hit the agent stops and returns a clear note instead of hanging,
+# so the orchestrator can finalise the task and unblock the plan. Override with
+# the AGENT_WORK_TIMEOUT env var (seconds).
+AGENT_WORK_TIMEOUT = int(os.environ.get("AGENT_WORK_TIMEOUT", "900"))  # 15 minutes
+
 # ── Prompt fragments injected into every specialist agent ──────────────────
 
 AGENT_WORK_SOP = """
@@ -50,7 +59,7 @@ You are an autonomous agent in an organisation. You OWN every task assigned to y
 ### Rules:
 - Your tool usage is INTERNAL. The person who assigned you this task does NOT see your tool calls — they only see your final answer.
 - **ALWAYS use web_search/web_fetch for any factual or current information.** Your training data is outdated. Never quote dates, prices, valuations, statistics, or news from memory — search the web first. If the task is about research, market data, current events, or any real-world facts, you MUST use your tools.
-- **Search workflow**: Use web_search with specific queries → read the results → if you need more detail, use web_fetch on the best URLs → then synthesize everything into your answer. Don't stop at search snippets if the task requires depth.
+- **Search workflow (in this order)**: 1) `web_search` with specific queries → 2) `web_fetch` the best result URLs for detail → 3) ONLY if those can't get what you need (the page needs a login, interaction/clicks, or is blocked/JS-heavy) fall back to the interactive **browser** tools (`browser_navigate`, `browser_read`, `browser_click`, `browser_type`). Always try `web_search`/`web_fetch` first — they're faster; use the browser as a fallback, not the default. Don't stop at search snippets if the task requires depth.
 - Stay on topic. Only address what was asked.
 - Be concise but thorough. Deliver the actual findings, not a description of your process.
 - NEVER respond with just an acknowledgment ("Sure!", "On it!", "I'll look into this"). Those waste time.
@@ -314,6 +323,17 @@ class BaseAgent:
         total_input = 0
         total_output = 0
 
+        # Overall wall-clock deadline for this whole task (see AGENT_WORK_TIMEOUT).
+        deadline = asyncio.get_event_loop().time() + AGENT_WORK_TIMEOUT
+
+        async def complete(**kwargs):
+            """LLM call bounded by the remaining time before the deadline, so a
+            stalled provider can't hang the task forever."""
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            return await asyncio.wait_for(self._adapter.complete(**kwargs), timeout=remaining)
+
         # Autonomy boundaries
         if max_rounds is None:
             max_rounds = self.config.max_iterations if self.config.max_iterations > 0 else 10
@@ -324,19 +344,34 @@ class BaseAgent:
         work_messages = list(self._conversation[-self.config.max_context_messages:])
         tools_used = 0
         confused_nudges = 0
+        # Enforced (not LLM-discretionary) verification: an agent that HAS web_search
+        # must not answer straight from memory. If it tries, we push back once and
+        # require it to search first — covering the common "answered from stale
+        # training data" failure (e.g. claiming a now-public company is private).
+        can_search = "web_search" in (await self._effective_skills())
+        forced_search_nudges = 0
+
+        task_id = (getattr(self, "_artifact_ctx", {}) or {}).get("task_id")
 
         for round_num in range(max_rounds):
             await self._set_status(
                 AgentStatus.WORKING,
                 action=f"Working... (step {round_num + 1})" if tools_used > 0 else "Working..."
             )
+            # Liveness heartbeat — tells the watchdog this task is progressing, so a
+            # slow-but-alive task isn't mistaken for a wedged thread.
+            if task_id:
+                await database.touch_task_heartbeat(task_id)
 
-            response = await self._adapter.complete(
-                system_prompt=system,
-                messages=work_messages,
-                model=self.config.llm_model,
-                max_tokens=AGENT_MAX_TOKENS,
-            )
+            try:
+                response = await complete(
+                    system_prompt=system,
+                    messages=work_messages,
+                    model=self.config.llm_model,
+                    max_tokens=AGENT_MAX_TOKENS,
+                )
+            except asyncio.TimeoutError:
+                return self._timeout_response(tools_used, total_input, total_output)
             total_input += response.input_tokens
             total_output += response.output_tokens
 
@@ -347,9 +382,12 @@ class BaseAgent:
                 work_messages.append({"role": "user", "content":
                     "[System] Token budget reached. Provide your best final answer now "
                     "from what you have. Plain text only."})
-                final = await self._adapter.complete(
-                    system_prompt=system, messages=work_messages, model=self.config.llm_model,
-                    max_tokens=AGENT_MAX_TOKENS)
+                try:
+                    final = await complete(
+                        system_prompt=system, messages=work_messages, model=self.config.llm_model,
+                        max_tokens=AGENT_MAX_TOKENS)
+                except asyncio.TimeoutError:
+                    return self._timeout_response(tools_used, total_input, total_output)
                 return LLMResponse(content=final.content, input_tokens=total_input + final.input_tokens,
                                    output_tokens=total_output + final.output_tokens, model=self.config.llm_model)
 
@@ -357,6 +395,21 @@ class BaseAgent:
             tool_call = self._parse_tool_call(response.content)
 
             if not tool_call:
+                # Enforced verification: a search-capable agent answering with zero
+                # searches is presumed to be working from (stale) memory. Force one
+                # search before we accept the answer.
+                if can_search and tools_used == 0 and forced_search_nudges < 1:
+                    forced_search_nudges += 1
+                    logger.info("[%s] Answered without searching — forcing a web_search first",
+                                self.config.name)
+                    work_messages.append({"role": "assistant", "content": response.content})
+                    work_messages.append({"role": "user", "content":
+                        "[System] You answered without using web_search. Your training data is "
+                        "stale as of today, so any real-world fact (status, prices, dates, who/what "
+                        "is current) must be VERIFIED. Issue a web_search tool call now to confirm "
+                        "the key facts before giving your final answer. If — and only if — the task "
+                        "genuinely needs no current real-world information, repeat your answer as-is."})
+                    continue
                 # No tool call — this might be the final answer. Cap nudges at 1:
                 # extra nudges just burn slow LLM calls for little gain.
                 if self._is_confused_response(response.content) and tools_used > 0 and confused_nudges < 1:
@@ -399,17 +452,38 @@ class BaseAgent:
             "synthesizing everything you learned from the tool results above. "
             "Plain text only — no JSON, no tool calls."})
 
-        summary = await self._adapter.complete(
-            system_prompt=system,
-            messages=work_messages,
-            model=self.config.llm_model,
-            max_tokens=AGENT_MAX_TOKENS,
-        )
+        try:
+            summary = await complete(
+                system_prompt=system,
+                messages=work_messages,
+                model=self.config.llm_model,
+                max_tokens=AGENT_MAX_TOKENS,
+            )
+        except asyncio.TimeoutError:
+            return self._timeout_response(tools_used, total_input, total_output)
         total_input += summary.input_tokens
         total_output += summary.output_tokens
 
         return LLMResponse(content=summary.content, input_tokens=total_input,
                            output_tokens=total_output, model=self.config.llm_model)
+
+    def _timeout_response(self, tools_used: int, total_input: int, total_output: int) -> LLMResponse:
+        """The work deadline was hit — return a clear note (instead of hanging) so
+        the agent reports what happened and the orchestrator can finalise/unblock."""
+        mins = AGENT_WORK_TIMEOUT // 60
+        if tools_used:
+            note = (f"⚠️ I ran out of time on this task — it passed the {mins}-minute limit after "
+                    f"{tools_used} tool call(s), and the model didn't return a final answer in time. "
+                    "The language model is likely slow or unavailable right now. Please try again, "
+                    "or switch this agent to a faster model.")
+        else:
+            note = (f"⚠️ I couldn't complete this task — the language model didn't respond within the "
+                    f"{mins}-minute limit (it may be slow or unavailable). Please try again, or switch "
+                    "this agent to a faster model.")
+        logger.warning("[%s] Work timed out after %ds (%d tool calls used)",
+                       self.config.name, AGENT_WORK_TIMEOUT, tools_used)
+        return LLMResponse(content=note, input_tokens=total_input, output_tokens=total_output,
+                           model=self.config.llm_model)
 
     # ── LLM helpers ──────────────────────────────────────────────────────────
 
@@ -418,9 +492,53 @@ class BaseAgent:
         (e.g. the Manager hides tools owned by a connected specialist)."""
         return self.config.skills
 
+    def _temporal_preamble(self) -> str:
+        """A dated header so the model KNOWS its training is stale relative to today
+        and must verify time-sensitive facts with web_search rather than recall."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+        skills = self.config.skills or []
+        has_search = "web_search" in skills
+        has_browser = any(s.startswith("browser_") for s in skills)
+        block = (
+            f"\n\n## Current date & knowledge freshness\n"
+            f"Today's real-world date is **{today}**.\n"
+            f"Your training data was frozen well before today, so anything time-sensitive "
+            f"in your memory (prices, valuations, who runs a company, whether a firm is "
+            f"public/private, IPO/funding status, dates, recent events, statistics, news) "
+            f"is likely OUTDATED and may be flatly wrong now.\n"
+        )
+        if has_search:
+            block += (
+                "Therefore: for ANY question that depends on the current state of the world, "
+                "you MUST call `web_search` (and `web_fetch` to read sources) FIRST and base your "
+                "answer on what you find — never on recall. Treat your built-in knowledge as a "
+                "starting hypothesis to verify, not a fact. If a `web_search` result begins with "
+                "`SEARCH_UNAVAILABLE`, "
+                + ("fall back to the browser tools (`browser_navigate`/`browser_read`) to find the "
+                   "answer. If that also fails, "
+                   if has_browser else "")
+                + "tell the user you could not retrieve live data and clearly flag your answer as "
+                "unverified — do NOT present remembered facts as current.\n"
+            )
+        elif has_browser:
+            block += (
+                "Therefore: for ANY question that depends on the current state of the world, use your "
+                "browser tools (`browser_navigate` to a search engine or source, then `browser_read`) "
+                "to verify FIRST — never answer time-sensitive facts from memory. If you can't retrieve "
+                "live data, say so and flag your answer as unverified.\n"
+            )
+        else:
+            block += (
+                "You do NOT have web access. For time-sensitive facts, state plainly that you "
+                "cannot verify current data and that your information may be out of date — do NOT "
+                "assert remembered facts (e.g. a company's public/private status) as if current.\n"
+            )
+        return block
+
     async def _build_system_prompt(self) -> str:
         """Build the full system prompt with SOP, tools, and connections."""
-        system = self.config.system_prompt
+        system = self.config.system_prompt + self._temporal_preamble()
 
         # Soul (personality) + persistent memory from the agent's folder files,
         # so the agent stays in character and recalls learned context each run.
@@ -474,12 +592,17 @@ class BaseAgent:
     async def _llm_complete(self) -> LLMResponse:
         messages = self._conversation[-self.config.max_context_messages:]
         system = await self._build_system_prompt()
-        return await self._adapter.complete(
-            system_prompt=system,
-            messages=messages,
-            model=self.config.llm_model,
-            max_tokens=AGENT_MAX_TOKENS,
-        )
+        # Bounded so a stalled provider can't hang a reply/plan forever — surface a
+        # clear note instead (same cap as the tool work loop).
+        try:
+            return await asyncio.wait_for(self._adapter.complete(
+                system_prompt=system,
+                messages=messages,
+                model=self.config.llm_model,
+                max_tokens=AGENT_MAX_TOKENS,
+            ), timeout=AGENT_WORK_TIMEOUT)
+        except asyncio.TimeoutError:
+            return self._timeout_response(0, 0, 0)
 
     def _is_confused_response(self, content: str) -> bool:
         """Detect if the LLM is confused about the tool protocol."""
@@ -805,6 +928,7 @@ class BaseAgent:
         action: str | None = ...,        # type: ignore
     ) -> None:
         self.state.status = status
+        self.state.status_since = datetime.utcnow()  # refresh each step → staleness watchdog
         if current_task is not ...:
             self.state.current_task = current_task
         if action is not ...:

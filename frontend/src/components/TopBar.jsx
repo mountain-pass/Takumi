@@ -58,7 +58,19 @@ const NOTIF_ICONS = {
   success: { icon: CheckCircle, color: 'text-green-500',  bg: 'bg-green-50' },
 }
 
-function NotificationPanel({ notifications, onDismiss, onClear }) {
+function timeAgo(iso) {
+  if (!iso) return ''
+  // created_at is stored as UTC "YYYY-MM-DD HH:MM:SS" (no tz) — parse as UTC.
+  const t = Date.parse(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z')
+  if (Number.isNaN(t)) return ''
+  const secs = Math.max(0, (Date.now() - t) / 1000)
+  if (secs < 45) return 'Just now'
+  if (secs < 3600) return `${Math.round(secs / 60)} min ago`
+  if (secs < 86400) return `${Math.round(secs / 3600)} h ago`
+  return `${Math.round(secs / 86400)} d ago`
+}
+
+function NotificationPanel({ notifications, onOpen, onDismiss, onClear }) {
   if (notifications.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-10 text-gray-400 gap-2">
@@ -69,28 +81,34 @@ function NotificationPanel({ notifications, onDismiss, onClear }) {
   }
 
   return (
-    <div className="divide-y divide-gray-100">
-      <div className="flex items-center justify-between px-4 py-2.5">
+    <div className="divide-y divide-gray-100 max-h-[70vh] overflow-y-auto">
+      <div className="sticky top-0 bg-white flex items-center justify-between px-4 py-2.5 border-b border-gray-100 z-10">
         <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Notifications</span>
         <button onClick={onClear} className="text-xs text-indigo-600 hover:text-indigo-800 font-medium">Clear all</button>
       </div>
       {notifications.map(n => {
         const cfg = NOTIF_ICONS[n.type] || NOTIF_ICONS.info
         const Icon = cfg.icon
+        const clickable = !!n.link_view
         return (
-          <div key={n.id} className={`flex gap-3 px-4 py-3 ${cfg.bg} hover:brightness-95 transition-all`}>
-            <Icon size={16} className={`${cfg.color} shrink-0 mt-0.5`} />
+          <div key={n.id}
+            onClick={clickable ? () => onOpen(n) : undefined}
+            className={`flex gap-3 px-4 py-3 ${n.read ? 'bg-white' : cfg.bg} ${clickable ? 'cursor-pointer hover:brightness-95' : ''} transition-all`}>
+            {!n.read && <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+            <Icon size={16} className={`${cfg.color} shrink-0 mt-0.5 ${n.read ? 'opacity-60' : ''}`} />
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium text-gray-800">{n.title}</p>
-              {n.body && <p className="text-xs text-gray-500 mt-0.5">{n.body}</p>}
-              {n.action && (
-                <button className="mt-1.5 flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800">
+              {n.body && <p className="text-xs text-gray-500 mt-0.5 break-words">{n.body}</p>}
+              {n.action && clickable && (
+                <span className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800">
                   {n.action} <ChevronRight size={11} />
-                </button>
+                </span>
               )}
-              <p className="text-[10px] text-gray-400 mt-1">{n.time}</p>
+              <p className="text-[10px] text-gray-400 mt-1">{timeAgo(n.created_at)}</p>
             </div>
-            <button onClick={() => onDismiss(n.id)} className="text-gray-300 hover:text-gray-500 shrink-0">
+            <button
+              onClick={(e) => { e.stopPropagation(); onDismiss(n.id) }}
+              className="text-gray-300 hover:text-gray-500 shrink-0 self-start">
               <X size={14} />
             </button>
           </div>
@@ -104,28 +122,15 @@ function NotificationPanel({ notifications, onDismiss, onClear }) {
 
 export default function TopBar() {
   const agents = useOrgStore(s => s.agents)
+  const notifications = useOrgStore(s => s.notifications)
+  const unread = useOrgStore(s => s.notifUnread)
+  const openNotification = useOrgStore(s => s.openNotification)
+  const dismissNotification = useOrgStore(s => s.dismissNotification)
+  const clearNotifications = useOrgStore(s => s.clearNotifications)
   const [open, setOpen] = useState(false)
-  const [notifications, setNotifications] = useState([
-    {
-      id: '1',
-      type: 'alert',
-      title: 'Action required: Review agent response',
-      body: 'The Manager agent is waiting for your approval before proceeding.',
-      action: 'Review now',
-      time: 'Just now',
-    },
-    {
-      id: '2',
-      type: 'info',
-      title: 'New skill available',
-      body: 'Web Search skill has been added to the marketplace.',
-      action: 'View skill',
-      time: '5 min ago',
-    },
-  ])
   const ref = useRef(null)
 
-  const unread = notifications.length
+  const hasItems = notifications.length > 0
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -136,8 +141,9 @@ export default function TopBar() {
     return () => document.removeEventListener('mousedown', handle)
   }, [])
 
-  function dismiss(id) {
-    setNotifications(prev => prev.filter(n => n.id !== id))
+  function openNotif(n) {
+    setOpen(false)
+    openNotification(n)
   }
 
   return (
@@ -153,9 +159,11 @@ export default function TopBar() {
             onClick={() => setOpen(o => !o)}
             className="relative w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
           >
-            {unread > 0 ? <BellDot size={18} className="text-gray-600" /> : <Bell size={18} className="text-gray-400" />}
+            {hasItems ? <BellDot size={18} className="text-gray-600" /> : <Bell size={18} className="text-gray-400" />}
             {unread > 0 && (
-              <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full" />
+              <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 flex items-center justify-center text-[10px] font-semibold text-white bg-red-500 rounded-full">
+                {unread > 9 ? '9+' : unread}
+              </span>
             )}
           </button>
 
@@ -163,8 +171,9 @@ export default function TopBar() {
             <div className="absolute right-0 top-10 w-80 bg-white rounded-xl shadow-xl border border-gray-100 overflow-hidden z-50">
               <NotificationPanel
                 notifications={notifications}
-                onDismiss={dismiss}
-                onClear={() => setNotifications([])}
+                onOpen={openNotif}
+                onDismiss={dismissNotification}
+                onClear={clearNotifications}
               />
             </div>
           )}

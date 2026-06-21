@@ -81,6 +81,7 @@ class AgentState(BaseModel):
     token_count: int = 0
     messages_processed: int = 0
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
+    status_since: datetime = Field(default_factory=datetime.utcnow)  # when status last changed
 
 
 class Task(BaseModel):
@@ -114,6 +115,7 @@ class WSEventType(str, Enum):
     TASK_COMPLETED = "task_completed"
     SELF_HEAL = "self_heal"
     RISK_HOLD = "risk_hold"
+    NOTIFICATION = "notification"
     ERROR = "error"
 
 
