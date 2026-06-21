@@ -1266,6 +1266,39 @@ async def risk_audit(days: float = 30, limit: int = 500):
     return await database.get_activity(since_iso=since, limit=limit)
 
 
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+@router.get("/notifications")
+async def list_notifications(limit: int = 50):
+    items = await database.get_notifications(limit=limit)
+    unread = sum(1 for n in items if not n.get("read"))
+    return {"notifications": items, "unread": unread}
+
+
+@router.post("/notifications/read")
+async def read_all_notifications():
+    await database.mark_all_notifications_read()
+    return {"ok": True}
+
+
+@router.post("/notifications/{nid}/read")
+async def read_notification(nid: str):
+    await database.mark_notification_read(nid)
+    return {"ok": True}
+
+
+@router.delete("/notifications/{nid}")
+async def dismiss_notification_route(nid: str):
+    await database.dismiss_notification(nid)
+    return {"ok": True}
+
+
+@router.delete("/notifications")
+async def clear_notifications_route():
+    await database.clear_notifications()
+    return {"ok": True}
+
+
 @router.get("/risk/policy")
 async def get_risk_policy():
     from .. import compliance
@@ -1332,9 +1365,12 @@ async def save_named_policy(req: NamedPolicyReq):
     summary = await compliance.summarise_policy(mgr, req.name, req.body)
     if not summary:  # fall back to the policy text so matching still works
         summary = (req.body or "").strip()[:240]
-    # Preserve rationale/impact_table on edits if the client didn't resend them.
+    # Preserve rationale/impact_table/transcript on edits if the client didn't
+    # resend them — e.g. "Save policy" only posts body/threshold, and must NOT
+    # wipe the interview transcript the policy was derived from.
     rationale = req.rationale
     impact_table = compliance._norm_impact_table(req.impact_table) if req.impact_table else []
+    transcript = req.transcript or []
     if req.id:
         existing = await database.get_risk_policy_row(req.id)
         if not rationale:
@@ -1344,12 +1380,17 @@ async def save_named_policy(req: NamedPolicyReq):
                 impact_table = compliance._norm_impact_table(_json.loads((existing or {}).get("impact_table") or "[]"))
             except Exception:
                 impact_table = []
+        if not transcript:
+            try:
+                transcript = _json.loads((existing or {}).get("transcript") or "[]")
+            except Exception:
+                transcript = []
     if not impact_table:  # always store a full table so the document renders
         impact_table = compliance._norm_impact_table([])
     await database.save_risk_policy({
         "id": pid, "name": req.name, "body": req.body, "summary": summary,
         "threshold": max(1, min(25, int(req.threshold))), "enabled": int(req.enabled),
-        "transcript": req.transcript or [], "review_frequency_months": req.review_frequency_months,
+        "transcript": transcript, "review_frequency_months": req.review_frequency_months,
         "rationale": rationale, "impact_table": impact_table,
     })
     # First policy becomes the active (default) global policy; or if requested.
@@ -1664,6 +1705,17 @@ async def create_mcp_server(req: MCPServerBody):
     record = {"id": str(uuid.uuid4()), **req.model_dump()}
     await database.save_mcp_server(record)
     await mcp_manager.refresh(record)
+    try:
+        from .. import notifications
+        await notifications.push(
+            type="info",
+            title="New MCP server connected",
+            body=f"“{record.get('name', 'A server')}” is now available to your agents.",
+            action="View servers",
+            link_view="skills",
+        )
+    except Exception:
+        pass
     return _mcp_public(record)
 
 

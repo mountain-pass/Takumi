@@ -211,6 +211,21 @@ CREATE TABLE IF NOT EXISTS activity_log (
 CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity_log(agent_id, created_at);
 
+CREATE TABLE IF NOT EXISTS notifications (
+    id          TEXT PRIMARY KEY,
+    type        TEXT NOT NULL DEFAULT 'info',   -- alert | info | success
+    title       TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL DEFAULT '',        -- button label, e.g. "View result"
+    link_view   TEXT NOT NULL DEFAULT '',        -- nav target: chat | risk | skills | ...
+    link_id     TEXT NOT NULL DEFAULT '',        -- e.g. conversation id to open
+    dedupe_key  TEXT NOT NULL DEFAULT '',        -- collapse repeat notifications
+    read        INTEGER NOT NULL DEFAULT 0,
+    dismissed   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_notif_live ON notifications(dismissed, created_at);
+
 CREATE TABLE IF NOT EXISTS risk_policies (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL DEFAULT '',
@@ -255,6 +270,10 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE risk_policies ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE risk_policies ADD COLUMN rationale TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE risk_policies ADD COLUMN impact_table TEXT NOT NULL DEFAULT '[]'",
+        # Liveness heartbeat + escalation tracking for the task watchdog.
+        "ALTER TABLE agent_tasks ADD COLUMN last_heartbeat TEXT",
+        "ALTER TABLE agent_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_tasks ADD COLUMN watchdog_flags TEXT NOT NULL DEFAULT '{}'",
     ]:
         try:
             await _db.execute(migration)
@@ -880,6 +899,75 @@ async def get_activity(since_iso: str | None = None, agent_id: str | None = None
     return [dict(r) for r in rows]
 
 
+# ── Notifications (user-facing) ───────────────────────────────────────────────
+
+async def add_notification(entry: dict) -> dict:
+    """Insert a notification. If a non-empty dedupe_key matches an existing
+    non-dismissed row, refresh that row instead of stacking duplicates."""
+    import uuid as _uuid
+    dedupe = (entry.get("dedupe_key") or "").strip()
+    if dedupe:
+        row = await (await _conn().execute(
+            "SELECT id FROM notifications WHERE dedupe_key = ? AND dismissed = 0 LIMIT 1",
+            (dedupe,),
+        )).fetchone()
+        if row:
+            await _conn().execute(
+                """UPDATE notifications SET type=?, title=?, body=?, action=?,
+                   link_view=?, link_id=?, read=0, created_at=datetime('now') WHERE id=?""",
+                (entry.get("type", "info"), entry.get("title", ""), entry.get("body", ""),
+                 entry.get("action", ""), entry.get("link_view", ""), entry.get("link_id", ""),
+                 row["id"]),
+            )
+            await _conn().commit()
+            return await get_notification(row["id"])
+    nid = entry.get("id") or _uuid.uuid4().hex
+    await _conn().execute(
+        """INSERT INTO notifications(id, type, title, body, action, link_view, link_id, dedupe_key)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+        (nid, entry.get("type", "info"), entry.get("title", ""), entry.get("body", ""),
+         entry.get("action", ""), entry.get("link_view", ""), entry.get("link_id", ""), dedupe),
+    )
+    await _conn().commit()
+    return await get_notification(nid)
+
+
+async def get_notification(nid: str) -> dict | None:
+    row = await (await _conn().execute(
+        "SELECT * FROM notifications WHERE id = ?", (nid,)
+    )).fetchone()
+    return dict(row) if row else None
+
+
+async def get_notifications(limit: int = 50, include_dismissed: bool = False) -> list[dict]:
+    q = "SELECT * FROM notifications"
+    if not include_dismissed:
+        q += " WHERE dismissed = 0"
+    q += " ORDER BY created_at DESC LIMIT ?"
+    rows = await (await _conn().execute(q, (limit,))).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def mark_notification_read(nid: str) -> None:
+    await _conn().execute("UPDATE notifications SET read = 1 WHERE id = ?", (nid,))
+    await _conn().commit()
+
+
+async def mark_all_notifications_read() -> None:
+    await _conn().execute("UPDATE notifications SET read = 1 WHERE dismissed = 0")
+    await _conn().commit()
+
+
+async def dismiss_notification(nid: str) -> None:
+    await _conn().execute("UPDATE notifications SET dismissed = 1 WHERE id = ?", (nid,))
+    await _conn().commit()
+
+
+async def clear_notifications() -> None:
+    await _conn().execute("UPDATE notifications SET dismissed = 1 WHERE dismissed = 0")
+    await _conn().commit()
+
+
 # ── Risk policies (named) ─────────────────────────────────────────────────────
 
 async def list_risk_policies(enabled_only: bool = False) -> list[dict]:
@@ -1035,6 +1123,38 @@ async def update_task(task_id: str, updates: dict) -> dict | None:
     )
     await _conn().commit()
     return current
+
+
+# ── Task liveness / watchdog ──────────────────────────────────────────────────
+
+async def touch_task_heartbeat(task_id: str) -> None:
+    """Mark a task as still alive — called by the working agent each step. A fresh
+    heartbeat means 'slow but progressing'; a stale one means the thread is wedged."""
+    try:
+        await _conn().execute(
+            "UPDATE agent_tasks SET last_heartbeat = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), task_id),
+        )
+        await _conn().commit()
+    except Exception:
+        pass
+
+
+async def set_task_attempts(task_id: str, attempts: int) -> None:
+    try:
+        await _conn().execute("UPDATE agent_tasks SET attempts = ? WHERE id = ?", (attempts, task_id))
+        await _conn().commit()
+    except Exception:
+        pass
+
+
+async def set_watchdog_flags(task_id: str, flags: dict) -> None:
+    try:
+        await _conn().execute("UPDATE agent_tasks SET watchdog_flags = ? WHERE id = ?",
+                              (json.dumps(flags), task_id))
+        await _conn().commit()
+    except Exception:
+        pass
 
 
 # ── Backup / restore ──────────────────────────────────────────────────────────

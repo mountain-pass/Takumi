@@ -9,7 +9,7 @@
 - Live frontend: animated org view, agent desks, chat, WebSocket state sync
 - Setup wizard: org name → LLM config → team builder with AI-enhanced prompts
 - Scheduled tasks (cron jobs)
-- Web search skill via SearXNG
+- Web search skill via headless browser (Jina/DuckDuckGo fallbacks)
 - Skill marketplace
 - Workflow view
 - Channel integrations (Telegram, WhatsApp, etc.)

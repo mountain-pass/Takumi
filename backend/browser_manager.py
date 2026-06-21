@@ -56,16 +56,100 @@ class BrowserManager:
                 from .config import get_settings
                 self._profile_dir = os.path.join(get_settings().data_dir, "browser-profile")
             os.makedirs(self._profile_dir, exist_ok=True)
-            self._ctx = await self._pw.chromium.launch_persistent_context(
-                self._profile_dir,
-                channel="chrome",
+            launch_args = dict(
+                user_data_dir=self._profile_dir,
                 headless=False,
                 viewport={"width": 1366, "height": 900},
                 args=["--no-first-run", "--no-default-browser-check"],
             )
+            try:
+                # Prefer the user's real Google Chrome (best site compatibility).
+                self._ctx = await self._pw.chromium.launch_persistent_context(
+                    channel="chrome", **launch_args)
+            except Exception as e:
+                # No system Chrome — fall back to Playwright's bundled Chromium
+                # (provisioned by `playwright install chromium` at startup).
+                logger.warning("[browser] system Chrome unavailable (%s) — using bundled Chromium", e)
+                self._ctx = await self._pw.chromium.launch_persistent_context(**launch_args)
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         logger.info("[browser] Chrome session ready (%s)", "CDP" if cdp else "persistent profile")
         return self._page
+
+    async def ensure_installed(self) -> None:
+        """Best-effort provisioning so browser skills are ready out of the box.
+        Verifies the Playwright package and a Chromium build are present, and
+        downloads Chromium if missing. Runs in the background at startup; never
+        raises and short-circuits quickly once everything is in place."""
+        import sys
+        notified = False  # only tell the user when we actually install something
+
+        # 1) Python package present?
+        try:
+            from playwright.async_api import async_playwright  # noqa: F401
+        except ImportError:
+            logger.info("[browser] Playwright not installed — installing package…")
+            await self._notify_setup("info", "Setting up browser automation",
+                                     "Installing the Playwright package so agents can browse the web…")
+            notified = True
+            if not await self._run([sys.executable, "-m", "pip", "install", "playwright"]):
+                logger.warning("[browser] Playwright package install failed — browser skills unavailable")
+                await self._notify_setup("alert", "Browser automation setup failed",
+                                         "Couldn't install Playwright — browser-control skills are unavailable.")
+                return
+
+        # 2) Chromium build present? (executable_path is known even when not downloaded)
+        try:
+            from playwright.async_api import async_playwright
+            pw = await async_playwright().start()
+            try:
+                path = pw.chromium.executable_path
+            finally:
+                await pw.stop()
+            if path and os.path.exists(path):
+                if notified:
+                    await self._notify_setup("success", "Browser automation ready",
+                                             "Agents can now navigate websites.")
+                return  # already provisioned — fast path on every restart
+        except Exception:
+            pass
+
+        logger.info("[browser] Downloading Chromium for Playwright (first run, ~150 MB)…")
+        await self._notify_setup("info", "Setting up browser automation",
+                                 "Downloading the browser engine (~150 MB) — this one-time step runs "
+                                 "in the background; agents can browse once it finishes.")
+        if await self._run([sys.executable, "-m", "playwright", "install", "chromium"]):
+            logger.info("[browser] Playwright Chromium ready")
+            await self._notify_setup("success", "Browser automation ready",
+                                     "Setup complete — agents can now navigate websites.")
+        else:
+            logger.warning("[browser] Chromium download failed — browser skills may be unavailable")
+            await self._notify_setup("alert", "Browser automation setup failed",
+                                     "Couldn't download the browser engine — browser-control skills are unavailable.")
+
+    @staticmethod
+    async def _notify_setup(type: str, title: str, body: str) -> None:
+        """Surface provisioning progress in the notification center. Best-effort."""
+        try:
+            from . import notifications
+            await notifications.push(type=type, title=title, body=body,
+                                     dedupe_key="setup:playwright")
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _run(cmd: list[str]) -> bool:
+        """Run a provisioning subprocess; return True on exit code 0."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning("[browser] `%s` failed: %s", " ".join(cmd[-3:]),
+                               (err or b"").decode(errors="replace")[:300])
+            return proc.returncode == 0
+        except Exception as e:
+            logger.warning("[browser] provisioning command errored: %s", e)
+            return False
 
     async def stop(self) -> None:
         try:

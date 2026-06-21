@@ -180,10 +180,12 @@ export default function App() {
   }
 
   const fetchAgents = useOrgStore(s => s.fetchAgents)
+  const loadNotifications = useOrgStore(s => s.loadNotifications)
 
   useEffect(() => {
     fetchOrg()
     connect()
+    loadNotifications()
     // Poll agent status as a fallback so the top-bar status self-heals even if a
     // WebSocket heartbeat is missed (e.g. after a reconnect).
     const id = setInterval(() => fetchAgents(), 8000)

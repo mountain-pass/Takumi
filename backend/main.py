@@ -71,6 +71,17 @@ async def lifespan(app: FastAPI):
         if patch:
             runtime_settings.update(patch)
     orchestrator.set_ws_broadcast(manager.broadcast)
+    from . import notifications
+    notifications.set_broadcast(manager.broadcast)
+    # Provision the Playwright browser in the background so agent browser-control
+    # skills are ready without manual setup — non-blocking, self-healing on any
+    # launch path (start.sh also does this synchronously on first run).
+    try:
+        from .browser_manager import browser_manager
+        browser_manager.configure(settings.data_dir)
+        asyncio.create_task(browser_manager.ensure_installed())
+    except Exception as e:
+        logger.warning("Playwright provisioning skipped: %s", e)
     await orchestrator.start()
     # Connect to configured MCP servers (non-fatal if any fail).
     try:

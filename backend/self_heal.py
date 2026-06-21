@@ -83,6 +83,19 @@ async def propose(orchestrator, inc: dict) -> None:
             "conversation_id": inc["conversation_id"],
         },
     ).model_dump_json())
+    try:
+        from . import notifications
+        await notifications.push(
+            type="alert",
+            title="Action required: review self-heal proposal",
+            body=f"A {inc['provider']} error can be auto-fixed. Review the proposed code change.",
+            action="Review now",
+            link_view="chat",
+            link_id=inc.get("conversation_id") or "",
+            dedupe_key=f"selfheal:{inc['id']}",
+        )
+    except Exception:
+        pass
 
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
@@ -243,6 +256,20 @@ async def finalize_heal(orchestrator, incident_id: str, result: str) -> None:
             payload={"kind": "result", "incident_id": incident_id, "status": status,
                      "message": msg, "conversation_id": inc["conversation_id"], "sha": sha},
         ).model_dump_json())
+        try:
+            from . import notifications
+            await notifications.push(
+                type="success" if sha else "info",
+                title="Self-heal complete" if sha else "Self-heal finished",
+                body=(f"The CTO patched {inc['provider']} on branch {inc['branch']} — try again."
+                      if sha else f"No code change was made for {inc['provider']}."),
+                action="View",
+                link_view="chat",
+                link_id=inc.get("conversation_id") or "",
+                dedupe_key=f"selfheal:{incident_id}",
+            )
+        except Exception:
+            pass
 
 
 def _now() -> str:
