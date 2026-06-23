@@ -1454,6 +1454,22 @@ async def list_runs(workflow_id: str, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def delete_run(run_id: str) -> None:
+    """Delete a single run and its steps."""
+    await _conn().execute("DELETE FROM workflow_run_steps WHERE run_id = ?", (run_id,))
+    await _conn().execute("DELETE FROM workflow_runs WHERE id = ?", (run_id,))
+    await _conn().commit()
+
+
+async def delete_runs(workflow_id: str) -> None:
+    """Delete every run (and its steps) for a workflow."""
+    await _conn().execute(
+        "DELETE FROM workflow_run_steps WHERE run_id IN "
+        "(SELECT id FROM workflow_runs WHERE workflow_id = ?)", (workflow_id,))
+    await _conn().execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (workflow_id,))
+    await _conn().commit()
+
+
 def _step_row(row) -> dict:
     d = dict(row)
     for k in ("input", "output"):

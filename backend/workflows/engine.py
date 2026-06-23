@@ -81,8 +81,9 @@ async def _run_compliance(node: dict, output: dict, workflow: dict, run_id: str,
 
 async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                        mode: str = "test", trigger_source: str = "manual",
-                       orchestrator=None, _depth: int = 0) -> str:
-    """Execute a workflow graph. Returns the run_id. Steps stream over WS."""
+                       orchestrator=None, _depth: int = 0, until_node: str | None = None) -> str:
+    """Execute a workflow graph. Returns the run_id. Steps stream over WS.
+    `until_node` stops after that node executes (used by 'Execute step')."""
     run_id = uuid.uuid4().hex
     graph = workflow.get("graph") or {}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
@@ -157,6 +158,11 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             raise
         comp = await _run_compliance(node, output, workflow, run_id, orchestrator) if ntype == "llm" else None
         ctx.context[node_id] = output
+        # Also expose the output under the node's label so templates can read
+        # {{My Node.field}} (friendlier than the raw node id).
+        _lbl = (node.get("data") or {}).get("label")
+        if _lbl:
+            ctx.context[_lbl] = output
         # A compliance agent that BLOCKS the output fails the node when the gate is
         # strict ('all'). Under 'unless_excluded'/'off' it's recorded but allowed.
         if comp and comp.get("status") == "blocked" and compliance.get_mode() == "all":
@@ -215,11 +221,40 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             consumed.add(nid); executed.add(nid)
         return results
 
+    # An error-catch branch ("Stop and Error" catcher): nodes reachable from any
+    # error_trigger node run ONLY when something fails, never in the normal flow.
+    def _node_type(n):
+        return n.get("type") or (n.get("data") or {}).get("type") or "trigger"
+    error_triggers = [nid for nid, n in nodes.items() if _node_type(n) == "error_trigger"]
+    error_branch: set[str] = set()
+    for et in error_triggers:
+        error_branch |= _reach([et])
+
+    async def run_error_branch(failed_label: str, error_msg: str, failed_id: str) -> None:
+        payload = {"error": error_msg, "node": failed_label, "node_id": failed_id,
+                   "run_id": run_id, "workflow": workflow.get("name", "")}
+        order = [n for n in _topo_order(list(nodes.values()), edges) if n in error_branch]
+        local: dict[str, dict] = {}
+        for nid in order:
+            node = nodes[nid]
+            ie = [e for e in incoming.get(nid, []) if e.get("source") in error_branch]
+            if _node_type(node) == "error_trigger" or not ie:
+                inp = payload
+            else:
+                inp = assemble_inputs(nid, {e["source"]: local.get(e["source"], {}) for e in ie})
+            try:
+                out, _ = await exec_node(node, inp)
+                local[nid] = out
+            except Exception as e:
+                logger.warning("[workflow] error branch node %s failed: %s", nid, e)
+                break
+
     run_status = "success"
     run_error = ""
+    failed_label = ""; failed_id = ""
     try:
         for node_id in _topo_order(list(nodes.values()), edges):
-            if node_id in consumed:
+            if node_id in consumed or node_id in error_branch:
                 continue
             node = nodes[node_id]
             ntype = node.get("type") or (node.get("data") or {}).get("type") or "trigger"
@@ -236,6 +271,8 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                 output, _ = await exec_node(node, inputs)
             except Exception as e:
                 run_status = "failed"; run_error = str(e)[:500]
+                failed_label = (node.get("data") or {}).get("label") or ntype
+                failed_id = node_id
                 break
 
             # Loop nodes fan their body sub-branch out per item, then continue via 'done'.
@@ -249,9 +286,18 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
 
             outputs[node_id] = output
             executed.add(node_id)
+            if until_node and node_id == until_node:
+                break  # 'Execute step' — stop after the requested node
     except Exception as e:
         run_status = "failed"; run_error = str(e)[:500]
         logger.exception("[workflow] run %s crashed", run_id)
+
+    # Catch-all: on any failure, run the error branch with the error context.
+    if run_status == "failed" and error_branch:
+        try:
+            await run_error_branch(failed_label, run_error, failed_id)
+        except Exception as e:
+            logger.warning("[workflow] error branch crashed: %s", e)
 
     await database.finish_run(run_id, run_status, run_error)
     await _broadcast(orchestrator, WSEventType.WORKFLOW_RUN,

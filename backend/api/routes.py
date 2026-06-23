@@ -1836,7 +1836,16 @@ async def get_workflow_route(wf_id: str):
 
 @router.put("/workflows/{wf_id}")
 async def update_workflow_route(wf_id: str, req: WorkflowReq):
+    import uuid as _uuid
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    # Webhook workflows get a stable token at save time so a test URL is available
+    # before publishing (otherwise there's no URL to POST to while test-listening).
+    if updates.get("trigger_type") == "webhook":
+        cfg = dict(updates.get("trigger_config") or {})
+        if not cfg.get("token"):
+            existing = await database.get_workflow(wf_id)
+            cfg["token"] = ((existing or {}).get("trigger_config") or {}).get("token") or _uuid.uuid4().hex
+        updates["trigger_config"] = cfg
     wf = await database.update_workflow(wf_id, updates)
     if not wf:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -1851,17 +1860,80 @@ async def delete_workflow_route(wf_id: str):
 
 class WorkflowTestReq(BaseModel):
     payload: dict | None = None
+    until: str | None = None   # node id — run up to this node only ('Execute step')
+
+
+WEBHOOK_TEST_TIMEOUT = 60  # seconds to wait for a real webhook call during a test
 
 
 @router.post("/workflows/{wf_id}/test")
 async def test_workflow_route(req: WorkflowTestReq, wf_id: str):
+    import asyncio
     from ..workflows import run_workflow
+    from ..workflows import webhook_wait
     wf = await database.get_workflow(wf_id)
     if not wf:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    run_id = await run_workflow(wf, req.payload or {}, mode="test",
-                                trigger_source="editor", orchestrator=orchestrator)
+
+    payload = req.payload
+    # Webhook trigger with no sample payload → wait for a real call to the hook URL.
+    if wf.get("trigger_type") == "webhook" and not payload:
+        fut = webhook_wait.arm(wf_id)
+        try:
+            payload = await asyncio.wait_for(fut, timeout=WEBHOOK_TEST_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            webhook_wait.disarm(wf_id)
+            cancelled = isinstance(e, asyncio.CancelledError)
+            return {"run_id": None, "timeout": not cancelled, "cancelled": cancelled,
+                    "message": "Test stopped." if cancelled else
+                               f"No webhook call received within {WEBHOOK_TEST_TIMEOUT}s. "
+                               f"POST to the webhook URL, then test again."}
+
+    run_id = await run_workflow(wf, payload or {}, mode="test",
+                                trigger_source="editor", orchestrator=orchestrator,
+                                until_node=req.until)
     return {"run_id": run_id, "run": await database.get_run(run_id)}
+
+
+@router.post("/workflows/{wf_id}/stop-test")
+async def stop_test_route(wf_id: str):
+    """Cancel a test that's currently waiting for a webhook call."""
+    from ..workflows import webhook_wait
+    webhook_wait.disarm(wf_id)
+    return {"ok": True}
+
+
+class CodeFormatReq(BaseModel):
+    code: str
+    language: str = "python"
+
+
+@router.post("/workflows/format")
+async def format_code_route(req: CodeFormatReq):
+    """Pretty-print code for the Code node. Python uses the stdlib AST (zero-dep);
+    JavaScript uses a lightweight brace-based re-indenter."""
+    code = req.code or ""
+    lang = (req.language or "python").lower()
+    try:
+        if lang in ("javascript", "js", "node"):
+            return {"code": _format_braces(code), "ok": True}
+        import ast
+        return {"code": ast.unparse(ast.parse(code)), "ok": True}
+    except Exception as e:
+        return {"code": code, "ok": False, "error": str(e)[:200]}
+
+
+def _format_braces(code: str) -> str:
+    """Re-indent C-style code by net bracket depth. Good enough for the Code node."""
+    out, depth = [], 0
+    for raw in code.split("\n"):
+        line = raw.strip()
+        closers = line[:1] in ("}", ")", "]")
+        indent = max(0, depth - (1 if closers else 0))
+        out.append(("  " * indent) + line if line else "")
+        depth += line.count("{") - line.count("}") + line.count("(") - line.count(")") + line.count("[") - line.count("]")
+        depth = max(0, depth)
+    return "\n".join(out)
 
 
 @router.get("/workflows/{wf_id}/runs")
@@ -1875,6 +1947,18 @@ async def get_workflow_run_route(run_id: str):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+
+@router.delete("/workflows/runs/{run_id}")
+async def delete_workflow_run_route(run_id: str):
+    await database.delete_run(run_id)
+    return {"ok": True}
+
+
+@router.delete("/workflows/{wf_id}/runs")
+async def delete_workflow_runs_route(wf_id: str):
+    await database.delete_runs(wf_id)
+    return {"ok": True}
 
 
 @router.post("/workflows/{wf_id}/publish")
@@ -1906,15 +1990,21 @@ async def unpublish_workflow_route(wf_id: str):
 
 @router.post("/hooks/workflow/{wf_id}")
 async def workflow_webhook_route(wf_id: str, payload: dict | None = None, token: str = ""):
-    """Public webhook trigger. Only fires for live workflows with trigger_type=webhook,
-    guarded by the secret token minted at publish time (?token=...)."""
+    """Public webhook trigger. Fires live workflows (guarded by the secret token),
+    or — if a test is currently listening — delivers the payload to that test."""
     from ..workflows import run_workflow
+    from ..workflows import webhook_wait
     wf = await database.get_workflow(wf_id)
-    if not wf or wf.get("status") != "live" or wf.get("trigger_type") != "webhook":
-        raise HTTPException(status_code=404, detail="No live webhook workflow here")
+    if not wf or wf.get("trigger_type") != "webhook":
+        raise HTTPException(status_code=404, detail="No webhook workflow here")
     expected = (wf.get("trigger_config") or {}).get("token")
     if expected and token != expected:
         raise HTTPException(status_code=403, detail="Invalid webhook token")
+    # A test in the editor is listening → hand it the payload instead of running live.
+    if webhook_wait.deliver(wf_id, payload or {}):
+        return {"ok": True, "captured_for_test": True}
+    if wf.get("status") != "live":
+        raise HTTPException(status_code=404, detail="Workflow is not live")
     run_id = await run_workflow(wf, payload or {}, mode="live",
                                 trigger_source="webhook", orchestrator=orchestrator)
     # If the workflow has a "Respond to Webhook" node, return its payload to the caller.

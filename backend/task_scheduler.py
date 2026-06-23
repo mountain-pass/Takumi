@@ -277,4 +277,60 @@ class TaskScheduler:
         except ValueError:
             pass
 
+        # Standard 5-field cron: "min hour dom month dow" (supports *, lists, ranges, */step).
+        if len(cron_expr.split()) == 5:
+            return _cron_next(cron_expr, now)
+
         return None
+
+
+def _cron_field(spec: str, lo: int, hi: int) -> set[int]:
+    """Expand one cron field into the set of matching values."""
+    vals: set[int] = set()
+    for part in spec.split(","):
+        step = 1
+        if "/" in part:
+            part, s = part.split("/", 1)
+            step = int(s)
+        if part in ("*", ""):
+            start, end = lo, hi
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(part)
+        vals.update(v for v in range(start, end + 1) if (v - start) % step == 0)
+    return vals
+
+
+def _cron_next(cron_expr: str, now: datetime) -> str | None:
+    """Next datetime matching a standard 5-field cron, scanning minute-by-minute
+    (bounded to ~400 days). Day-of-month OR day-of-week match (cron convention)."""
+    mins, hrs, doms, months, dows = cron_expr.split()
+    try:
+        m_set = _cron_field(mins, 0, 59)
+        h_set = _cron_field(hrs, 0, 23)
+        dom_set = _cron_field(doms, 1, 31)
+        mon_set = _cron_field(months, 1, 12)
+        dow_set = _cron_field(dows, 0, 6)  # 0 = Sunday
+    except ValueError:
+        return None
+    dom_restricted = doms.strip() != "*"
+    dow_restricted = dows.strip() != "*"
+    t = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    for _ in range(400 * 24 * 60):
+        cron_dow = (t.weekday() + 1) % 7  # Python Mon=0 → cron Sun=0
+        # Cron convention: when BOTH dom and dow are restricted, match either;
+        # when only one is restricted, match that one; when neither, any day.
+        if dom_restricted and dow_restricted:
+            day_ok = (t.day in dom_set) or (cron_dow in dow_set)
+        elif dom_restricted:
+            day_ok = t.day in dom_set
+        elif dow_restricted:
+            day_ok = cron_dow in dow_set
+        else:
+            day_ok = True
+        if (t.minute in m_set and t.hour in h_set and t.month in mon_set and day_ok):
+            return t.isoformat()
+        t += timedelta(minutes=1)
+    return None

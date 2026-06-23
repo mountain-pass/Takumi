@@ -84,11 +84,15 @@ export const useOrgStore = create((set, get) => ({
     })
     if (!res.ok) { set({ wfRun: { runId: null, status: 'failed', steps: {} } }); return null }
     const d = await res.json()
+    if (d.timeout) { set({ wfRun: { runId: null, status: 'failed', steps: {}, order: [], note: d.message } }); return d }
     // Reconcile from the returned run (covers anything missed over WS).
-    const steps = {}
-    for (const s of (d.run?.steps || [])) steps[s.node_id] = { status: s.status, output: s.output, compliance: s.compliance, error: s.error }
-    set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps } })
+    const steps = {}, order = []
+    for (const s of (d.run?.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps, order } })
     return d
+  },
+  async stopTest(id) {
+    try { await fetch(`${API}/workflows/${id}/stop-test`, { method: 'POST' }) } catch {}
   },
   providers: [],
   async loadProviders() {
@@ -103,14 +107,41 @@ export const useOrgStore = create((set, get) => ({
       return res.ok ? ((await res.json()).models || []) : []
     } catch { return [] }
   },
+  async formatCode(code, language) {
+    try {
+      const res = await fetch(`${API}/workflows/format`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, language }),
+      })
+      return res.ok ? await res.json() : null
+    } catch { return null }
+  },
+  async executeStep(id, nodeId, payload = {}) {
+    const res = await fetch(`${API}/workflows/${id}/test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload, until: nodeId }),
+    })
+    if (!res.ok) return null
+    const d = await res.json()
+    const steps = {}, order = []
+    for (const s of (d.run?.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps, order } })
+    return d.run
+  },
   async getRun(runId) {
     const res = await fetch(`${API}/workflows/runs/${runId}`)
     if (!res.ok) return null
     const run = await res.json()
-    const steps = {}
-    for (const s of (run.steps || [])) steps[s.node_id] = { status: s.status, output: s.output, compliance: s.compliance, error: s.error }
-    set({ wfRun: { runId: run.id, status: run.status, steps } })
+    const steps = {}, order = []
+    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: run.id, status: run.status, steps, order } })
     return run
+  },
+  async deleteRun(runId) {
+    await fetch(`${API}/workflows/runs/${runId}`, { method: 'DELETE' })
+  },
+  async deleteAllRuns(workflowId) {
+    await fetch(`${API}/workflows/${workflowId}/runs`, { method: 'DELETE' })
   },
   async publishWorkflow(id, live) {
     const res = await fetch(`${API}/workflows/${id}/${live ? 'publish' : 'unpublish'}`, { method: 'POST' })
@@ -305,8 +336,9 @@ export const useOrgStore = create((set, get) => ({
       set(s => ({ wfRun: { ...(s.wfRun || { steps: {} }), runId: payload.run_id, status: payload.status } }))
     } else if (type === 'workflow_step') {
       set(s => {
-        const run = s.wfRun && s.wfRun.runId === payload.run_id ? s.wfRun : { runId: payload.run_id, status: 'running', steps: {} }
-        return { wfRun: { ...run, steps: { ...run.steps, [payload.node_id]: {
+        const run = s.wfRun && s.wfRun.runId === payload.run_id ? s.wfRun : { runId: payload.run_id, status: 'running', steps: {}, order: [] }
+        const order = (run.order || []).includes(payload.node_id) ? run.order : [...(run.order || []), payload.node_id]
+        return { wfRun: { ...run, order, steps: { ...run.steps, [payload.node_id]: {
           status: payload.status, output: payload.output, compliance: payload.compliance, error: payload.error,
         } } } }
       })

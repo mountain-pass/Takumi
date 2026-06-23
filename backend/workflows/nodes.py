@@ -92,6 +92,17 @@ async def trigger_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return inputs or _cfg(node).get("sample") or {}
 
 
+def _pairs_to_dict(pairs) -> dict:
+    """Turn [{name, value}, ...] rows (n8n-style) into a dict, skipping blank names."""
+    out = {}
+    for p in (pairs or []):
+        if isinstance(p, dict):
+            name = (p.get("name") or "").strip()
+            if name:
+                out[name] = p.get("value", "")
+    return out
+
+
 async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     import httpx
     cfg = render(_cfg(node), ctx, inputs)
@@ -99,11 +110,34 @@ async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     url = cfg.get("url") or ""
     if not url:
         raise ValueError("HTTP node has no URL configured")
-    headers = cfg.get("headers") or {}
-    body = cfg.get("body")
-    async with httpx.AsyncClient(timeout=NODE_TIMEOUT, follow_redirects=True) as client:
-        kwargs: dict[str, Any] = {"headers": headers}
+
+    # Query params: structured rows (preferred) when enabled.
+    params = _pairs_to_dict(cfg.get("queryParams")) if cfg.get("sendQuery") else {}
+
+    # Headers: legacy JSON dict + structured rows when enabled.
+    headers = dict(cfg.get("headers") or {}) if isinstance(cfg.get("headers"), dict) else {}
+    if cfg.get("sendHeaders"):
+        headers.update(_pairs_to_dict(cfg.get("headerParams")))
+
+    # Body: legacy nodes have no `sendBody` key → send `body` if present.
+    # New nodes gate it on the toggle.
+    send_body = cfg.get("sendBody")
+    body = cfg.get("body") if (send_body or send_body is None) else None
+
+    opts = cfg.get("options") or {}
+    timeout = float(opts.get("timeout") or 0) / 1000 or NODE_TIMEOUT
+    verify = not bool(opts.get("ignoreSSL"))
+    follow = opts.get("followRedirects", True) is not False
+    on_error = (cfg.get("onError") or "stop").lower()
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=follow, verify=verify) as client:
+        kwargs: dict[str, Any] = {"headers": headers, "params": params}
         if body not in (None, ""):
+            if cfg.get("bodyType") == "json" and isinstance(body, str):
+                try:
+                    body = json.loads(body)
+                except Exception:
+                    pass
             if isinstance(body, (dict, list)):
                 kwargs["json"] = body
             else:
@@ -113,7 +147,14 @@ async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
         parsed = resp.json()
     except Exception:
         parsed = resp.text
-    return {"status": resp.status_code, "headers": dict(resp.headers), "body": parsed}
+
+    result = {"status": resp.status_code, "headers": dict(resp.headers), "body": parsed,
+              "ok": resp.status_code < 400}
+    # 4xx/5xx fail the node (so the Error Trigger catches it) unless "Continue on error".
+    if resp.status_code >= 400 and on_error != "continue":
+        snippet = parsed if isinstance(parsed, str) else json.dumps(parsed)
+        raise RuntimeError(f"HTTP {resp.status_code} {resp.reason_phrase} from {url}: {snippet[:500]}")
+    return result
 
 
 # A deliberately small, safe environment for the code node. No imports, no
@@ -126,52 +167,105 @@ _SAFE_BUILTINS = {
 }
 
 
+def _render_code_tokens(code: str, ctx: NodeContext, inputs: dict, lang: str) -> str:
+    """Resolve {{Node.field}} tokens dragged into code to LITERAL values so the
+    code stays valid: JSON literals for JS, Python literals for Python."""
+    is_js = lang in ("javascript", "js", "node")
+
+    def sub(m):
+        val = _resolve_path(m.group(1).strip(), ctx, inputs)
+        return json.dumps(val) if is_js else repr(val)
+
+    return _TPL.sub(sub, code)
+
+
 async def code_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Run a small script. Language 'python' (default) or 'javascript'.
-    `input` and `context` are in scope; assign to `output`."""
+    `input` and `context` are in scope; assign to `output`. Any {{Node.field}}
+    tokens (e.g. dragged from the INPUT pane) are resolved to literal values first."""
     cfg = _cfg(node)
     lang = (cfg.get("language") or "python").lower()
     code = cfg.get("code") or ("output = input" if lang == "python" else "output = input;")
+    code = _render_code_tokens(code, ctx, inputs, lang)
     if lang in ("javascript", "js", "node"):
         return await _run_js(code, inputs, ctx)
+
+    import re as _re
+    import textwrap as _tw
     env = {"__builtins__": _SAFE_BUILTINS}
     local = {"input": inputs, "context": ctx.context, "output": None}
-    try:
-        # Try as an expression first (so `input['x'] * 2` works directly).
-        local["output"] = eval(compile(code, "<code-node>", "eval"), env, local)
-    except SyntaxError:
-        exec(compile(code, "<code-node>", "exec"), env, local)
-    out = local.get("output")
+    has_return = bool(_re.search(r"(^|\n)[ \t]*return\b", code))
+    if has_return:
+        # Wrap so a top-level `return ...` works (like JS / n8n).
+        wrapped = ("def __wf_main(input, context):\n" + _tw.indent(code, "    ") +
+                   "\n    return locals().get('output')\n__wf_result = __wf_main(input, context)")
+        exec(compile(wrapped, "<code-node>", "exec"), env, local)
+        out = local.get("__wf_result")
+    else:
+        try:
+            # A bare expression (e.g. `input['x'] * 2`) is allowed too.
+            out = eval(compile(code, "<code-node>", "eval"), env, local)
+        except SyntaxError:
+            exec(compile(code, "<code-node>", "exec"), env, local)
+            out = local.get("output")
     return out if isinstance(out, dict) else {"result": out}
 
 
 async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
     """Execute JS via a `node` subprocess. `input`/`context` are injected as JSON;
-    the script should assign `output`. Requires Node.js on PATH."""
-    import shutil
+    the script should assign `output`. Requires Node.js on PATH.
+
+    The script is piped via stdin and the (potentially large) input/context are
+    passed through temp files — never argv/env — so big upstream outputs don't
+    blow past the OS ARG_MAX limit ('[Errno 7] Argument list too long')."""
+    import shutil, os, tempfile
     node_bin = shutil.which("node")
     if not node_bin:
         raise RuntimeError("JavaScript code node requires Node.js on PATH (not found)")
-    harness = (
-        "const input = JSON.parse(process.env.WF_INPUT || '{}');\n"
-        "const context = JSON.parse(process.env.WF_CONTEXT || '{}');\n"
-        "let output;\n" + code + "\n"
-        "process.stdout.write(JSON.stringify(output === undefined ? null : output));\n"
-    )
-    proc = await asyncio.create_subprocess_exec(
-        node_bin, "-e", harness,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={"WF_INPUT": json.dumps(inputs), "WF_CONTEXT": json.dumps(ctx.context),
-             "PATH": __import__("os").environ.get("PATH", "")},
-    )
-    out, err = await asyncio.wait_for(proc.communicate(), timeout=NODE_TIMEOUT - 5)
-    if proc.returncode != 0:
-        raise RuntimeError(f"JS error: {(err or b'').decode()[:300]}")
+    import re as _re
+
+    in_path = ctx_path = None
     try:
-        parsed = json.loads((out or b"").decode() or "null")
-    except Exception:
-        parsed = (out or b"").decode()
-    return parsed if isinstance(parsed, dict) else {"result": parsed}
+        fd_i, in_path = tempfile.mkstemp(suffix=".json", prefix="wf_in_")
+        with os.fdopen(fd_i, "w") as f:
+            json.dump(inputs, f)
+        fd_c, ctx_path = tempfile.mkstemp(suffix=".json", prefix="wf_ctx_")
+        with os.fdopen(fd_c, "w") as f:
+            json.dump(ctx.context, f)
+
+        head = ("const __fs = require('fs');\n"
+                "const input = JSON.parse(__fs.readFileSync(process.env.WF_INPUT_FILE, 'utf8') || '{}');\n"
+                "const context = JSON.parse(__fs.readFileSync(process.env.WF_CONTEXT_FILE, 'utf8') || '{}');\n")
+        if _re.search(r"(^|\n)\s*return\b", code):
+            # Wrap so a top-level `return ...` works (like Python / n8n).
+            body = "const __wf_main = () => {\n" + code + "\n};\nconst output = __wf_main();\n"
+        else:
+            body = "let output;\n" + code + "\n"
+        harness = head + body + "process.stdout.write(JSON.stringify(output === undefined ? null : output));\n"
+
+        # Pipe the script via stdin (node reads from stdin when given no file).
+        proc = await asyncio.create_subprocess_exec(
+            node_bin, "-",   # read the script from stdin (avoids argv size limits)
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={"WF_INPUT_FILE": in_path, "WF_CONTEXT_FILE": ctx_path,
+                 "PATH": os.environ.get("PATH", "")},
+        )
+        out, err = await asyncio.wait_for(proc.communicate(harness.encode()), timeout=NODE_TIMEOUT - 5)
+        if proc.returncode != 0:
+            raise RuntimeError(f"JS error: {(err or b'').decode()[:300]}")
+        try:
+            parsed = json.loads((out or b"").decode() or "null")
+        except Exception:
+            parsed = (out or b"").decode()
+        return parsed if isinstance(parsed, dict) else {"result": parsed}
+    finally:
+        for p in (in_path, ctx_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 async def if_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -190,6 +284,88 @@ async def if_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
         logger.warning("[workflow] if-node eval failed: %s", e)
         result = False
     return {"result": result, "_branch": "true" if result else "false"}
+
+
+async def switch_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Route to one of several outputs by evaluating ordered rules. Each rule is a
+    Python expression; the first true rule's index becomes the taken handle. Falls
+    through to the 'default' handle when none match."""
+    cfg = _cfg(node)
+    rules = cfg.get("rules") or []
+    env = {"__builtins__": _SAFE_BUILTINS}
+    scope = {"input": inputs, "context": ctx.context}
+    matched = "default"
+    for i, rule in enumerate(rules):
+        expr = rule.get("condition") if isinstance(rule, dict) else rule
+        try:
+            if expr and bool(eval(compile(render(str(expr), ctx, inputs), "<switch>", "eval"), env, dict(scope))):
+                matched = str(i)
+                break
+        except Exception as e:
+            logger.debug("[workflow] switch rule %d failed: %s", i, e)
+    return {"_branch": matched, "matched": matched,
+            "value": inputs if isinstance(inputs, dict) else {"value": inputs}}
+
+
+async def filter_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Pass input through if the condition holds; otherwise stop this branch."""
+    cfg = _cfg(node)
+    expr = cfg.get("condition") or "True"
+    try:
+        rendered = render(expr, ctx, inputs)
+        keep = bool(eval(compile(str(rendered), "<filter>", "eval"),
+                         {"__builtins__": _SAFE_BUILTINS},
+                         {"input": inputs, "context": ctx.context})) if isinstance(rendered, str) else bool(rendered)
+    except Exception as e:
+        logger.warning("[workflow] filter eval failed: %s", e)
+        keep = False
+    if keep:
+        out = inputs if isinstance(inputs, dict) else {"value": inputs}
+        return {**out, "_kept": True}
+    # Sentinel handle that no edge matches → downstream is pruned.
+    return {"_branch": "__dropped__", "_kept": False}
+
+
+async def stop_error_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Throw an error to fail the run with a custom message."""
+    cfg = _cfg(node)
+    msg = render(cfg.get("message") or "Workflow stopped", ctx, inputs)
+    raise RuntimeError(str(msg))
+
+
+async def set_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Edit Fields (Set): add/override fields. `assignments` is an object of
+    name → value (values are templated). keep_only drops the original input."""
+    cfg = _cfg(node)
+    assignments = cfg.get("assignments") or {}
+    rendered = render(assignments, ctx, inputs) if isinstance(assignments, dict) else {}
+    base = {} if cfg.get("keep_only") else (inputs if isinstance(inputs, dict) else {"value": inputs})
+    return {**base, **rendered}
+
+
+async def datetime_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Date & Time: produce or transform a timestamp. Actions: 'now' (default),
+    'format' (parse `field` and reformat), 'add' (offset seconds)."""
+    from datetime import datetime, timedelta, timezone
+    cfg = _cfg(node)
+    action = (cfg.get("action") or "now").lower()
+    if action == "now":
+        return {"datetime": datetime.now(timezone.utc).isoformat()}
+    if action == "add":
+        try:
+            base = datetime.fromisoformat(str(render(cfg.get("value") or "", ctx, inputs))) if cfg.get("value") else datetime.now(timezone.utc)
+        except Exception:
+            base = datetime.now(timezone.utc)
+        secs = float(cfg.get("seconds") or 0)
+        return {"datetime": (base + timedelta(seconds=secs)).isoformat()}
+    # format
+    raw = render(cfg.get("value") or "", ctx, inputs)
+    fmt = cfg.get("format") or "%Y-%m-%d %H:%M:%S"
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        return {"datetime": dt.strftime(fmt)}
+    except Exception:
+        return {"datetime": str(raw)}
 
 
 async def loop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -268,6 +444,12 @@ async def noop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return inputs if isinstance(inputs, dict) else {"value": inputs}
 
 
+async def error_trigger_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Catch-all entry: runs only when another node fails. Receives the error
+    context {error, node, node_id, run_id, workflow} for the error branch to handle."""
+    return inputs if isinstance(inputs, dict) else {"error": str(inputs)}
+
+
 async def respond_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Mark the payload to return to a webhook caller. The webhook route returns
     the output of the (first) respond node in the run."""
@@ -319,4 +501,10 @@ NODE_HANDLERS = {
     "noop": noop_node,
     "respond": respond_node,
     "subworkflow": subworkflow_node,
+    "switch": switch_node,
+    "filter": filter_node,
+    "stop_error": stop_error_node,
+    "set": set_node,
+    "datetime": datetime_node,
+    "error_trigger": error_trigger_node,
 }
