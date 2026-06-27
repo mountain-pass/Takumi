@@ -5,7 +5,7 @@
 import React, { useEffect, useState } from 'react'
 import {
   GitBranch, Plus, Clock, Webhook, Bot, Hand, CheckCircle2, AlertCircle,
-  Loader2, Trash2,
+  Loader2, Trash2, Sparkles, SlidersHorizontal, X,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import WorkflowEditor from './WorkflowEditor'
@@ -29,20 +29,24 @@ export default function WorkflowView() {
   const createWorkflow = useOrgStore(s => s.createWorkflow)
   const deleteWorkflow = useOrgStore(s => s.deleteWorkflow)
   const [editingId, setEditingId] = useState(null)
+  const [aiMode, setAiMode] = useState(false)       // open the editor in AI-assist mode
+  const [chooser, setChooser] = useState(false)     // Manual vs AI Assist picker
 
   useEffect(() => { loadWorkflows() }, [])
 
-  async function handleCreate() {
+  async function handleCreate(mode) {
+    setChooser(false)
     const wf = await createWorkflow({
       name: 'Untitled workflow',
       graph: { nodes: [{ id: 'trigger', type: 'trigger', position: { x: 80, y: 160 },
         data: { label: 'When triggered', kind: 'trigger', config: {} } }], edges: [] },
     })
-    if (wf?.id) setEditingId(wf.id)
+    if (wf?.id) { setAiMode(mode === 'ai'); setEditingId(wf.id) }
   }
 
   if (editingId) {
-    return <WorkflowEditor workflowId={editingId} onBack={() => { setEditingId(null); loadWorkflows() }} />
+    return <WorkflowEditor workflowId={editingId} aiAssist={aiMode}
+      onBack={() => { setEditingId(null); setAiMode(false); loadWorkflows() }} />
   }
 
   return (
@@ -52,7 +56,7 @@ export default function WorkflowView() {
           <h1 className="text-lg font-semibold text-gray-800">Workflows</h1>
           <p className="text-xs text-gray-400">Build multi-step automations triggered by schedules, webhooks or agents.</p>
         </div>
-        <button onClick={handleCreate}
+        <button onClick={() => setChooser(true)}
           className="flex items-center gap-2 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg">
           <Plus size={16} /> Create workflow
         </button>
@@ -63,7 +67,7 @@ export default function WorkflowView() {
           <div className="h-full flex flex-col items-center justify-center text-gray-400 gap-3">
             <GitBranch size={40} strokeWidth={1.5} />
             <p className="text-sm font-medium">No workflows yet</p>
-            <button onClick={handleCreate} className="text-indigo-600 text-sm font-medium hover:underline">
+            <button onClick={() => setChooser(true)} className="text-indigo-600 text-sm font-medium hover:underline">
               Create your first workflow
             </button>
           </div>
@@ -108,6 +112,36 @@ export default function WorkflowView() {
           </div>
         )}
       </div>
+
+      {chooser && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setChooser(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="text-base font-semibold text-gray-800">Create a workflow</h2>
+              <button onClick={() => setChooser(false)} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+            </div>
+            <p className="text-xs text-gray-400 mb-4">Choose how you want to build it.</p>
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => handleCreate('manual')}
+                className="text-left p-4 rounded-xl border border-gray-200 hover:border-indigo-300 hover:bg-indigo-50/40 transition-all">
+                <div className="w-9 h-9 rounded-lg bg-gray-100 flex items-center justify-center mb-3">
+                  <SlidersHorizontal size={18} className="text-gray-600" />
+                </div>
+                <div className="font-medium text-sm text-gray-800">Manual</div>
+                <div className="text-xs text-gray-400 mt-0.5">Start from a blank canvas and add nodes yourself.</div>
+              </button>
+              <button onClick={() => handleCreate('ai')}
+                className="text-left p-4 rounded-xl border border-indigo-200 bg-indigo-50/40 hover:border-indigo-400 hover:bg-indigo-50 transition-all">
+                <div className="w-9 h-9 rounded-lg bg-indigo-100 flex items-center justify-center mb-3">
+                  <Sparkles size={18} className="text-indigo-600" />
+                </div>
+                <div className="font-medium text-sm text-gray-800">AI Assist</div>
+                <div className="text-xs text-gray-400 mt-0.5">Describe your objective and build it by chatting with AI.</div>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

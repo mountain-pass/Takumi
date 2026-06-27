@@ -125,8 +125,18 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             return (e.get("sourceHandle") or "true") == branch_of[src]
         return True
 
-    def assemble_inputs(node_id, src_outputs):
+    def assemble_inputs(node_id, src_outputs, in_edges=None):
         live = [s for s in src_outputs]
+        # Deterministic input order for Merge: sort by the targetHandle index
+        # ('input-0', 'input-1', …) so Input 1/2/3 map to the wired ports.
+        if in_edges:
+            def hidx(src):
+                for e in in_edges:
+                    if e.get("source") == src:
+                        th = str(e.get("targetHandle") or "")
+                        return int(th[6:]) if th.startswith("input-") and th[6:].isdigit() else 10**6
+                return 10**6
+            live.sort(key=hidx)
         ups = [src_outputs[s] for s in live]
         if len(ups) == 1:
             return ups[0]
@@ -173,15 +183,16 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             ctx.context[_lbl] = output
         # A compliance agent that BLOCKS the output fails the node when the gate is
         # strict ('all'). Under 'unless_excluded'/'off' it's recorded but allowed.
+        tokens = ctx.step_tokens.get(node_id)
         if comp and comp.get("status") == "blocked" and compliance.get_mode() == "all":
-            await database.finish_run_step(step_id, status="failed", output=output, compliance=comp,
+            await database.finish_run_step(step_id, status="failed", output=output, compliance=comp, tokens=tokens,
                                            error=f"Blocked by compliance ({comp.get('level')}, score {comp.get('score')})")
             await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                              {"run_id": run_id, "node_id": node_id, "status": "failed",
                               "label": label, "output": output, "compliance": comp,
                               "error": "Blocked by compliance review"})
             raise RuntimeError(f"Compliance blocked '{label}'")
-        await database.finish_run_step(step_id, status="success", output=output, compliance=comp)
+        await database.finish_run_step(step_id, status="success", output=output, compliance=comp, tokens=tokens)
         await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                          {"run_id": run_id, "node_id": node_id, "status": "success",
                           "label": label, "output": output, "compliance": comp})
@@ -218,7 +229,7 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                 if not ie:                                # body entry node → receives the item
                     inp = item if isinstance(item, dict) else {"item": item}
                 else:
-                    inp = assemble_inputs(nid, {e["source"]: local.get(e["source"], {}) for e in ie})
+                    inp = assemble_inputs(nid, {e["source"]: local.get(e["source"], {}) for e in ie}, ie)
                 out, _ = await exec_node(node, inp, label_suffix=f" [item {i + 1}]")
                 local[nid] = out
             if len(terminals) == 1:
@@ -285,7 +296,7 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                 continue  # pruned branch — skip silently
 
             inputs = (trigger_payload or {}) if is_start else assemble_inputs(
-                node_id, {s: outputs.get(s, {}) for s in live_sources})
+                node_id, {s: outputs.get(s, {}) for s in live_sources}, in_edges)
 
             try:
                 output, _ = await exec_node(node, inputs)

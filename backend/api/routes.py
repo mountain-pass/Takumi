@@ -1797,6 +1797,7 @@ class WorkflowReq(BaseModel):
     require_compliance: bool | None = None
     trigger_type: str | None = None
     trigger_config: dict | None = None
+    objective: str | None = None
 
 
 @router.get("/workflows")
@@ -1821,8 +1822,271 @@ async def create_workflow_route(req: WorkflowReq):
         "require_compliance": True if req.require_compliance is None else req.require_compliance,
         "trigger_type": req.trigger_type or "manual",
         "trigger_config": req.trigger_config or {},
+        "objective": req.objective or "",
     }
     return await database.create_workflow(wf)
+
+
+class WorkflowAIBuildReq(BaseModel):
+    messages: list[dict] = []        # [{role:'user'|'assistant', content:str}] conversation so far
+    graph: dict | None = None        # the current workflow graph
+    objective: str | None = None     # captured business objective (if any)
+
+
+_AI_BUILD_SYSTEM = """You are an automation **workflow builder** (like n8n's AI assistant). \
+You design a workflow WITH the user through conversation, and you emit the workflow graph as JSON.
+
+Hard rules:
+- The FIRST thing to establish is the business objective AND the reason behind it. The user's first \
+message answers "What is the main business objective for this flow, and why does it matter?". Capture \
+the objective as `objective` and make sure you understand the WHY (the business outcome/motivation).
+- If their answer is a purely technical solution (e.g. "call this API then write a file") with no \
+business reason, ask a follow-up: WHY do they want this / what outcome are they really after — before \
+building. Use that reason to design a better workflow than a literal technical spec.
+- Then ask SHORT clarifying questions, ONE topic at a time, and incrementally build the graph as you learn more.
+- Keep `reply` conversational and brief (1-3 sentences). Never dump JSON into `reply`.
+- Always keep the existing node with id "trigger" as the entry point.
+
+Available node `type` values:
+- trigger (entry), http (API call: config.method, config.url), code (config.language js|python, config.code),
+- set (edit fields), if (config.condition, config.lang), switch (config.rules), loop (config.items_field),
+- merge, filter (config.condition), llm (AI agent: config.prompt, config.system, config.agent_id),
+- respond (config.body), wait (config.seconds), datetime, variable (config.name, config.value),
+- read_file (config.path), write_file (config.path, config.content), stop_error, noop, subworkflow.
+
+Graph JSON shape (return the FULL graph every time, never a diff):
+{"nodes":[{"id":"<unique>","type":"<type>","position":{"x":N,"y":N},"data":{"label":"Human label","kind":"<type>","config":{...}}}],
+ "edges":[{"id":"e-a-b","source":"<id>","target":"<id>","sourceHandle":"true|false|0|loop|done"(optional)}]}
+Layout left→right: x starts at 80, +240 per step; y around 160; offset branches by ±130 in y.
+
+Respond with ONLY a JSON object (no markdown fences, no prose outside it):
+{"reply":"<chat message>","objective":"<captured objective or empty>","graph":<full graph>,"done":<true when complete & user is happy>}
+"""
+
+
+def _clean_fences(s: str) -> str:
+    """Strip a leading ```json / ``` code fence and trailing ``` from an LLM reply."""
+    s = s.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
+
+
+def _extract_json(text: str) -> dict:
+    """Pull the first balanced JSON object out of an LLM reply (tolerates fences/prose)."""
+    s = _clean_fences(text)
+    a, b = s.find("{"), s.rfind("}")
+    if a == -1 or b == -1:
+        raise ValueError("no JSON object found")
+    return _json.loads(s[a:b + 1])
+
+
+def _salvage_improve(raw: str) -> dict:
+    """When the improve JSON is malformed/truncated, recover readable fields by regex
+    so the user never sees raw JSON."""
+    s = _clean_fences(raw)
+    m = re.search(r'"analysis"\s*:\s*"(.*?)("\s*[,}]|$)', s, re.S)
+    analysis = (m.group(1) if m else s).replace('\\"', '"').replace('\\n', '\n').strip()
+    mo = re.search(r'"meets_objective"\s*:\s*"(\w+)"', s)
+    sugg = [{"title": t.replace('\\"', '"'), "detail": d.replace('\\"', '"'), "impact": imp}
+            for t, d, imp in re.findall(
+                r'"title"\s*:\s*"(.*?)"\s*,\s*"detail"\s*:\s*"(.*?)"\s*,\s*"impact"\s*:\s*"(\w+)"', s, re.S)]
+    return {"analysis": analysis, "meets_objective": mo.group(1) if mo else "unknown", "suggestions": sugg}
+
+
+@router.post("/workflows/ai-build")
+async def workflow_ai_build_route(req: WorkflowAIBuildReq):
+    """Conversational workflow builder. Given the chat so far + current graph,
+    returns the assistant's reply, the captured objective, and the updated graph."""
+    from ..llm_adapters.factory import get_adapter
+    from ..config import get_settings
+
+    rt = runtime_settings.get()
+    provider_str = rt.get("llm_provider", "")
+    if not provider_str:
+        raise HTTPException(400, "No LLM configured. Complete setup first.")
+
+    graph = req.graph or {"nodes": [], "edges": []}
+    system = (_AI_BUILD_SYSTEM
+              + f"\n\nCurrent objective: {req.objective or '(none yet)'}"
+              + f"\nCurrent graph JSON:\n{_json.dumps(graph)}")
+    msgs = [{"role": m.get("role", "user"), "content": str(m.get("content", ""))}
+            for m in req.messages if m.get("content")]
+    if not msgs:
+        msgs = [{"role": "user", "content": "Let's start."}]
+
+    try:
+        provider = LLMProvider(provider_str)
+        adapter = get_adapter(provider, get_settings(), rt)
+        model = rt.get("llm_model") or _default_model(provider_str)
+        resp = await adapter.complete(system_prompt=system, messages=msgs, model=model,
+                                      max_tokens=2200, temperature=0.4)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        data = _extract_json(resp.content)
+    except Exception:
+        # Model didn't return JSON — treat the whole thing as a chat reply, keep graph.
+        return {"reply": resp.content.strip(), "objective": req.objective or "", "graph": graph, "done": False}
+
+    return {
+        "reply": str(data.get("reply", "")).strip(),
+        "objective": (data.get("objective") or req.objective or "").strip(),
+        "graph": data.get("graph") if isinstance(data.get("graph"), dict) else graph,
+        "done": bool(data.get("done")),
+    }
+
+
+def _runs_digest(runs: list[dict]) -> tuple[str, int]:
+    """Compact recent-execution summary for the improve analysis + total AI tokens."""
+    lines, total_tokens = [], 0
+    for r in runs:
+        steps = r.get("steps", [])
+        parts = []
+        for s in steps:
+            tin, tout = s.get("input_tokens", 0) or 0, s.get("output_tokens", 0) or 0
+            total_tokens += tin + tout
+            tok = f" [{tin + tout} tok]" if (tin + tout) else ""
+            out = _json.dumps(s.get("output", {}))[:160]
+            parts.append(f"{s.get('node_label') or s.get('node_type')}={s.get('status')}{tok} → {out}")
+        lines.append(f"- run {r.get('status')} ({r.get('mode')}): " + " | ".join(parts))
+    return "\n".join(lines) or "(no executions yet)", total_tokens
+
+
+_IMPROVE_SYSTEM = """You are a workflow optimisation analyst. Given a workflow's BUSINESS OBJECTIVE, \
+its node graph, and recent execution history, assess whether the workflow is actually achieving the \
+objective, and how it could be improved — EVEN IF it already meets the objective (fewer steps, fewer \
+AI tokens, more reliable, clearer, more accurate). Be concrete and reference node labels.
+
+Return ONLY a JSON object (no markdown fences):
+{"analysis":"<2-4 sentence assessment>","meets_objective":"yes|partly|no|unknown",
+ "suggestions":[{"title":"<short>","detail":"<concrete change>","impact":"tokens|reliability|simplicity|accuracy"}]}
+If there are no executions yet, analyse the graph against the objective and suggest improvements anyway."""
+
+
+@router.post("/workflows/{wf_id}/improve")
+async def workflow_improve_route(wf_id: str):
+    """AI reads the objective + execution history and returns analysis + improvement suggestions."""
+    from ..llm_adapters.factory import get_adapter
+    from ..config import get_settings
+
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(404, "Workflow not found")
+    rt = runtime_settings.get()
+    if not rt.get("llm_provider"):
+        raise HTTPException(400, "No LLM configured. Complete setup first.")
+
+    runs = await database.list_runs(wf_id, limit=5)
+    runs = [await database.get_run(r["id"]) for r in runs]
+    digest, total_tokens = _runs_digest([r for r in runs if r])
+    has_llm = any((n.get("type") == "llm") for n in (wf.get("graph", {}).get("nodes", [])))
+
+    user_msg = (
+        f"Business objective: {wf.get('objective') or '(not set)'}\n\n"
+        f"Workflow graph JSON:\n{_json.dumps(wf.get('graph', {}))}\n\n"
+        f"Recent executions:\n{digest}\n\n"
+        + (f"Total AI tokens across these runs: {total_tokens}\n" if has_llm else
+           "This workflow has no AI/LLM nodes, so there are no token costs to optimise.\n")
+    )
+    try:
+        provider = LLMProvider(rt["llm_provider"])
+        adapter = get_adapter(provider, get_settings(), rt)
+        model = rt.get("llm_model") or _default_model(rt["llm_provider"])
+        resp = await adapter.complete(system_prompt=_IMPROVE_SYSTEM,
+                                      messages=[{"role": "user", "content": user_msg}],
+                                      model=model, max_tokens=2000, temperature=0.3)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        data = _extract_json(resp.content)
+    except Exception:
+        data = _salvage_improve(resp.content)
+    data["total_tokens"] = total_tokens if has_llm else None
+    data["objective"] = wf.get("objective") or ""
+    return data
+
+
+_IMPROVE_APPLY_SYSTEM = """You are a workflow optimisation engineer. Given a workflow's BUSINESS \
+OBJECTIVE, its current node graph, and recent execution history, produce an IMPROVED version of the \
+graph that better achieves the objective: fix broken token references, remove dead/disconnected nodes, \
+reduce AI tokens, and simplify — without breaking the objective. Always keep the node with id "trigger". \
+Preserve node ids for nodes you keep. Use the same graph JSON shape as the input.
+
+Return ONLY a JSON object (no markdown fences):
+{"summary":"<1-3 sentences describing what you changed>","graph":<the full improved workflow graph>}"""
+
+
+@router.post("/workflows/{wf_id}/improve/apply")
+async def workflow_improve_apply_route(wf_id: str):
+    """AI produces an improved graph (applied client-side as a draft new version)."""
+    from ..llm_adapters.factory import get_adapter
+    from ..config import get_settings
+
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(404, "Workflow not found")
+    rt = runtime_settings.get()
+    if not rt.get("llm_provider"):
+        raise HTTPException(400, "No LLM configured. Complete setup first.")
+
+    runs = await database.list_runs(wf_id, limit=5)
+    runs = [await database.get_run(r["id"]) for r in runs]
+    digest, _ = _runs_digest([r for r in runs if r])
+    user_msg = (f"Business objective: {wf.get('objective') or '(not set)'}\n\n"
+                f"Current graph JSON:\n{_json.dumps(wf.get('graph', {}))}\n\n"
+                f"Recent executions:\n{digest}")
+    try:
+        provider = LLMProvider(rt["llm_provider"])
+        adapter = get_adapter(provider, get_settings(), rt)
+        model = rt.get("llm_model") or _default_model(rt["llm_provider"])
+        resp = await adapter.complete(system_prompt=_IMPROVE_APPLY_SYSTEM,
+                                      messages=[{"role": "user", "content": user_msg}],
+                                      model=model, max_tokens=2600, temperature=0.2)
+        data = _extract_json(resp.content)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    graph = data.get("graph")
+    if not isinstance(graph, dict) or not graph.get("nodes"):
+        raise HTTPException(500, "The AI did not return a valid improved graph.")
+    return {"summary": str(data.get("summary", "")).strip(), "graph": graph}
+
+
+# ── Workflow versions ─────────────────────────────────────────────────────────
+
+class WorkflowVersionReq(BaseModel):
+    graph: dict | None = None
+    label: str | None = None
+
+
+@router.get("/workflows/{wf_id}/versions")
+async def list_workflow_versions_route(wf_id: str):
+    if not await database.get_workflow(wf_id):
+        raise HTTPException(404, "Workflow not found")
+    return {"versions": await database.list_versions(wf_id)}
+
+
+@router.post("/workflows/{wf_id}/versions")
+async def create_workflow_version_route(wf_id: str, req: WorkflowVersionReq):
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(404, "Workflow not found")
+    graph = req.graph if req.graph is not None else wf.get("graph", {"nodes": [], "edges": []})
+    return await database.create_version(wf_id, graph, label=req.label or "", activate=True)
+
+
+@router.post("/workflows/{wf_id}/versions/{version}/activate")
+async def activate_workflow_version_route(wf_id: str, version: int):
+    wf = await database.activate_version(wf_id, version)
+    if not wf:
+        raise HTTPException(404, "Version not found")
+    return wf
 
 
 @router.get("/workflows/{wf_id}")

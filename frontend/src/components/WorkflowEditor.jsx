@@ -27,7 +27,7 @@ import {
   Split, Filter as FilterIcon, OctagonAlert, SlidersHorizontal, CalendarClock, Clock,
   UserCheck, Zap, Trash2, ChevronRight, ChevronLeft, ChevronDown, Hash, Type as TypeIcon,
   ToggleLeft, Braces, Brackets, GripVertical, Info, Variable, FileDown, FileUp,
-  FolderOpen, Folder, FileText, Ban,
+  FolderOpen, Folder, FileText, Ban, Target, History, Check,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -52,7 +52,23 @@ const NODE_META = {
   loop: { label: 'Loop Over Items', desc: 'Iterate an array; run the body per item', icon: Repeat, color: '#14b8a6', fields: [
     { key: 'items_field', label: 'Array field to iterate (one {{token}} or a path)', type: 'text', placeholder: '{{Code.items}}' },
   ] },
-  merge: { label: 'Merge', desc: 'Combine multiple inputs into one', icon: MergeIcon, color: '#64748b', fields: [] },
+  merge: { label: 'Merge', desc: 'Combine multiple inputs into one', icon: MergeIcon, color: '#64748b', fields: [
+    { key: 'mode', label: 'Mode', type: 'select', options: ['append', 'combine', 'chooseBranch'] },
+    { key: 'number_of_inputs', label: 'Number of inputs', type: 'select', options: ['2', '3', '4', '5', '6', '7', '8', '9', '10'],
+      showIf: c => (c.mode || 'append') !== 'combine' },
+    { key: 'combine_by', label: 'Combine by', type: 'select', options: ['matchingFields', 'position', 'allCombinations'],
+      showIf: c => c.mode === 'combine' },
+    { key: 'fields_to_match', label: 'Fields to match (comma-separated)', type: 'text', placeholder: 'id, email',
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'output_type', label: 'Output type', type: 'select', options: ['keepMatches', 'keepNonMatches', 'keepEverything', 'enrichInput1', 'enrichInput2'],
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'fuzzy', label: 'Fuzzy compare — treat "3" and 3 as equal', type: 'checkbox',
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'clash', label: 'On clashing fields, prioritise', type: 'select', options: ['input2', 'input1'],
+      showIf: c => c.mode === 'combine' },
+    { key: 'branch', label: 'Branch to output, 1-based', type: 'number', placeholder: '1',
+      showIf: c => c.mode === 'chooseBranch' },
+  ] },
   filter: { label: 'Filter', desc: 'Continue only if the condition holds', icon: FilterIcon, color: '#22c55e', fields: [
     { key: 'lang', label: 'Expression language', type: 'select', options: ['python', 'javascript'] },
     { key: 'condition', label: 'Keep when (supports {{tokens}}, && and ||)', type: 'text', placeholder: "{{Code.output}} > 0" },
@@ -115,6 +131,14 @@ function outputHandles(data) {
   return [{ id: 'source', label: '', color: '#9ca3af' }]
 }
 
+// Merge shows N numbered input ports (n8n-style). Combine is always 2 inputs;
+// otherwise honour the configured Number of inputs.
+function inputHandles(data) {
+  if (data.kind !== 'merge') return null
+  const n = data.config?.mode === 'combine' ? 2 : (parseInt(data.config?.number_of_inputs) || 2)
+  return Array.from({ length: n }, (_, i) => ({ id: `input-${i}`, label: String(i + 1) }))
+}
+
 // ── Custom node ───────────────────────────────────────────────────────────────
 function WfNode({ id, data, selected }) {
   const meta = NODE_META[data.kind] || NODE_META.code
@@ -122,10 +146,12 @@ function WfNode({ id, data, selected }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(data.label || meta.label)
   const handles = outputHandles(data)
+  const inputs = inputHandles(data)
   const multi = handles.length > 1
-  // Grow the box so every output handle gets its own row (≈26px each) instead of
-  // cramming together and spilling below the node.
-  const minHeight = multi ? handles.length * 26 + 12 : undefined
+  // Grow the box so every output/input handle gets its own row (≈26px each)
+  // instead of cramming together and spilling below the node.
+  const rows = Math.max(handles.length, inputs?.length || 0)
+  const minHeight = rows > 1 ? rows * 26 + 12 : undefined
 
   function commit() {
     setEditing(false)
@@ -135,7 +161,19 @@ function WfNode({ id, data, selected }) {
   return (
     <div style={{ minHeight }} className={`bg-white rounded-xl border shadow-sm w-[190px] px-3 py-2.5 transition-all
       ${selected ? 'border-indigo-500 shadow-md' : 'border-gray-200'} ${STATUS_RING[data.status] || ''}`}>
-      {!NODE_META[data.kind]?.entry && data.kind !== 'trigger' && <Handle type="target" position={Position.Left} className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />}
+      {inputs ? inputs.map((h, i) => {
+        const top = `${(100 / (inputs.length + 1)) * (i + 1)}%`
+        return (
+          <React.Fragment key={h.id}>
+            <Handle id={h.id} type="target" position={Position.Left} style={{ top }}
+              className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />
+            {inputs.length > 1 && (
+              <span className="absolute text-[9px] text-gray-400 pointer-events-none"
+                style={{ top: `calc(${top} - 7px)`, left: -4, transform: 'translateX(-100%)' }}>{h.label}</span>
+            )}
+          </React.Fragment>
+        )
+      }) : (!NODE_META[data.kind]?.entry && data.kind !== 'trigger' && <Handle type="target" position={Position.Left} className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />)}
       <div className="flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0" style={{ background: meta.color + '1a' }}>
           <Icon size={15} style={{ color: meta.color }} />
@@ -201,7 +239,83 @@ function ComplianceBadge({ c }) {
   return <span className={`inline-flex items-center gap-1 text-[11px] ${m.color}`}><m.icon size={12} /> {m.label}</span>
 }
 
-function EditorInner({ workflowId, onBack }) {
+// Conversational workflow builder. Chats with the user, captures the business
+// objective first, then writes the AI-generated graph onto the canvas each turn.
+function AIAssistPanel({ objective, getGraph, onApply, onClose }) {
+  const [messages, setMessages] = useState([
+    { role: 'assistant', content: objective
+      ? `This flow's objective is: "${objective}". Tell me what you'd like to add or change and I'll update the workflow.`
+      : 'What is the main business objective for this flow — and why does it matter to your business? Tell me the outcome you\'re after, not the technical steps, so I can design the best workflow for it.' },
+  ])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [obj, setObj] = useState(objective || '')
+  const [error, setError] = useState('')
+  const scrollRef = useRef(null)
+  useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight) }, [messages, busy])
+
+  async function send() {
+    const text = input.trim()
+    if (!text || busy) return
+    // The opener always asks for the objective, so the first user message IS the
+    // objective — capture it deterministically rather than relying on the model.
+    const isFirstUser = messages.every(m => m.role !== 'user')
+    const nextObj = obj || (isFirstUser ? text : '')
+    const convo = [...messages, { role: 'user', content: text }]
+    setMessages(convo); setInput(''); setBusy(true); setError(''); setObj(nextObj)
+    try {
+      const res = await fetch('/api/workflows/ai-build', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: convo, graph: getGraph(), objective: nextObj }),
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'AI build failed')
+      const data = await res.json()
+      const finalObj = data.objective || nextObj
+      setObj(finalObj)
+      onApply(data.graph || getGraph(), finalObj)
+      setMessages(m => [...m, { role: 'assistant', content: data.reply || '(no reply)' }])
+    } catch (e) { setError(String(e.message || e)) } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="w-[340px] shrink-0 border-r border-gray-100 bg-white flex flex-col">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+        <div className="w-7 h-7 rounded-lg bg-indigo-100 flex items-center justify-center"><Sparkles size={15} className="text-indigo-600" /></div>
+        <div className="flex-1">
+          <div className="text-sm font-semibold text-gray-800">AI Assist</div>
+          <div className="text-[11px] text-gray-400">Build this flow by chatting</div>
+        </div>
+        {onClose && <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={16} /></button>}
+      </div>
+      {obj && (
+        <div className="px-4 py-2 bg-indigo-50/50 border-b border-indigo-100 text-[11px] text-indigo-700">
+          <span className="font-semibold">Objective:</span> {obj}
+        </div>
+      )}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[85%] px-3 py-2 rounded-2xl text-[13px] whitespace-pre-wrap ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
+          </div>
+        ))}
+        {busy && <div className="flex justify-start"><div className="px-3 py-2 rounded-2xl bg-gray-100 text-gray-400 text-[13px] flex items-center gap-2"><Loader2 size={13} className="animate-spin" /> Thinking…</div></div>}
+        {error && <div className="text-[11px] text-red-500 bg-red-50 border border-red-100 rounded-lg px-2 py-1.5">{error}</div>}
+      </div>
+      <div className="p-3 border-t border-gray-100">
+        <div className="flex items-end gap-2">
+          <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
+            placeholder="Ask anything…"
+            className="flex-1 resize-none border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 max-h-32" />
+          <button onClick={send} disabled={busy || !input.trim()}
+            className="p-2 rounded-xl bg-indigo-600 text-white disabled:opacity-40 hover:bg-indigo-700"><ChevronRight size={18} /></button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EditorInner({ workflowId, onBack, aiAssist }) {
   const rf = useReactFlow()
   const agents = useOrgStore(s => s.agents)
   const getWorkflow = useOrgStore(s => s.getWorkflow)
@@ -230,24 +344,31 @@ function EditorInner({ workflowId, onBack }) {
   const [focusedKey, setFocusedKey] = useState(null)
   const [showDocs, setShowDocs] = useState(false)
   const [waitingHook, setWaitingHook] = useState(false)
+  const [objective, setObjective] = useState('')
+  const [improving, setImproving] = useState(false)
+  const [improveResult, setImproveResult] = useState(null)
+  const [showObjective, setShowObjective] = useState(false)
+  const [showVersions, setShowVersions] = useState(false)
+  const [improveBanner, setImproveBanner] = useState(null)
+  const [assistOpen, setAssistOpen] = useState(!!aiAssist)   // AI builder panel — on by default for AI-created flows
 
   const renameNode = useCallback((id, label) => {
     setNodes(ns => ns.map(n => n.id === id ? { ...n, data: { ...n.data, label } } : n))
   }, [])
 
-  useEffect(() => {
-    (async () => {
-      const wf = await getWorkflow(workflowId)
-      if (!wf) return
-      setName(wf.name); setStatus(wf.status); setRequireCompliance(!!wf.require_compliance)
-      setTriggerConfig(wf.trigger_config || {})
-      setNodes((wf.graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
-      setEdges((wf.graph?.edges || []).map(e => ({
-        ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
-      })))
-      setRuns(wf.runs || [])
-    })()
-  }, [workflowId])
+  const loadWorkflow = useCallback(async () => {
+    const wf = await getWorkflow(workflowId)
+    if (!wf) return
+    setName(wf.name); setStatus(wf.status); setRequireCompliance(!!wf.require_compliance)
+    setTriggerConfig(wf.trigger_config || {}); setObjective(wf.objective || '')
+    setNodes((wf.graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
+    setEdges((wf.graph?.edges || []).map(e => ({
+      ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
+    })))
+    setRuns(wf.runs || [])
+  }, [workflowId, getWorkflow])
+
+  useEffect(() => { loadWorkflow() }, [loadWorkflow])
 
   const webhookUrl = triggerConfig.token
     ? `${window.location.origin}/api/hooks/workflow/${workflowId}?token=${triggerConfig.token}`
@@ -382,6 +503,14 @@ function EditorInner({ workflowId, onBack }) {
     }
   }
 
+  // Replace the canvas with an AI-generated graph (used by the AI Assist builder).
+  function applyGraph(graph) {
+    setNodes((graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
+    setEdges((graph?.edges || []).map(e => ({
+      ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
+    })))
+  }
+
   async function handleSave() {
     setSaving(true)
     const trigger = pickTrigger(nodes)
@@ -391,7 +520,7 @@ function EditorInner({ workflowId, onBack }) {
     if (trigger_type === 'schedule') trigger_config.cron = scheduleToCron(tcfg.schedule)
     if (trigger_type === 'webhook') trigger_config.response_mode = tcfg.responseMode || 'auto'
     if (tcfg.sample) trigger_config.payload = tcfg.sample
-    const wf = await saveWorkflow(workflowId, { name, graph: buildGraph(), require_compliance: requireCompliance, trigger_type, trigger_config })
+    const wf = await saveWorkflow(workflowId, { name, graph: buildGraph(), require_compliance: requireCompliance, trigger_type, trigger_config, objective })
     if (wf?.trigger_config) setTriggerConfig(wf.trigger_config)   // pick up server-minted webhook token
     setSaving(false)
   }
@@ -410,6 +539,52 @@ function EditorInner({ workflowId, onBack }) {
     if (wf?.runs) setRuns(wf.runs)
     setTesting(false)
     if (d?.timeout) alert(d.message)
+  }
+
+  async function handleImprove() {
+    setImproving(true)
+    try {
+      await handleSave()   // persist latest objective + graph so the analysis is current
+      const res = await fetch(`/api/workflows/${workflowId}/improve`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
+      setImproveResult(await res.json())
+    } catch (e) {
+      setImproveResult({ error: String(e.message || e), suggestions: [] })
+    } finally { setImproving(false) }
+  }
+
+  // Let the AI generate the improved graph and apply it to the canvas as a draft.
+  async function handleApplyImprove() {
+    setImproving(true)
+    try {
+      await handleSave()
+      const res = await fetch(`/api/workflows/${workflowId}/improve/apply`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
+      const data = await res.json()
+      applyGraph(data.graph)
+      requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 }))
+      setImproveResult(null)
+      setImproveBanner(data.summary || 'AI improvements applied as a draft.')
+    } catch (e) {
+      setImproveResult({ error: String(e.message || e), suggestions: [] })
+    } finally { setImproving(false) }
+  }
+
+  // Snapshot the current canvas as a new (active) version. Label is optional —
+  // the backend names it "Version N" when blank.
+  async function saveAsNewVersion(label = '') {
+    await handleSave()
+    const res = await fetch(`/api/workflows/${workflowId}/versions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ graph: buildGraph(), label }),
+    })
+    if (res.ok) { setImproveBanner(null); await loadWorkflow() }
+    return res.ok
+  }
+
+  async function activateVersion(version) {
+    const res = await fetch(`/api/workflows/${workflowId}/versions/${version}/activate`, { method: 'POST' })
+    if (res.ok) { setImproveBanner(null); await loadWorkflow() }
   }
 
   async function handlePublish() {
@@ -512,11 +687,33 @@ function EditorInner({ workflowId, onBack }) {
               className={`px-3 py-1 text-xs font-medium rounded-md capitalize ${tab === t ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>{t}</button>
           ))}
         </div>
-        <label className="flex items-center gap-1.5 text-xs text-gray-500 ml-2 cursor-pointer">
-          <input type="checkbox" checked={requireCompliance} onChange={e => setRequireCompliance(e.target.checked)} />
-          Require compliance review
-        </label>
         <div className="flex-1" />
+
+        {/* AI / meta tools */}
+        <button onClick={() => setAssistOpen(o => !o)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg ${assistOpen ? 'text-white bg-indigo-600 border-indigo-600 hover:bg-indigo-700' : 'text-indigo-600 border-indigo-200 hover:bg-indigo-50'}`}
+          title="Build or refine this flow by chatting with AI">
+          <Sparkles size={14} /> AI Assist
+        </button>
+        <button onClick={handleImprove} disabled={improving}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-violet-600 border border-violet-200 rounded-lg hover:bg-violet-50 disabled:opacity-50"
+          title="Analyse this flow against its objective and suggest improvements">
+          {improving ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} Improve flow
+        </button>
+        <button onClick={() => setShowObjective(true)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg ${objective ? 'text-gray-700 border-gray-200 hover:bg-gray-50' : 'text-amber-700 border-amber-200 bg-amber-50 hover:bg-amber-100'}`}
+          title="Set the business objective for this workflow">
+          <Target size={14} /> {objective ? 'Objective' : 'Set objective'}
+        </button>
+        <button onClick={() => setShowVersions(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50"
+          title="Workflow versions — view, revert, and choose the active one">
+          <History size={14} /> Versions
+        </button>
+
+        <div className="w-px h-6 bg-gray-200 mx-1" />
+
+        {/* Run / save / publish */}
         <button onClick={handleTest} disabled={testing}
           className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-50 disabled:opacity-50">
           {testing ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} Test
@@ -535,6 +732,21 @@ function EditorInner({ workflowId, onBack }) {
           <Globe size={14} /> {status === 'live' ? 'Unpublish' : 'Publish'}
         </button>
       </div>
+
+      {improveBanner && (
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-violet-50 border-b border-violet-200 text-xs text-violet-800">
+          <Sparkles size={14} className="shrink-0 mt-0.5" />
+          <span className="flex-1 leading-relaxed"><b>AI draft applied:</b> {improveBanner}</span>
+          <button onClick={() => saveAsNewVersion()}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 shrink-0 whitespace-nowrap">
+            <Check size={13} /> Save as new version
+          </button>
+          <button onClick={() => { setImproveBanner(null); loadWorkflow() }}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-violet-800 bg-white border border-violet-300 rounded-lg hover:bg-violet-100 shrink-0 whitespace-nowrap">
+            <X size={13} /> Discard
+          </button>
+        </div>
+      )}
 
       {waitingHook && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-800">
@@ -556,6 +768,14 @@ function EditorInner({ workflowId, onBack }) {
         <ExecutionsView runs={runs} nodes={nodes} wfRun={wfRun} getRun={getRun} onRefresh={refreshRuns} workflowId={workflowId} />
       ) : (
       <div className="flex-1 flex min-h-0">
+        {assistOpen && (
+          <AIAssistPanel
+            objective={objective}
+            getGraph={buildGraph}
+            onApply={(graph, obj) => { applyGraph(graph); if (obj) setObjective(obj); requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 })) }}
+            onClose={() => setAssistOpen(false)}
+          />
+        )}
         {/* Canvas */}
         <div className="flex-1 relative">
           <ReactFlow nodes={liveNodes} edges={displayEdges} nodeTypes={nodeTypes}
@@ -571,6 +791,17 @@ function EditorInner({ workflowId, onBack }) {
           <button onClick={() => setPaletteOpen(true)}
             className="absolute top-3 right-3 flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium rounded-lg shadow-sm">
             <Plus size={16} /> Add node
+          </button>
+
+          {/* Compliance review toggle — floats on the canvas, not crammed in the toolbar */}
+          <button onClick={() => setRequireCompliance(v => !v)}
+            title="When on, AI-agent outputs in this workflow pass a compliance review before continuing."
+            className={`absolute top-3 left-3 flex items-center gap-2 pl-3 pr-2 py-2 text-sm font-medium rounded-lg shadow-sm border bg-white ${requireCompliance ? 'text-emerald-700 border-emerald-200' : 'text-gray-500 border-gray-200'}`}>
+            {requireCompliance ? <ShieldCheck size={16} className="text-emerald-600" /> : <ShieldAlert size={16} className="text-gray-300" />}
+            Compliance review
+            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${requireCompliance ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-400'}`}>
+              {requireCompliance ? 'ON' : 'OFF'}
+            </span>
           </button>
 
           {paletteOpen && <NodePalette onAdd={addNode} onClose={() => setPaletteOpen(false)} />}
@@ -596,6 +827,172 @@ function EditorInner({ workflowId, onBack }) {
       )}
 
       {showDocs && <WorkflowDocs onClose={() => setShowDocs(false)} />}
+      {improveResult && <ImproveModal result={improveResult} objective={objective}
+        applying={improving} onApply={handleApplyImprove} onClose={() => setImproveResult(null)} />}
+      {showObjective && <ObjectiveModal value={objective}
+        onSave={async (v) => { setObjective(v); setShowObjective(false); await saveWorkflow(workflowId, { objective: v }) }}
+        onClose={() => setShowObjective(false)} />}
+      {showVersions && <VersionsPanel workflowId={workflowId}
+        onActivate={activateVersion} onSaveNew={saveAsNewVersion} onClose={() => setShowVersions(false)} />}
+    </div>
+  )
+}
+
+// ── Improve-flow modal ────────────────────────────────────────────────────────
+const IMPACT_STYLE = {
+  tokens: 'bg-amber-100 text-amber-700', reliability: 'bg-blue-100 text-blue-700',
+  simplicity: 'bg-emerald-100 text-emerald-700', accuracy: 'bg-violet-100 text-violet-700',
+}
+const MEETS_STYLE = {
+  yes: 'bg-emerald-100 text-emerald-700', partly: 'bg-amber-100 text-amber-700',
+  no: 'bg-red-100 text-red-700', unknown: 'bg-gray-100 text-gray-500',
+}
+
+function ImproveModal({ result, objective, applying, onApply, onClose }) {
+  const suggestions = Array.isArray(result.suggestions) ? result.suggestions : []
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <Sparkles size={16} className="text-violet-600" />
+            <h2 className="text-base font-semibold text-gray-800">Improve flow</h2>
+          </div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {result.error ? (
+            <p className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{result.error}</p>
+          ) : <>
+            {objective && <p className="text-xs text-gray-400"><span className="font-semibold text-gray-500">Objective:</span> {objective}</p>}
+            <div className="flex items-center gap-2 flex-wrap">
+              {result.meets_objective && (
+                <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${MEETS_STYLE[result.meets_objective] || MEETS_STYLE.unknown}`}>
+                  Meets objective: {result.meets_objective}
+                </span>
+              )}
+              {result.total_tokens != null && (
+                <span className="text-[11px] font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-600">
+                  {result.total_tokens.toLocaleString()} AI tokens (recent runs)
+                </span>
+              )}
+            </div>
+            {result.analysis && <p className="text-sm text-gray-700 leading-relaxed">{result.analysis}</p>}
+            <div className="space-y-2">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Suggestions</h3>
+              {suggestions.length === 0 && <p className="text-sm text-gray-400">No suggestions — the flow looks good.</p>}
+              {suggestions.map((s, i) => (
+                <div key={i} className="border border-gray-200 rounded-xl p-3">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-sm font-medium text-gray-800">{s.title}</span>
+                    {s.impact && <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${IMPACT_STYLE[s.impact] || 'bg-gray-100 text-gray-600'}`}>{s.impact}</span>}
+                  </div>
+                  <p className="text-xs text-gray-500 leading-relaxed">{s.detail}</p>
+                </div>
+              ))}
+            </div>
+          </>}
+        </div>
+        <div className="px-5 py-3 border-t border-gray-100 flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50">Close</button>
+          {!result.error && (
+            <button onClick={onApply} disabled={applying}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-50">
+              {applying ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} Apply with AI
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Edit the workflow's business objective.
+function ObjectiveModal({ value, onSave, onClose }) {
+  const [text, setText] = useState(value || '')
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-5" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2"><Target size={16} className="text-amber-600" />
+            <h2 className="text-base font-semibold text-gray-800">Business objective</h2></div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <p className="text-xs text-gray-400 mb-3">What should this workflow achieve? Used to evaluate and improve the flow.</p>
+        <textarea autoFocus rows={4} value={text} onChange={e => setText(e.target.value)}
+          placeholder="e.g. Notify sales in Slack whenever a high-value order is placed."
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y" />
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50">Cancel</button>
+          <button onClick={() => onSave(text.trim())} className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700">Save</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// View, revert, and choose the active workflow version.
+function VersionsPanel({ workflowId, onActivate, onSaveNew, onClose }) {
+  const [versions, setVersions] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [label, setLabel] = useState('')
+  const refresh = useCallback(async () => {
+    const res = await fetch(`/api/workflows/${workflowId}/versions`)
+    if (res.ok) setVersions((await res.json()).versions || [])
+  }, [workflowId])
+  useEffect(() => { refresh() }, [refresh])
+
+  async function saveNew() {
+    setBusy(true)
+    try { const ok = await onSaveNew(label.trim()); if (ok) { setLabel(''); await refresh() } }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2"><History size={16} className="text-gray-600" />
+            <h2 className="text-base font-semibold text-gray-800">Versions</h2></div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <div className="px-5 py-3 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <input value={label} onChange={e => setLabel(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !busy) saveNew() }}
+              placeholder="Label (optional)"
+              className="flex-1 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm outline-none focus:border-violet-400" />
+            <button onClick={saveNew} disabled={busy}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-50 shrink-0">
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />} Save as new version
+            </button>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-1.5">Only the <b>active</b> version runs when the trigger fires.</p>
+        </div>
+        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {versions === null && <p className="text-sm text-gray-400 p-2">Loading…</p>}
+          {versions?.map(v => (
+            <div key={v.version} className={`border rounded-xl px-3 py-2.5 flex items-center gap-3 ${v.active ? 'border-green-300 bg-green-50/50' : 'border-gray-200'}`}>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-gray-800">v{v.version}</span>
+                  <span className="text-xs text-gray-500 truncate">{v.label}</span>
+                  {v.active && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">ACTIVE</span>}
+                </div>
+                <div className="text-[11px] text-gray-400">{(v.graph?.nodes || []).length} nodes · {fmtLocal(v.created_at)}</div>
+              </div>
+              {v.active ? (
+                <span className="flex items-center gap-1 text-xs text-green-600 font-medium"><Check size={13} /> Running</span>
+              ) : (
+                <button onClick={async () => { setBusy(true); await onActivate(v.version); setBusy(false); refresh() }} disabled={busy}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                  Make active
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -701,6 +1098,8 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
   // Show steps in the order they actually executed (graph/flow order), not node-array order.
   const orderIds = matched?.order?.length ? matched.order : nodes.map(n => n.id)
   const ordered = orderIds.map(id => ({ node: byId[id], step: steps[id] })).filter(x => x.node && x.step)
+  // Total AI tokens for this run (only LLM nodes contribute; 0 when none involved).
+  const runTokens = ordered.reduce((t, { step }) => t + (step.input_tokens || 0) + (step.output_tokens || 0), 0)
   return (
     <div className="flex-1 flex min-h-0">
       <aside className="w-72 border-r border-gray-100 overflow-y-auto shrink-0">
@@ -732,6 +1131,12 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
       <main className="flex-1 overflow-y-auto p-5">
         {!selId ? <p className="text-sm text-gray-400">Select an execution to see its steps.</p> : (
           <div className="space-y-2 max-w-3xl">
+            {runTokens > 0 && (
+              <div className="flex items-center gap-1.5 text-xs text-gray-500 mb-1">
+                <Sparkles size={13} className="text-violet-500" />
+                <span className="font-medium text-gray-700">{runTokens.toLocaleString()}</span> AI tokens used this run
+              </div>
+            )}
             {ordered.length === 0 && <p className="text-sm text-gray-400">Loading steps…</p>}
             {ordered.map(({ node, step }) => (
               <div key={node.id} className="bg-white border border-gray-200 rounded-xl px-4 py-3">
@@ -740,6 +1145,11 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
                   <span className="text-sm font-medium text-gray-800">{node.data.label}</span>
                   <span className="text-[10px] text-gray-400">{NODE_META[node.data.kind]?.label}</span>
                   {step.compliance && <ComplianceBadge c={step.compliance} />}
+                  {(step.input_tokens || step.output_tokens) ? (
+                    <span className="ml-auto text-[10px] font-medium text-violet-600 bg-violet-50 rounded-full px-1.5 py-0.5">
+                      {((step.input_tokens || 0) + (step.output_tokens || 0)).toLocaleString()} tok
+                    </span>
+                  ) : null}
                 </div>
                 {step.error
                   ? <p className="text-xs text-red-500 mt-1 break-words">{step.error}</p>
@@ -1203,7 +1613,7 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             {meta.custom === 'http' && <HttpConfig config={config} onChange={onConfig} onFocusField={onFocusField} dragActive={dragActive} dropToken={dropToken} />}
             {meta.custom === 'trigger' && <TriggerConfig config={config} onChange={onConfig} webhookUrl={webhookUrl} />}
             {meta.custom === 'set' && <SetConfig config={config} onChange={onConfig} onFocusField={onFocusField} />}
-            {(meta.fields || []).map(({ key, ...f }) => (
+            {(meta.fields || []).filter(({ showIf }) => !showIf || showIf(config)).map(({ key, showIf, ...f }) => (
               <Field key={key} {...f} agents={agents} value={config[key] ?? ''}
                 dragActive={dragActive} onDropToken={dropToken(key)}
                 onFocus={() => onFocusField(key)} onChange={(v) => onConfig(key, v)} />

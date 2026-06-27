@@ -32,6 +32,7 @@ class NodeContext:
         self.orchestrator = orchestrator
         self.workflow = workflow
         self.context: dict[str, Any] = {}   # node_id → output
+        self.step_tokens: dict[str, tuple] = {}   # node_id → (input_tokens, output_tokens), LLM nodes only
 
 
 # ── templating ────────────────────────────────────────────────────────────────
@@ -462,12 +463,99 @@ async def loop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return {"items": items, "count": len(items), "_loop": True}
 
 
+def _as_items(out: Any) -> list:
+    """Normalise a node's output into a list of items (n8n's per-input item array)."""
+    if isinstance(out, list):
+        return out
+    if isinstance(out, dict) and isinstance(out.get("items"), list):
+        return out["items"]
+    if out is None:
+        return []
+    return [out]
+
+
+def _merge_two(a: Any, b: Any, prio2: bool) -> dict:
+    """Shallow-merge two items. prio2 → Input 2 wins on clashing keys (n8n default)."""
+    a = a if isinstance(a, dict) else {"value": a}
+    b = b if isinstance(b, dict) else {"value": b}
+    return {**a, **b} if prio2 else {**b, **a}
+
+
 async def merge_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Combine all upstream outputs into one object (engine passes them via inputs._merged)."""
-    merged = inputs.get("_merged") if isinstance(inputs, dict) else None
-    if merged is None:
-        return inputs or {}
-    return {"merged": merged}
+    """Combine multiple upstream inputs, n8n-style. The engine passes the ordered
+    list of upstream outputs (connection order = Input 1, 2, 3…) via inputs._merged.
+
+    Modes: append | combine | chooseBranch. Combine sub-modes: matchingFields |
+    position | allCombinations. ponytail: shallow merge only (no deep-merge / dot
+    notation); matching is top-level field equality. Add deep merge if a real
+    nested-clash case shows up.
+    """
+    cfg = _cfg(node)
+    ups = inputs.get("_merged") if isinstance(inputs, dict) else None
+    if ups is None:  # single (or no) upstream — nothing to combine
+        ups = [inputs] if inputs else []
+    streams = [_as_items(u) for u in ups]
+    mode = cfg.get("mode") or "append"
+
+    if mode == "chooseBranch":
+        idx = int(cfg.get("branch") or 1) - 1
+        items = streams[idx] if 0 <= idx < len(streams) else []
+        return {"items": items, "count": len(items)}
+
+    if mode == "append":
+        items = [it for s in streams for it in s]
+        return {"items": items, "count": len(items)}
+
+    # combine — operates on the first two inputs (like n8n).
+    a = streams[0] if len(streams) > 0 else []
+    b = streams[1] if len(streams) > 1 else []
+    prio2 = (cfg.get("clash") or "input2") != "input1"
+    sub = cfg.get("combine_by") or "matchingFields"
+
+    if sub == "position":
+        n = min(len(a), len(b))
+        items = [_merge_two(a[i], b[i], prio2) for i in range(n)]
+        return {"items": items, "count": len(items)}
+
+    if sub == "allCombinations":
+        items = [_merge_two(x, y, prio2) for x in a for y in b]
+        return {"items": items, "count": len(items)}
+
+    # matchingFields — join a and b on equal field values.
+    fuzzy = bool(cfg.get("fuzzy"))
+    fields = [f.strip() for f in str(cfg.get("fields_to_match") or "").replace(",", " ").split() if f.strip()]
+    out_type = cfg.get("output_type") or "keepMatches"
+
+    def key(it):
+        norm = (lambda v: str(v)) if fuzzy else (lambda v: repr(v))
+        return tuple(norm(it.get(f) if isinstance(it, dict) else None) for f in fields)
+
+    idx_b: dict = {}
+    for it in b:
+        idx_b.setdefault(key(it), []).append(it)
+
+    matched, unmatched_a, used_b = [], [], set()
+    for it in a:
+        hits = idx_b.get(key(it), []) if fields else []
+        if hits:
+            for m in hits:
+                matched.append(_merge_two(it, m, prio2))
+                used_b.add(id(m))
+        else:
+            unmatched_a.append(it)
+    unmatched_b = [it for it in b if id(it) not in used_b]
+
+    if out_type == "keepNonMatches":
+        items = unmatched_a + unmatched_b
+    elif out_type == "keepEverything":
+        items = matched + unmatched_a + unmatched_b
+    elif out_type == "enrichInput1":          # left join
+        items = matched + unmatched_a
+    elif out_type == "enrichInput2":          # right join
+        items = matched + unmatched_b
+    else:                                      # keepMatches (inner join)
+        items = matched
+    return {"items": items, "count": len(items)}
 
 
 async def llm_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -506,6 +594,8 @@ async def llm_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
         model=model,
         max_tokens=int(cfg.get("max_tokens") or 1024),
     )
+    # Record token usage on the step (engine reads ctx.step_tokens after the call).
+    ctx.step_tokens[node["id"]] = (resp.input_tokens or 0, resp.output_tokens or 0)
     return {"text": resp.content, "agent": agent.config.name, "agent_id": agent.config.id, "model": model}
 
 
