@@ -1785,3 +1785,231 @@ async def mcp_oauth_callback(code: str = "", state: str = "", error: str = ""):
     if resolve_callback(state, code):
         return page("Authorized ✓", "You can close this window and return to Takumi.", True)
     return page("Authorization expired", "This request was not recognised. Please try connecting again.", False)
+
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+
+class WorkflowReq(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    graph: dict | None = None
+    status: str | None = None
+    require_compliance: bool | None = None
+    trigger_type: str | None = None
+    trigger_config: dict | None = None
+
+
+@router.get("/workflows")
+async def list_workflows_route():
+    workflows = await database.list_workflows()
+    # Attach last-run status for the list view.
+    for wf in workflows:
+        runs = await database.list_runs(wf["id"], limit=1)
+        wf["last_run"] = runs[0] if runs else None
+    return {"workflows": workflows}
+
+
+@router.post("/workflows")
+async def create_workflow_route(req: WorkflowReq):
+    import uuid as _uuid
+    wf = {
+        "id": _uuid.uuid4().hex,
+        "name": req.name or "Untitled workflow",
+        "description": req.description or "",
+        "graph": req.graph or {"nodes": [], "edges": []},
+        "status": "draft",
+        "require_compliance": True if req.require_compliance is None else req.require_compliance,
+        "trigger_type": req.trigger_type or "manual",
+        "trigger_config": req.trigger_config or {},
+    }
+    return await database.create_workflow(wf)
+
+
+@router.get("/workflows/{wf_id}")
+async def get_workflow_route(wf_id: str):
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    wf["runs"] = await database.list_runs(wf_id, limit=20)
+    return wf
+
+
+@router.put("/workflows/{wf_id}")
+async def update_workflow_route(wf_id: str, req: WorkflowReq):
+    import uuid as _uuid
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    # Webhook workflows get a stable token at save time so a test URL is available
+    # before publishing (otherwise there's no URL to POST to while test-listening).
+    if updates.get("trigger_type") == "webhook":
+        cfg = dict(updates.get("trigger_config") or {})
+        if not cfg.get("token"):
+            existing = await database.get_workflow(wf_id)
+            cfg["token"] = ((existing or {}).get("trigger_config") or {}).get("token") or _uuid.uuid4().hex
+        updates["trigger_config"] = cfg
+    wf = await database.update_workflow(wf_id, updates)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return wf
+
+
+@router.delete("/workflows/{wf_id}")
+async def delete_workflow_route(wf_id: str):
+    await database.delete_workflow(wf_id)
+    return {"ok": True}
+
+
+class WorkflowTestReq(BaseModel):
+    payload: dict | None = None
+    until: str | None = None   # node id — run up to this node only ('Execute step')
+
+
+WEBHOOK_TEST_TIMEOUT = 60  # seconds to wait for a real webhook call during a test
+
+
+@router.post("/workflows/{wf_id}/test")
+async def test_workflow_route(req: WorkflowTestReq, wf_id: str):
+    import asyncio
+    from ..workflows import run_workflow
+    from ..workflows import webhook_wait
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    payload = req.payload
+    # Webhook trigger with no sample payload → wait for a real call to the hook URL.
+    if wf.get("trigger_type") == "webhook" and not payload:
+        fut = webhook_wait.arm(wf_id)
+        try:
+            payload = await asyncio.wait_for(fut, timeout=WEBHOOK_TEST_TIMEOUT)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            webhook_wait.disarm(wf_id)
+            cancelled = isinstance(e, asyncio.CancelledError)
+            return {"run_id": None, "timeout": not cancelled, "cancelled": cancelled,
+                    "message": "Test stopped." if cancelled else
+                               f"No webhook call received within {WEBHOOK_TEST_TIMEOUT}s. "
+                               f"POST to the webhook URL, then test again."}
+
+    run_id = await run_workflow(wf, payload or {}, mode="test",
+                                trigger_source="editor", orchestrator=orchestrator,
+                                until_node=req.until)
+    return {"run_id": run_id, "run": await database.get_run(run_id)}
+
+
+@router.post("/workflows/{wf_id}/stop-test")
+async def stop_test_route(wf_id: str):
+    """Cancel a test that's currently waiting for a webhook call."""
+    from ..workflows import webhook_wait
+    webhook_wait.disarm(wf_id)
+    return {"ok": True}
+
+
+class CodeFormatReq(BaseModel):
+    code: str
+    language: str = "python"
+
+
+@router.post("/workflows/format")
+async def format_code_route(req: CodeFormatReq):
+    """Pretty-print code for the Code node. Python uses the stdlib AST (zero-dep);
+    JavaScript uses a lightweight brace-based re-indenter."""
+    code = req.code or ""
+    lang = (req.language or "python").lower()
+    try:
+        if lang in ("javascript", "js", "node"):
+            return {"code": _format_braces(code), "ok": True}
+        import ast
+        return {"code": ast.unparse(ast.parse(code)), "ok": True}
+    except Exception as e:
+        return {"code": code, "ok": False, "error": str(e)[:200]}
+
+
+def _format_braces(code: str) -> str:
+    """Re-indent C-style code by net bracket depth. Good enough for the Code node."""
+    out, depth = [], 0
+    for raw in code.split("\n"):
+        line = raw.strip()
+        closers = line[:1] in ("}", ")", "]")
+        indent = max(0, depth - (1 if closers else 0))
+        out.append(("  " * indent) + line if line else "")
+        depth += line.count("{") - line.count("}") + line.count("(") - line.count(")") + line.count("[") - line.count("]")
+        depth = max(0, depth)
+    return "\n".join(out)
+
+
+@router.get("/workflows/{wf_id}/runs")
+async def list_workflow_runs_route(wf_id: str):
+    return {"runs": await database.list_runs(wf_id, limit=30)}
+
+
+@router.get("/workflows/runs/{run_id}")
+async def get_workflow_run_route(run_id: str):
+    run = await database.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@router.delete("/workflows/runs/{run_id}")
+async def delete_workflow_run_route(run_id: str):
+    await database.delete_run(run_id)
+    return {"ok": True}
+
+
+@router.delete("/workflows/{wf_id}/runs")
+async def delete_workflow_runs_route(wf_id: str):
+    await database.delete_runs(wf_id)
+    return {"ok": True}
+
+
+@router.post("/workflows/{wf_id}/publish")
+async def publish_workflow_route(wf_id: str):
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    wf = await database.get_workflow(wf_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    cfg = dict(wf.get("trigger_config") or {})
+    ttype = wf.get("trigger_type")
+    # Webhook workflows get a stable secret token (used to build the public URL).
+    if ttype == "webhook" and not cfg.get("token"):
+        cfg["token"] = _uuid.uuid4().hex
+    # Schedule workflows start counting from publish time (don't fire instantly).
+    if ttype == "schedule" and cfg.get("cron"):
+        cfg["next_run_at"] = _dt.utcnow().isoformat()
+    wf = await database.update_workflow(wf_id, {"status": "live", "trigger_config": cfg})
+    return wf
+
+
+@router.post("/workflows/{wf_id}/unpublish")
+async def unpublish_workflow_route(wf_id: str):
+    wf = await database.update_workflow(wf_id, {"status": "draft"})
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return wf
+
+
+@router.post("/hooks/workflow/{wf_id}")
+async def workflow_webhook_route(wf_id: str, payload: dict | None = None, token: str = ""):
+    """Public webhook trigger. Fires live workflows (guarded by the secret token),
+    or — if a test is currently listening — delivers the payload to that test."""
+    from ..workflows import run_workflow
+    from ..workflows import webhook_wait
+    wf = await database.get_workflow(wf_id)
+    if not wf or wf.get("trigger_type") != "webhook":
+        raise HTTPException(status_code=404, detail="No webhook workflow here")
+    expected = (wf.get("trigger_config") or {}).get("token")
+    if expected and token != expected:
+        raise HTTPException(status_code=403, detail="Invalid webhook token")
+    # A test in the editor is listening → hand it the payload instead of running live.
+    if webhook_wait.deliver(wf_id, payload or {}):
+        return {"ok": True, "captured_for_test": True}
+    if wf.get("status") != "live":
+        raise HTTPException(status_code=404, detail="Workflow is not live")
+    run_id = await run_workflow(wf, payload or {}, mode="live",
+                                trigger_source="webhook", orchestrator=orchestrator)
+    # If the workflow has a "Respond to Webhook" node, return its payload to the caller.
+    run = await database.get_run(run_id)
+    for step in (run or {}).get("steps", []):
+        if step.get("node_type") == "respond" and step.get("status") == "success":
+            return (step.get("output") or {}).get("response", {"run_id": run_id})
+    return {"run_id": run_id, "status": (run or {}).get("status")}

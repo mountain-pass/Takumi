@@ -116,6 +116,8 @@ class WSEventType(str, Enum):
     SELF_HEAL = "self_heal"
     RISK_HOLD = "risk_hold"
     NOTIFICATION = "notification"
+    WORKFLOW_STEP = "workflow_step"
+    WORKFLOW_RUN = "workflow_run"
     ERROR = "error"
 
 

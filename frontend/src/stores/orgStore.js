@@ -43,6 +43,113 @@ export const useOrgStore = create((set, get) => ({
   openArtifact(a) { set({ artifact: a }) },
   closeArtifact() { set({ artifact: null }) },
 
+  // ── Workflows ────────────────────────────────────────────────────────────────
+  workflows: [],
+  wfRun: null,   // live run being observed: { runId, status, steps: {nodeId: {status, output, compliance}} }
+
+  async loadWorkflows() {
+    try {
+      const res = await fetch(`${API}/workflows`)
+      if (res.ok) { const d = await res.json(); set({ workflows: d.workflows || [] }) }
+    } catch {}
+  },
+  async createWorkflow(body = {}) {
+    const res = await fetch(`${API}/workflows`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    const wf = await res.json()
+    get().loadWorkflows()
+    return wf
+  },
+  async getWorkflow(id) {
+    const res = await fetch(`${API}/workflows/${id}`)
+    return res.ok ? await res.json() : null
+  },
+  async saveWorkflow(id, updates) {
+    const res = await fetch(`${API}/workflows/${id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates),
+    })
+    const wf = await res.json()
+    get().loadWorkflows()
+    return wf
+  },
+  async deleteWorkflow(id) {
+    await fetch(`${API}/workflows/${id}`, { method: 'DELETE' })
+    get().loadWorkflows()
+  },
+  async testWorkflow(id, payload = {}) {
+    set({ wfRun: { runId: null, status: 'running', steps: {} } })
+    const res = await fetch(`${API}/workflows/${id}/test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload }),
+    })
+    if (!res.ok) { set({ wfRun: { runId: null, status: 'failed', steps: {} } }); return null }
+    const d = await res.json()
+    if (d.timeout) { set({ wfRun: { runId: null, status: 'failed', steps: {}, order: [], note: d.message } }); return d }
+    // Reconcile from the returned run (covers anything missed over WS).
+    const steps = {}, order = []
+    for (const s of (d.run?.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps, order } })
+    return d
+  },
+  async stopTest(id) {
+    try { await fetch(`${API}/workflows/${id}/stop-test`, { method: 'POST' }) } catch {}
+  },
+  providers: [],
+  async loadProviders() {
+    try {
+      const res = await fetch(`${API}/providers`)
+      if (res.ok) set({ providers: (await res.json()).filter(p => p.type === 'llm') })
+    } catch {}
+  },
+  async getProviderModels(id) {
+    try {
+      const res = await fetch(`${API}/providers/${id}/models`)
+      return res.ok ? ((await res.json()).models || []) : []
+    } catch { return [] }
+  },
+  async formatCode(code, language) {
+    try {
+      const res = await fetch(`${API}/workflows/format`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, language }),
+      })
+      return res.ok ? await res.json() : null
+    } catch { return null }
+  },
+  async executeStep(id, nodeId, payload = {}) {
+    const res = await fetch(`${API}/workflows/${id}/test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload, until: nodeId }),
+    })
+    if (!res.ok) return null
+    const d = await res.json()
+    const steps = {}, order = []
+    for (const s of (d.run?.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps, order } })
+    return d.run
+  },
+  async getRun(runId) {
+    const res = await fetch(`${API}/workflows/runs/${runId}`)
+    if (!res.ok) return null
+    const run = await res.json()
+    const steps = {}, order = []
+    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    set({ wfRun: { runId: run.id, status: run.status, steps, order } })
+    return run
+  },
+  async deleteRun(runId) {
+    await fetch(`${API}/workflows/runs/${runId}`, { method: 'DELETE' })
+  },
+  async deleteAllRuns(workflowId) {
+    await fetch(`${API}/workflows/${workflowId}/runs`, { method: 'DELETE' })
+  },
+  async publishWorkflow(id, live) {
+    const res = await fetch(`${API}/workflows/${id}/${live ? 'publish' : 'unpublish'}`, { method: 'POST' })
+    const wf = res.ok ? await res.json() : null
+    get().loadWorkflows()
+    return wf
+  },
+
   // ── Notifications ────────────────────────────────────────────────────────────
   notifications: [],
   notifUnread: 0,
@@ -224,6 +331,16 @@ export const useOrgStore = create((set, get) => ({
           : [payload, ...s.notifications].slice(0, 50)
         const unread = list.filter(n => !n.read).length
         return { notifications: list, notifUnread: unread }
+      })
+    } else if (type === 'workflow_run') {
+      set(s => ({ wfRun: { ...(s.wfRun || { steps: {} }), runId: payload.run_id, status: payload.status } }))
+    } else if (type === 'workflow_step') {
+      set(s => {
+        const run = s.wfRun && s.wfRun.runId === payload.run_id ? s.wfRun : { runId: payload.run_id, status: 'running', steps: {}, order: [] }
+        const order = (run.order || []).includes(payload.node_id) ? run.order : [...(run.order || []), payload.node_id]
+        return { wfRun: { ...run, order, steps: { ...run.steps, [payload.node_id]: {
+          status: payload.status, output: payload.output, compliance: payload.compliance, error: payload.error,
+        } } } }
       })
     } else if (type === 'agent_added') {
       // Reload agents list

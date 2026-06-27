@@ -14,6 +14,7 @@ from .browser import (
 )
 from .risk import assess_risk, scan_secrets, review_outbound, risk_register
 from .activity import activity_log
+from .workflow import run_workflow_skill
 
 
 # Each skill: { name, description, parameters (for the LLM prompt), callable }
@@ -126,6 +127,12 @@ SKILL_REGISTRY: dict[str, dict[str, Any]] = {
         "description": "List recent entries from the organisation's risk register.",
         "parameters": {"limit": "(optional) how many entries, default 15"},
         "callable": risk_register,
+    },
+    "run_workflow": {
+        "name": "run_workflow",
+        "description": "Trigger a published (live) automation workflow by its name, optionally passing a JSON payload as its input. Returns the run status and final output.",
+        "parameters": {"name": "The workflow name to run", "payload": "(optional) JSON object passed to the trigger node"},
+        "callable": run_workflow_skill,
     },
     "activity_log": {
         "name": "activity_log",

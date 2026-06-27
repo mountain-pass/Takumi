@@ -235,6 +235,47 @@ CREATE TABLE IF NOT EXISTS risk_policies (
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS workflows (
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL DEFAULT 'Untitled workflow',
+    description        TEXT NOT NULL DEFAULT '',
+    graph              TEXT NOT NULL DEFAULT '{"nodes":[],"edges":[]}',  -- {nodes, edges}
+    status             TEXT NOT NULL DEFAULT 'draft',   -- draft | live
+    require_compliance INTEGER NOT NULL DEFAULT 1,
+    trigger_type       TEXT NOT NULL DEFAULT 'manual',  -- manual | schedule | webhook | agent
+    trigger_config     TEXT NOT NULL DEFAULT '{}',
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id             TEXT PRIMARY KEY,
+    workflow_id    TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    mode           TEXT NOT NULL DEFAULT 'test',   -- test | live
+    status         TEXT NOT NULL DEFAULT 'running', -- running | success | failed
+    trigger_source TEXT NOT NULL DEFAULT 'manual',
+    error          TEXT NOT NULL DEFAULT '',
+    started_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_runs ON workflow_runs(workflow_id, started_at);
+
+CREATE TABLE IF NOT EXISTS workflow_run_steps (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    node_id     TEXT NOT NULL DEFAULT '',
+    node_type   TEXT NOT NULL DEFAULT '',
+    node_label  TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'running', -- running | success | failed | skipped
+    input       TEXT NOT NULL DEFAULT '{}',
+    output      TEXT NOT NULL DEFAULT '{}',
+    compliance  TEXT,                            -- {status, level, score, verdict, reason}
+    error       TEXT NOT NULL DEFAULT '',
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_run_steps ON workflow_run_steps(run_id, started_at);
 """
 
 
@@ -1321,3 +1362,157 @@ async def migrate_from_json(data_dir: str) -> None:
     # Mark migration complete so legacy JSON files never re-clobber the
     # authoritative SQLite settings on subsequent restarts.
     await set_setting("_json_migrated", "1")
+
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+
+def _wf_row(row) -> dict:
+    d = dict(row)
+    for k in ("graph", "trigger_config"):
+        try:
+            d[k] = json.loads(d.get(k) or ("{}" if k == "trigger_config" else '{"nodes":[],"edges":[]}'))
+        except Exception:
+            d[k] = {} if k == "trigger_config" else {"nodes": [], "edges": []}
+    return d
+
+
+async def create_workflow(wf: dict) -> dict:
+    await _conn().execute(
+        "INSERT INTO workflows(id, name, description, graph, status, require_compliance, "
+        "trigger_type, trigger_config) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        (wf["id"], wf.get("name", "Untitled workflow"), wf.get("description", ""),
+         json.dumps(wf.get("graph", {"nodes": [], "edges": []})), wf.get("status", "draft"),
+         1 if wf.get("require_compliance", True) else 0,
+         wf.get("trigger_type", "manual"), json.dumps(wf.get("trigger_config", {}))),
+    )
+    await _conn().commit()
+    return await get_workflow(wf["id"])
+
+
+async def get_workflow(wf_id: str) -> dict | None:
+    row = await (await _conn().execute("SELECT * FROM workflows WHERE id = ?", (wf_id,))).fetchone()
+    return _wf_row(row) if row else None
+
+
+async def list_workflows() -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM workflows ORDER BY updated_at DESC"
+    )).fetchall()
+    return [_wf_row(r) for r in rows]
+
+
+async def update_workflow(wf_id: str, updates: dict) -> dict | None:
+    row = await (await _conn().execute("SELECT * FROM workflows WHERE id = ?", (wf_id,))).fetchone()
+    if not row:
+        return None
+    cur = dict(row)
+    fields, values = [], []
+    for col in ("name", "description", "status", "trigger_type"):
+        if col in updates and updates[col] is not None:
+            fields.append(f"{col} = ?"); values.append(updates[col])
+    if "require_compliance" in updates and updates["require_compliance"] is not None:
+        fields.append("require_compliance = ?"); values.append(1 if updates["require_compliance"] else 0)
+    if "graph" in updates and updates["graph"] is not None:
+        fields.append("graph = ?"); values.append(json.dumps(updates["graph"]))
+    if "trigger_config" in updates and updates["trigger_config"] is not None:
+        fields.append("trigger_config = ?"); values.append(json.dumps(updates["trigger_config"]))
+    fields.append("updated_at = datetime('now')")
+    values.append(wf_id)
+    await _conn().execute(f"UPDATE workflows SET {', '.join(fields)} WHERE id = ?", values)
+    await _conn().commit()
+    return await get_workflow(wf_id)
+
+
+async def delete_workflow(wf_id: str) -> None:
+    await _conn().execute("DELETE FROM workflows WHERE id = ?", (wf_id,))
+    await _conn().commit()
+
+
+async def create_run(run: dict) -> dict:
+    await _conn().execute(
+        "INSERT INTO workflow_runs(id, workflow_id, mode, status, trigger_source) VALUES(?, ?, ?, ?, ?)",
+        (run["id"], run["workflow_id"], run.get("mode", "test"),
+         run.get("status", "running"), run.get("trigger_source", "manual")),
+    )
+    await _conn().commit()
+    return run
+
+
+async def finish_run(run_id: str, status: str, error: str = "") -> None:
+    await _conn().execute(
+        "UPDATE workflow_runs SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?",
+        (status, error, run_id),
+    )
+    await _conn().commit()
+
+
+async def list_runs(workflow_id: str, limit: int = 20) -> list[dict]:
+    rows = await (await _conn().execute(
+        "SELECT * FROM workflow_runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT ?",
+        (workflow_id, limit),
+    )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def delete_run(run_id: str) -> None:
+    """Delete a single run and its steps."""
+    await _conn().execute("DELETE FROM workflow_run_steps WHERE run_id = ?", (run_id,))
+    await _conn().execute("DELETE FROM workflow_runs WHERE id = ?", (run_id,))
+    await _conn().commit()
+
+
+async def delete_runs(workflow_id: str) -> None:
+    """Delete every run (and its steps) for a workflow."""
+    await _conn().execute(
+        "DELETE FROM workflow_run_steps WHERE run_id IN "
+        "(SELECT id FROM workflow_runs WHERE workflow_id = ?)", (workflow_id,))
+    await _conn().execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (workflow_id,))
+    await _conn().commit()
+
+
+def _step_row(row) -> dict:
+    d = dict(row)
+    for k in ("input", "output"):
+        try:
+            d[k] = json.loads(d.get(k) or "{}")
+        except Exception:
+            d[k] = {}
+    try:
+        d["compliance"] = json.loads(d["compliance"]) if d.get("compliance") else None
+    except Exception:
+        d["compliance"] = None
+    return d
+
+
+async def get_run(run_id: str) -> dict | None:
+    row = await (await _conn().execute("SELECT * FROM workflow_runs WHERE id = ?", (run_id,))).fetchone()
+    if not row:
+        return None
+    run = dict(row)
+    steps = await (await _conn().execute(
+        "SELECT * FROM workflow_run_steps WHERE run_id = ? ORDER BY started_at", (run_id,)
+    )).fetchall()
+    run["steps"] = [_step_row(s) for s in steps]
+    return run
+
+
+async def add_run_step(step: dict) -> None:
+    await _conn().execute(
+        "INSERT INTO workflow_run_steps(id, run_id, node_id, node_type, node_label, status, input) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?)",
+        (step["id"], step["run_id"], step.get("node_id", ""), step.get("node_type", ""),
+         step.get("node_label", ""), step.get("status", "running"),
+         json.dumps(step.get("input", {}))),
+    )
+    await _conn().commit()
+
+
+async def finish_run_step(step_id: str, *, status: str, output: dict | None = None,
+                          compliance: dict | None = None, error: str = "") -> None:
+    await _conn().execute(
+        "UPDATE workflow_run_steps SET status = ?, output = ?, compliance = ?, error = ?, "
+        "finished_at = datetime('now') WHERE id = ?",
+        (status, json.dumps(output or {}),
+         json.dumps(compliance) if compliance is not None else None, error, step_id),
+    )
+    await _conn().commit()
