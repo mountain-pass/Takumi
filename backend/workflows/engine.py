@@ -81,13 +81,21 @@ async def _run_compliance(node: dict, output: dict, workflow: dict, run_id: str,
 
 async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                        mode: str = "test", trigger_source: str = "manual",
-                       orchestrator=None, _depth: int = 0, until_node: str | None = None) -> str:
+                       orchestrator=None, _depth: int = 0, until_node: str | None = None,
+                       only_node: str | None = None, seed_context: dict | None = None) -> str:
     """Execute a workflow graph. Returns the run_id. Steps stream over WS.
-    `until_node` stops after that node executes (used by 'Execute step')."""
+    `until_node` stops after that node executes (used by 'Execute step').
+    `only_node` runs JUST that node with the given `trigger_payload` as its input
+    (used by 'This step only' — re-test one node without re-running upstream).
+    `seed_context` pre-populates ctx.context (keyed by upstream node id/label) so
+    {{Upstream.field}} tokens still resolve in only_node mode."""
     run_id = uuid.uuid4().hex
     graph = workflow.get("graph") or {}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
-    edges = graph.get("edges", [])
+    # `wfback_*` edges are the visual loop-back drawn from a Loop body to the Loop node.
+    # The engine fans the loop body out internally, so these are decorative only — drop
+    # them so they never affect topo ordering or input assembly.
+    edges = [e for e in graph.get("edges", []) if not str(e.get("id", "")).startswith("wfback")]
 
     await database.create_run({"id": run_id, "workflow_id": workflow["id"],
                                "mode": mode, "status": "running", "trigger_source": trigger_source})
@@ -253,7 +261,19 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
     run_error = ""
     failed_label = ""; failed_id = ""
     try:
-        for node_id in _topo_order(list(nodes.values()), edges):
+        single = nodes.get(only_node) if only_node else None
+        if only_node and single is None:
+            run_status = "failed"; run_error = f"Node {only_node} not found"
+        elif single is not None:
+            if seed_context:
+                ctx.context.update(seed_context)
+            try:
+                await exec_node(single, trigger_payload or {})
+            except Exception as e:
+                run_status = "failed"; run_error = str(e)[:500]
+                failed_label = (single.get("data") or {}).get("label") or _node_type(single)
+                failed_id = only_node
+        for node_id in ([] if only_node else _topo_order(list(nodes.values()), edges)):
             if node_id in consumed or node_id in error_branch:
                 continue
             node = nodes[node_id]
@@ -288,6 +308,13 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             executed.add(node_id)
             if until_node and node_id == until_node:
                 break  # 'Execute step' — stop after the requested node
+    except asyncio.CancelledError:
+        # Stopped from the editor — finalise the run record then re-raise so the
+        # awaiting request unwinds.
+        await database.finish_run(run_id, "cancelled", "Execution stopped")
+        await _broadcast(orchestrator, WSEventType.WORKFLOW_RUN,
+                         {"run_id": run_id, "workflow_id": workflow["id"], "status": "cancelled", "mode": mode})
+        raise
     except Exception as e:
         run_status = "failed"; run_error = str(e)[:500]
         logger.exception("[workflow] run %s crashed", run_id)

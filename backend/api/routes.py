@@ -1861,9 +1861,12 @@ async def delete_workflow_route(wf_id: str):
 class WorkflowTestReq(BaseModel):
     payload: dict | None = None
     until: str | None = None   # node id — run up to this node only ('Execute step')
+    single: bool = False       # with `until`: run ONLY that node using `payload` as its input
+    context: dict | None = None  # with `single`: upstream outputs (by node id/label) for {{token}} resolution
 
 
 WEBHOOK_TEST_TIMEOUT = 60  # seconds to wait for a real webhook call during a test
+_running_tests: dict = {}  # wf_id -> asyncio.Task for the in-flight editor test run
 
 
 @router.post("/workflows/{wf_id}/test")
@@ -1889,17 +1892,32 @@ async def test_workflow_route(req: WorkflowTestReq, wf_id: str):
                                f"No webhook call received within {WEBHOOK_TEST_TIMEOUT}s. "
                                f"POST to the webhook URL, then test again."}
 
-    run_id = await run_workflow(wf, payload or {}, mode="test",
-                                trigger_source="editor", orchestrator=orchestrator,
-                                until_node=req.until)
+    # Run as a cancellable task and register it so /stop-test can cancel an actually
+    # executing run (not just a webhook wait).
+    task = asyncio.ensure_future(run_workflow(
+        wf, payload or {}, mode="test", trigger_source="editor", orchestrator=orchestrator,
+        until_node=None if req.single else req.until,
+        only_node=req.until if req.single else None,
+        seed_context=req.context if req.single else None))
+    _running_tests[wf_id] = task
+    try:
+        run_id = await task
+    except asyncio.CancelledError:
+        return {"run_id": None, "cancelled": True, "message": "Execution stopped."}
+    finally:
+        if _running_tests.get(wf_id) is task:
+            _running_tests.pop(wf_id, None)
     return {"run_id": run_id, "run": await database.get_run(run_id)}
 
 
 @router.post("/workflows/{wf_id}/stop-test")
 async def stop_test_route(wf_id: str):
-    """Cancel a test that's currently waiting for a webhook call."""
+    """Stop a test: cancel a webhook wait AND an in-progress execution."""
     from ..workflows import webhook_wait
     webhook_wait.disarm(wf_id)
+    task = _running_tests.get(wf_id)
+    if task and not task.done():
+        task.cancel()
     return {"ok": True}
 
 
@@ -1988,6 +2006,36 @@ async def unpublish_workflow_route(wf_id: str):
     return wf
 
 
+@router.get("/workflows/fs/list")
+async def workflow_fs_list(path: str = ""):
+    """List a server directory so the editor's file browser can pick a path for the
+    Read/Write File nodes (those nodes already accept any server path). Hides dotfiles."""
+    import os
+    base = os.path.expanduser(path or "~")
+    if not os.path.isdir(base):
+        base = os.path.dirname(base) or os.path.expanduser("~")
+    base = os.path.abspath(base)
+    try:
+        names = sorted(os.listdir(base), key=str.lower)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot list {base}: {e}")
+    entries = []
+    for n in names:
+        if n.startswith("."):
+            continue
+        full = os.path.join(base, n)
+        try:
+            is_dir = os.path.isdir(full)
+            entries.append({"name": n, "type": "dir" if is_dir else "file",
+                            "size": 0 if is_dir else os.path.getsize(full)})
+        except OSError:
+            continue
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    parent = os.path.dirname(base)
+    return {"path": base, "parent": parent if parent != base else None,
+            "home": os.path.expanduser("~"), "entries": entries}
+
+
 @router.post("/hooks/workflow/{wf_id}")
 async def workflow_webhook_route(wf_id: str, payload: dict | None = None, token: str = ""):
     """Public webhook trigger. Fires live workflows (guarded by the secret token),
@@ -2007,9 +2055,26 @@ async def workflow_webhook_route(wf_id: str, payload: dict | None = None, token:
         raise HTTPException(status_code=404, detail="Workflow is not live")
     run_id = await run_workflow(wf, payload or {}, mode="live",
                                 trigger_source="webhook", orchestrator=orchestrator)
-    # If the workflow has a "Respond to Webhook" node, return its payload to the caller.
     run = await database.get_run(run_id)
-    for step in (run or {}).get("steps", []):
-        if step.get("node_type") == "respond" and step.get("status") == "success":
-            return (step.get("output") or {}).get("response", {"run_id": run_id})
+    steps = (run or {}).get("steps", [])
+
+    def _respond_output():
+        for step in steps:
+            if step.get("node_type") == "respond" and step.get("status") == "success":
+                return step.get("output")
+        return None
+
+    def _last_output():
+        for step in reversed(steps):
+            if step.get("status") == "success" and step.get("output") is not None:
+                return step.get("output")
+        return None
+
+    # response_mode: 'respond' = return the Respond-to-Webhook node's payload (falling
+    # back to the last node if there's no respond node); 'auto' (default) = return the
+    # workflow's final node output. Fall back to a run summary if there's nothing.
+    mode = (wf.get("trigger_config") or {}).get("response_mode") or "auto"
+    body = (_respond_output() or _last_output()) if mode == "respond" else _last_output()
+    if body is not None:
+        return body
     return {"run_id": run_id, "status": (run or {}).get("status")}

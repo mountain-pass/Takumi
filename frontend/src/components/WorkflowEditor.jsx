@@ -13,13 +13,21 @@ import {
   addEdge, applyNodeChanges, applyEdgeChanges, Handle, Position, useReactFlow,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
+import CodeMirror from '@uiw/react-codemirror'
+import { javascript, javascriptLanguage } from '@codemirror/lang-javascript'
+import { python, pythonLanguage } from '@codemirror/lang-python'
+import { json, jsonLanguage } from '@codemirror/lang-json'
+import { linter, lintGutter } from '@codemirror/lint'
+import { Decoration, ViewPlugin, EditorView } from '@codemirror/view'
+import { RangeSetBuilder } from '@codemirror/state'
 import {
   ArrowLeft, Save, Play, Globe, Code2, GitFork, Repeat, Merge as MergeIcon,
   Sparkles, Hand, Loader2, CheckCircle2, AlertCircle, ShieldCheck, ShieldAlert,
   ShieldX, X, Copy, Timer, Workflow, Reply, CircleSlash, Plus, Search, Pencil,
   Split, Filter as FilterIcon, OctagonAlert, SlidersHorizontal, CalendarClock, Clock,
   UserCheck, Zap, Trash2, ChevronRight, ChevronLeft, ChevronDown, Hash, Type as TypeIcon,
-  ToggleLeft, Braces, Brackets, GripVertical, Info,
+  ToggleLeft, Braces, Brackets, GripVertical, Info, Variable, FileDown, FileUp,
+  FolderOpen, Folder, FileText, Ban,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -29,11 +37,7 @@ const NODE_META = {
   trigger: { label: 'Trigger', desc: 'Entry point — manual, schedule, webhook or agent', icon: Zap, color: '#6366f1', custom: 'trigger', fields: [] },
   http: { label: 'HTTP Request', desc: 'Make an API call and use the response', icon: Globe, color: '#0ea5e9', custom: 'http', fields: [] },
   code: { label: 'Code', desc: 'Run custom Python or JavaScript', icon: Code2, color: '#a855f7', custom: 'code', fields: [] },
-  set: { label: 'Edit Fields', desc: 'Add, set or override fields on the item', icon: SlidersHorizontal, color: '#8b5cf6', fields: [
-    { key: 'assignments', label: 'Fields to set (JSON: name → value/template)', type: 'json',
-      placeholder: '{ "name": "{{trigger.first}}", "total": "{{http.body.amount}}" }' },
-    { key: 'keep_only', label: 'Keep only the fields set above', type: 'checkbox' },
-  ] },
+  set: { label: 'Edit Fields', desc: 'Add, set or override fields on the item', icon: SlidersHorizontal, color: '#8b5cf6', custom: 'set', fields: [] },
   datetime: { label: 'Date & Time', desc: 'Get or transform a timestamp', icon: CalendarClock, color: '#0d9488', fields: [
     { key: 'action', label: 'Action', type: 'select', options: ['now', 'format', 'add'] },
     { key: 'value', label: 'Source value (for format/add)', type: 'text', placeholder: '{{trigger.created_at}}' },
@@ -41,15 +45,17 @@ const NODE_META = {
     { key: 'seconds', label: 'Offset seconds (for add)', type: 'number' },
   ] },
   if: { label: 'If', desc: 'Route to true / false branches', icon: GitFork, color: '#f59e0b', fields: [
-    { key: 'condition', label: 'Condition (Python expression)', type: 'text', placeholder: "input['status'] == 200" },
+    { key: 'lang', label: 'Expression language', type: 'select', options: ['python', 'javascript'] },
+    { key: 'condition', label: 'Condition (supports {{tokens}}, && and ||)', type: 'text', placeholder: "{{Code.output}} > 1 && {{Code.output}} < 3" },
   ] },
   switch: { label: 'Switch', desc: 'Route to many outputs by ordered rules', icon: Split, color: '#f97316', custom: 'switch', fields: [] },
   loop: { label: 'Loop Over Items', desc: 'Iterate an array; run the body per item', icon: Repeat, color: '#14b8a6', fields: [
-    { key: 'items_field', label: 'Array field to iterate', type: 'text', placeholder: 'body.items' },
+    { key: 'items_field', label: 'Array field to iterate (one {{token}} or a path)', type: 'text', placeholder: '{{Code.items}}' },
   ] },
   merge: { label: 'Merge', desc: 'Combine multiple inputs into one', icon: MergeIcon, color: '#64748b', fields: [] },
   filter: { label: 'Filter', desc: 'Continue only if the condition holds', icon: FilterIcon, color: '#22c55e', fields: [
-    { key: 'condition', label: 'Keep when (Python expression)', type: 'text', placeholder: "input['amount'] > 0" },
+    { key: 'lang', label: 'Expression language', type: 'select', options: ['python', 'javascript'] },
+    { key: 'condition', label: 'Keep when (supports {{tokens}}, && and ||)', type: 'text', placeholder: "{{Code.output}} > 0" },
   ] },
   stop_error: { label: 'Stop and Error', desc: 'Throw an error and fail the run', icon: OctagonAlert, color: '#ef4444', fields: [
     { key: 'message', label: 'Error message', type: 'text', placeholder: 'Payload was invalid' },
@@ -64,6 +70,19 @@ const NODE_META = {
   noop: { label: 'No Operation', desc: 'Do nothing — pass input through', icon: CircleSlash, color: '#94a3b8', fields: [] },
   llm: { label: 'AI Agent / LLM', desc: 'Run a prompt through an agent & model', icon: Sparkles, color: '#ec4899', custom: 'llm', fields: [] },
   error_trigger: { label: 'Error Trigger', desc: 'Catch-all — runs when any node fails', icon: OctagonAlert, color: '#dc2626', entry: true, fields: [] },
+  variable: { label: 'Variable', desc: 'Assign a named value (overwritable; read as {{name}})', icon: Variable, color: '#0d9488', fields: [
+    { key: 'name', label: 'Variable name', type: 'text', placeholder: 'myVar' },
+    { key: 'value', label: 'Value (supports {{tokens}}; defaults to input)', type: 'text', placeholder: '{{HTTP Request.body.id}}' },
+  ] },
+  write_file: { label: 'Write File', desc: 'Write content to a file on disk', icon: FileDown, color: '#0284c7', fields: [
+    { key: 'path', label: 'File path', type: 'filepath', pickMode: 'write', placeholder: '/tmp/output.json' },
+    { key: 'content', label: 'Content (supports {{tokens}}; defaults to input)', type: 'textarea', placeholder: '{{Code.output}}' },
+    { key: 'mode', label: 'Mode', type: 'select', options: ['overwrite', 'append'] },
+  ] },
+  read_file: { label: 'Read File', desc: 'Read a file from disk into the workflow', icon: FileUp, color: '#ca8a04', fields: [
+    { key: 'path', label: 'File path', type: 'filepath', pickMode: 'read', placeholder: '/tmp/input.json' },
+    { key: 'parse_json', label: 'Parse content as JSON (adds a json field)', type: 'checkbox' },
+  ] },
 }
 
 // Palette grouping (n8n-style categories).
@@ -71,7 +90,8 @@ const CATEGORIES = [
   { id: 'trigger', label: 'Add Trigger', hint: 'How this workflow starts', kinds: ['trigger', 'error_trigger'] },
   { id: 'core', label: 'Core', kinds: ['http', 'code', 'respond', 'subworkflow', 'wait', 'noop'] },
   { id: 'flow', label: 'Flow', kinds: ['if', 'switch', 'loop', 'merge', 'filter', 'stop_error'] },
-  { id: 'transform', label: 'Data transformation', kinds: ['set', 'datetime', 'code'] },
+  { id: 'transform', label: 'Data transformation', kinds: ['set', 'variable', 'datetime', 'code'] },
+  { id: 'files', label: 'Files', kinds: ['read_file', 'write_file'] },
   { id: 'ai', label: 'AI', kinds: ['llm'] },
   { id: 'hitl', label: 'Human in the loop', hint: 'Coming soon', kinds: [], comingSoon: true },
 ]
@@ -238,6 +258,30 @@ function EditorInner({ workflowId, onBack }) {
     ...n, data: { ...n.data, status: wfRun?.steps?.[n.id]?.status, onRename: renameNode },
   })), [nodes, wfRun, renameNode])
 
+  // Display edges: smoothstep so they bend at right angles (esp. backward loop-backs),
+  // loop-back edges drawn dashed/grey, and the loop's 'loop' edge labelled with the
+  // item count from the last run.
+  const displayEdges = useMemo(() => edges.map(e => {
+    const isBack = String(e.id || '').startsWith('wfback_')
+    const src = nodes.find(n => n.id === e.source)
+    // Count of items flowing down this edge from the source's last run (n8n-style).
+    const out = wfRun?.steps?.[e.source]?.output
+    let cnt
+    if (out != null) {
+      if (src?.data?.kind === 'loop') cnt = e.sourceHandle === 'loop' ? out.count : 1
+      else if (Array.isArray(out)) cnt = out.length
+      else if (Array.isArray(out.items)) cnt = out.items.length
+      else cnt = 1
+    }
+    const label = cnt != null ? `${cnt} item${cnt === 1 ? '' : 's'}` : undefined
+    return {
+      ...e, type: 'smoothstep', label,
+      style: isBack ? { stroke: '#94a3b8', strokeDasharray: '5 4' } : e.style,
+      labelStyle: { fontSize: 10, fill: '#4f46e5', fontWeight: 600 },
+      labelBgStyle: { fill: '#eef2ff' }, labelBgPadding: [4, 2], labelBgBorderRadius: 4,
+    }
+  }), [edges, nodes, wfRun])
+
   const onNodesChange = useCallback((c) => setNodes(ns => applyNodeChanges(c, ns)), [])
   const onEdgesChange = useCallback((c) => setEdges(es => applyEdgeChanges(c, es)), [])
   const onConnect = useCallback((params) => setEdges(es => addEdge({ ...params, animated: true }, es)), [])
@@ -253,6 +297,24 @@ function EditorInner({ workflowId, onBack }) {
       const c = rf.screenToFlowPosition({ x: r.left + r.width / 2, y: r.top + r.height / 2 })
       position = { x: c.x - 95, y: c.y - 30 }   // offset by ~half node size so it lands centered
     }
+    // A Loop comes with a starter body: a "Replace Me" node on the loop branch whose
+    // end loops back into the Loop (n8n-style). The loop-back edge is visual only
+    // (id `wfback_*`) — the engine fans the body out per item on its own.
+    if (kind === 'loop') {
+      const bodyId = newId('noop')
+      setNodes(ns => [...ns,
+        { id, type: 'loop', position, data: { label: NODE_META.loop.label, kind: 'loop', config: {} } },
+        { id: bodyId, type: 'noop', position: { x: position.x + 240, y: position.y + 12 },
+          data: { label: 'Replace Me', kind: 'noop', config: {} } },
+      ])
+      setEdges(es => [...es,
+        { id: `${id}-loop-${bodyId}`, source: id, sourceHandle: 'loop', target: bodyId, animated: true },
+        { id: `wfback_${bodyId}_${id}`, source: bodyId, target: id, animated: true },
+      ])
+      setSelectedId(id)
+      setPaletteOpen(false)
+      return
+    }
     setNodes(ns => [...ns, {
       id, type: kind, position,
       data: { label: NODE_META[kind].label, kind, config: cfg },
@@ -260,6 +322,37 @@ function EditorInner({ workflowId, onBack }) {
     setSelectedId(id)       // place + select on the canvas; double-click opens its detail view
     setPaletteOpen(false)
   }
+
+  // Copy/paste the selected node with Cmd/Ctrl+C / Cmd/Ctrl+V. Ignored while typing
+  // in a field (input/textarea/CodeMirror) so normal text copy/paste still works.
+  const clipboardRef = useRef(null)   // { node, pastes }
+  useEffect(() => {
+    const editable = el => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey) || editable(document.activeElement)) return
+      const k = e.key.toLowerCase()
+      if (k === 'c') {
+        const n = nodes.find(x => x.id === selectedId)
+        if (n) { clipboardRef.current = { node: n, pastes: 0 }; e.preventDefault() }
+      } else if (k === 'v' && clipboardRef.current) {
+        e.preventDefault()
+        const { node: src } = clipboardRef.current
+        const kind = src.data.kind
+        const n = ++clipboardRef.current.pastes
+        const id = newId(kind)
+        const copy = {
+          id, type: src.type,
+          position: { x: (src.position?.x || 0) + 40 * n, y: (src.position?.y || 0) + 40 * n },
+          data: { label: `${src.data.label || NODE_META[kind].label} copy`, kind,
+                  config: JSON.parse(JSON.stringify(src.data.config || {})) },
+        }
+        setNodes(ns => [...ns, copy])
+        setSelectedId(id)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [nodes, selectedId])
 
   function updateNodeConfig(key, value) {
     setNodes(ns => ns.map(n => n.id === editingId
@@ -296,6 +389,7 @@ function EditorInner({ workflowId, onBack }) {
     const trigger_type = tcfg.triggerType || 'manual'
     const trigger_config = { ...triggerConfig }
     if (trigger_type === 'schedule') trigger_config.cron = scheduleToCron(tcfg.schedule)
+    if (trigger_type === 'webhook') trigger_config.response_mode = tcfg.responseMode || 'auto'
     if (tcfg.sample) trigger_config.payload = tcfg.sample
     const wf = await saveWorkflow(workflowId, { name, graph: buildGraph(), require_compliance: requireCompliance, trigger_type, trigger_config })
     if (wf?.trigger_config) setTriggerConfig(wf.trigger_config)   // pick up server-minted webhook token
@@ -340,10 +434,42 @@ function EditorInner({ workflowId, onBack }) {
     setStepping(false)
   }
 
-  // Cancel a test/step that's waiting for a webhook call.
+  // The input this node would receive from already-run upstream nodes (no re-run).
+  // Prefer this node's own captured input; else assemble from direct upstream outputs
+  // (single upstream → its output; multiple → merged), mirroring the engine.
+  function capturedInput(nodeId) {
+    const own = wfRun?.steps?.[nodeId]?.input
+    if (own) return own
+    const sources = [...new Set(edges.filter(e => e.target === nodeId).map(e => e.source))]
+    const outs = sources.map(s => wfRun?.steps?.[s]?.output).filter(o => o != null)
+    if (outs.length === 0) return null
+    if (outs.length === 1) return outs[0]
+    return Object.assign({}, ...outs.filter(o => typeof o === 'object'))
+  }
+
+  // Re-run ONLY this node using the input from upstream's last run — no upstream re-run.
+  async function handleStepOnly(nodeId) {
+    const input = capturedInput(nodeId)
+    if (!input) return
+    // Seed every already-run node's output by id AND label so {{Upstream.field}} tokens resolve.
+    const context = {}
+    for (const [id, s] of Object.entries(wfRun?.steps || {})) {
+      if (s?.output == null) continue
+      context[id] = s.output
+      const label = nodes.find(n => n.id === id)?.data?.label
+      if (label) context[label] = s.output
+    }
+    setStepping(true)
+    await handleSave()
+    await executeStep(workflowId, nodeId, input, true, context)
+    setStepping(false)
+  }
+
+  // Stop a running test/step — cancels a webhook wait AND an executing run.
   async function handleStop() {
     await stopTest(workflowId)
     setWaitingHook(false)
+    setStepping(false)
   }
 
   const editing = nodes.find(n => n.id === editingId)
@@ -432,7 +558,7 @@ function EditorInner({ workflowId, onBack }) {
       <div className="flex-1 flex min-h-0">
         {/* Canvas */}
         <div className="flex-1 relative">
-          <ReactFlow nodes={liveNodes} edges={edges} nodeTypes={nodeTypes}
+          <ReactFlow nodes={liveNodes} edges={displayEdges} nodeTypes={nodeTypes}
             onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeClick={(_, n) => setSelectedId(n.id)} onNodeDoubleClick={(_, n) => setEditingId(n.id)}
             onPaneClick={() => setSelectedId(null)}
@@ -457,6 +583,8 @@ function EditorInner({ workflowId, onBack }) {
               onClose={() => setEditingId(null)} onRename={updateNodeLabel}
               onConfig={updateNodeConfig} onFocusField={setFocusedKey}
               onInsert={insertToken} onDelete={deleteEditing} onStep={() => handleStep(editing.id)}
+              onStepOnly={() => handleStepOnly(editing.id)} hasInput={!!capturedInput(editing.id)}
+              onExecuteNode={handleStep}
               onStop={handleStop}
               prevNodes={(() => { const ids = [...new Set(edges.filter(e => e.target === editing.id).map(e => e.source))]; return ids.map(id => nodes.find(n => n.id === id)).filter(Boolean) })()}
               nextNodes={(() => { const ids = [...new Set(edges.filter(e => e.source === editing.id).map(e => e.target))]; return ids.map(id => nodes.find(n => n.id === id)).filter(Boolean) })()}
@@ -745,7 +873,7 @@ function Tree({ data, base, onInsert, onDragStart, onDragEnd }) {
   )
 }
 
-function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
+function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd, onExecute, stepping }) {
   const [open, setOpen] = useState(true)
   const ref = node.data.label || node.id
   const meta = NODE_META[node.data.kind] || {}
@@ -762,7 +890,12 @@ function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
       {open && (
         <div className="pb-1.5">
           {output == null
-            ? <p className="text-[11px] text-gray-400 pl-7 pr-2 py-1">No data — run to view, or drag the whole node: <button onClick={() => onInsert(`{{${ref}}}`)} className="font-mono text-indigo-500 hover:underline">{`{{${ref}}}`}</button></p>
+            ? <div className="pl-7 pr-2 py-1 space-y-1.5">
+                <p className="text-[11px] text-gray-400">No data — run to view, or drag the whole node: <button onClick={() => onInsert(`{{${ref}}}`)} className="font-mono text-indigo-500 hover:underline">{`{{${ref}}}`}</button></p>
+                {onExecute && <button onClick={() => onExecute(node.id)} disabled={stepping}
+                  className="flex items-center gap-1 text-[11px] text-orange-600 border border-orange-300 hover:bg-orange-50 rounded-md px-2 py-1 disabled:opacity-50">
+                  <Play size={11} /> Execute step</button>}
+              </div>
             : <Tree data={output} base={ref} onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd} />}
         </div>
       )}
@@ -770,7 +903,7 @@ function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
   )
 }
 
-function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, onDragEnd }) {
+function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, onDragEnd, onExecute, stepping }) {
   const [view, setView] = useState('schema')
   const input = step?.input
   return (
@@ -793,7 +926,8 @@ function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, on
         ) : (
           ancestors.map(a => (
             <NodeAccordion key={a.id} node={a} output={steps[a.id]?.output}
-              onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd} />
+              onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd}
+              onExecute={onExecute} stepping={stepping} />
           ))
         )}
       </div>
@@ -825,6 +959,7 @@ function RunStatus({ status, small }) {
   if (status === 'running') return <Loader2 size={sz} className="text-blue-500 animate-spin shrink-0" />
   if (status === 'success') return <CheckCircle2 size={sz} className="text-green-500 shrink-0" />
   if (status === 'failed')  return <AlertCircle size={sz} className="text-red-500 shrink-0" />
+  if (status === 'cancelled') return <Ban size={sz} className="text-slate-400 shrink-0" title="Cancelled" />
   return <span className="text-gray-400">{status}</span>
 }
 
@@ -836,6 +971,13 @@ function SwitchConfig({ config, onChange, onFocusField }) {
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
   return (
     <div className="space-y-2">
+      <div>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Expression language</label>
+        <select value={config.lang || 'python'} onChange={e => onChange('lang', e.target.value)} className={`${base} text-xs`}>
+          <option value="python">Python</option>
+          <option value="javascript">JavaScript</option>
+        </select>
+      </div>
       <label className="block text-[11px] font-medium text-gray-500">Rules — first match wins; otherwise the <b>default</b> output</label>
       {rules.map((r, i) => (
         <div key={i} className="border border-gray-200 rounded-lg p-2 space-y-1.5">
@@ -845,7 +987,7 @@ function SwitchConfig({ config, onChange, onFocusField }) {
           </div>
           <input value={r.label || ''} onChange={e => update(i, { label: e.target.value })} placeholder="Output label (optional)" className={`${base} text-xs`} />
           <input value={r.condition || ''} onFocus={() => onFocusField && onFocusField('rules')} onChange={e => update(i, { condition: e.target.value })}
-            placeholder="Condition, e.g. input['type'] == 'mint'" className={`${base} font-mono text-xs`} />
+            placeholder="Condition, e.g. {{Code.output}} > 1 && {{Code.output}} < 3" className={`${base} font-mono text-xs`} />
         </div>
       ))}
       <button onClick={add} className="flex items-center gap-1 text-xs text-indigo-600 hover:underline"><Plus size={12} /> Add rule</button>
@@ -984,8 +1126,8 @@ function NavNodes({ nodes, side, onNavigate }) {
 }
 
 function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookUrl, stepping,
-                      onClose, onRename, onConfig, onFocusField, onInsert, onDelete, onStep, onStop,
-                      prevNodes, nextNodes, onNavigate }) {
+                      onClose, onRename, onConfig, onFocusField, onInsert, onDelete, onStep, onStepOnly, hasInput, onStop,
+                      onExecuteNode, prevNodes, nextNodes, onNavigate }) {
   const meta = NODE_META[node.data.kind] || {}
   const Icon = meta.icon || CircleSlash
   const config = node.data.config || {}
@@ -1017,10 +1159,18 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             <X size={14} /> Stop
           </button>
         ) : (
-          <button onClick={onStep}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-orange-500 hover:bg-orange-600 rounded-lg">
-            <Play size={14} /> Execute step
-          </button>
+          <>
+            {hasInput && !isEntry && (
+              <button onClick={onStepOnly} title="Re-run only this node with the input captured from the last run — no upstream re-run"
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-orange-600 border border-orange-300 hover:bg-orange-50 rounded-lg">
+                <Play size={14} /> This step only
+              </button>
+            )}
+            <button onClick={onStep}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-orange-500 hover:bg-orange-600 rounded-lg">
+              <Play size={14} /> Execute step
+            </button>
+          </>
         )}
         <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-700"><X size={18} /></button>
       </div>
@@ -1037,7 +1187,8 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             </div>
           ) : (
             <InputPanel ancestors={ancestors} steps={steps} step={step} isEntry={isEntry}
-              onInsert={onInsert} onDragStart={() => setDragActive(true)} onDragEnd={() => setDragActive(false)} />
+              onInsert={onInsert} onDragStart={() => setDragActive(true)} onDragEnd={() => setDragActive(false)}
+              onExecute={onExecuteNode} stepping={stepping} />
           )}
         </div>
 
@@ -1051,6 +1202,7 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             {meta.custom === 'code' && <CodeConfig config={config} onChange={onConfig} onFocusField={onFocusField} dragActive={dragActive} dropToken={dropToken} />}
             {meta.custom === 'http' && <HttpConfig config={config} onChange={onConfig} onFocusField={onFocusField} dragActive={dragActive} dropToken={dropToken} />}
             {meta.custom === 'trigger' && <TriggerConfig config={config} onChange={onConfig} webhookUrl={webhookUrl} />}
+            {meta.custom === 'set' && <SetConfig config={config} onChange={onConfig} onFocusField={onFocusField} />}
             {(meta.fields || []).map(({ key, ...f }) => (
               <Field key={key} {...f} agents={agents} value={config[key] ?? ''}
                 dragActive={dragActive} onDropToken={dropToken(key)}
@@ -1096,14 +1248,117 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
   )
 }
 
-function Field({ label, type, value, onChange, options, placeholder, agents, onFocus, dragActive, onDropToken }) {
-  // Text/textarea fields accept dragged {{tokens}} from the INPUT pane.
+// JSON config fields → CodeMirror JSON editor (highlighting, line numbers, live
+// validation, {{token}} pills, drop-at-caret). Local text state avoids reformat/
+// cursor-jump while typing; parse-up stores a dict when valid (set_node needs one),
+// else the raw string so the run still has something + the linter flags it.
+function JsonEditorField({ value, onChange, onFocus }) {
+  const [text, setText] = useState(() =>
+    typeof value === 'object' && value !== null ? JSON.stringify(value, null, 2) : (value ?? ''))
+  const [fmtErr, setFmtErr] = useState(false)
+  const push = v => { setText(v); let p = v; try { p = JSON.parse(v) } catch { /* keep raw string */ } onChange(p) }
+  const format = () => {
+    try { const pretty = JSON.stringify(JSON.parse(text), null, 2); setText(pretty); onChange(JSON.parse(text)); setFmtErr(false) }
+    catch { setFmtErr(true) }
+  }
+  return (
+    <div>
+      <div className="flex items-center justify-end mb-1">
+        {fmtErr && <span className="text-[10px] text-red-500 mr-auto">Invalid JSON — can’t format</span>}
+        <button type="button" onClick={format}
+          className="flex items-center gap-1 text-[11px] text-indigo-600 hover:bg-indigo-50 px-1.5 py-0.5 rounded">
+          <Sparkles size={11} /> Format
+        </button>
+      </div>
+      <CodeEditor value={text} language="json" onChange={v => { setFmtErr(false); push(v) }} onFocus={onFocus} />
+    </div>
+  )
+}
+
+// Path input with a "Browse" button that opens a server-side folder browser, so the
+// user can pick a file/location instead of knowing the absolute path.
+function FilePathField({ value, placeholder, onChange, onFocus, pick = 'read' }) {
+  const [open, setOpen] = useState(false)
+  const base = "flex-1 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400 font-mono text-xs"
+  return (
+    <div className="flex items-center gap-1.5">
+      <input type="text" value={value || ''} placeholder={placeholder} onFocus={onFocus}
+        onChange={e => onChange(e.target.value)} className={base} />
+      <button type="button" onClick={() => setOpen(true)}
+        className="shrink-0 flex items-center gap-1 text-xs px-2.5 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50">
+        <FolderOpen size={13} /> Browse
+      </button>
+      {open && <FileBrowser mode={pick} initial={value} onClose={() => setOpen(false)}
+        onPick={p => { onChange(p); setOpen(false) }} />}
+    </div>
+  )
+}
+
+function FileBrowser({ mode, initial, onPick, onClose }) {
+  const listDir = useOrgStore(s => s.listDir)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState('')
+  const [fname, setFname] = useState('')
+  const load = async (path) => {
+    setLoading(true); setErr('')
+    const d = await listDir(path || '')
+    if (d) setData(d); else setErr('Cannot open this folder')
+    setLoading(false)
+  }
+  useEffect(() => { load(initial || '') }, [])   // initial path → backend resolves to its dir
+  const join = (dir, name) => `${dir.replace(/\/$/, '')}/${name}`
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="w-[640px] max-w-[92vw] h-[70vh] bg-white rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
+          <FolderOpen size={16} className="text-indigo-600" />
+          <span className="text-sm font-semibold text-gray-800">{mode === 'write' ? 'Choose where to save' : 'Choose a file'}</span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-700"><X size={18} /></button>
+        </div>
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-100 bg-gray-50">
+          <button disabled={!data?.parent} onClick={() => load(data.parent)}
+            className="text-xs px-2 py-1 border border-gray-200 rounded-lg hover:bg-white disabled:opacity-40">↑ Up</button>
+          <code className="flex-1 text-[11px] text-gray-600 truncate">{data?.path || '…'}</code>
+          {data?.home && <button onClick={() => load(data.home)} className="text-xs px-2 py-1 border border-gray-200 rounded-lg hover:bg-white">Home</button>}
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {loading ? <div className="flex items-center justify-center h-full text-gray-400 gap-2"><Loader2 size={18} className="animate-spin" /></div>
+            : err ? <p className="p-4 text-xs text-red-500">{err}</p>
+            : (data?.entries || []).length === 0 ? <p className="p-4 text-xs text-gray-400">Empty folder.</p>
+            : data.entries.map(en => (
+              <button key={en.name} onClick={() => en.type === 'dir' ? load(join(data.path, en.name))
+                : mode === 'write' ? setFname(en.name) : onPick(join(data.path, en.name))}
+                className="w-full flex items-center gap-2 px-4 py-1.5 text-left text-sm hover:bg-indigo-50">
+                {en.type === 'dir' ? <Folder size={14} className="text-indigo-500 shrink-0" /> : <FileText size={14} className="text-gray-400 shrink-0" />}
+                <span className="flex-1 truncate text-gray-700">{en.name}</span>
+                {en.type === 'file' && <span className="text-[10px] text-gray-400">{en.size} B</span>}
+              </button>
+            ))}
+        </div>
+        {mode === 'write' && (
+          <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-100">
+            <input value={fname} onChange={e => setFname(e.target.value)} placeholder="filename.json"
+              className="flex-1 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400 font-mono text-xs" />
+            <button disabled={!fname.trim() || !data} onClick={() => onPick(join(data.path, fname.trim()))}
+              className="text-sm px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg disabled:opacity-40">Use this path</button>
+          </div>
+        )}
+        {mode !== 'write' && <div className="px-4 py-2.5 border-t border-gray-100 text-[11px] text-gray-400">Click a file to select it, or a folder to open it.</div>}
+      </div>
+    </div>
+  )
+}
+
+function Field({ label, type, value, onChange, options, placeholder, agents, onFocus, dragActive, onDropToken, error, pickMode }) {
+  // Text/textarea fields accept dragged {{tokens}} from the INPUT pane. We DON'T
+  // intercept the drop — textareas/inputs natively insert dropped text/plain at the
+  // drop caret and fire onChange. Intercepting (preventDefault) would force it to
+  // the start. We only add the highlight ring while a drag is active.
   const droppable = !!onDropToken && (type === 'textarea' || type === 'json' || type === undefined || type === 'text')
-  const ring = dragActive && droppable ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : ''
-  const dropProps = droppable ? {
-    onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' },
-    onDrop: e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t) onDropToken(t) },
-  } : {}
+  const ring = dragActive && droppable ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : (error ? ' border-red-400 ring-1 ring-red-300' : '')
+  const dropProps = {}
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400" + ring
   let input
   if (type === 'select') {
@@ -1120,27 +1375,38 @@ function Field({ label, type, value, onChange, options, placeholder, agents, onF
       <option value="">Auto (first non-manager)</option>
       {(agents || []).map(a => <option key={a.config.id} value={a.config.id}>{a.config.name}</option>)}
     </select>
-  } else if (type === 'textarea' || type === 'json') {
+  } else if (type === 'json') {
+    input = <JsonEditorField value={value} onChange={onChange} onFocus={onFocus} />
+  } else if (type === 'textarea') {
     const val = typeof value === 'object' ? JSON.stringify(value, null, 2) : (value ?? '')
-    input = <textarea value={val} placeholder={placeholder} rows={type === 'json' ? 4 : 5} onFocus={onFocus} {...dropProps}
-      onChange={e => {
-        if (type === 'json') { try { onChange(JSON.parse(e.target.value)) } catch { onChange(e.target.value) } }
-        else onChange(e.target.value)
-      }}
+    input = <textarea value={val} placeholder={placeholder} rows={5} onFocus={onFocus} {...dropProps}
+      onChange={e => onChange(e.target.value)}
       className={`${base} font-mono text-xs resize-y`} />
   } else if (type === 'number') {
     input = <input type="number" value={value} placeholder={placeholder} onFocus={onFocus}
       onChange={e => onChange(e.target.value === '' ? '' : Number(e.target.value))} className={base} />
+  } else if (type === 'filepath') {
+    input = <FilePathField value={value} placeholder={placeholder} onChange={onChange}
+      pick={pickMode} onFocus={onFocus} {...dropProps} />
   } else {
     input = <input type="text" value={value} placeholder={placeholder} onFocus={onFocus} {...dropProps} onChange={e => onChange(e.target.value)} className={base} />
   }
-  return <div>{label && <label className="block text-[11px] font-medium text-gray-500 mb-1">{label}</label>}{input}</div>
+  return <div>{label && <label className="block text-[11px] font-medium text-gray-500 mb-1">{label}</label>}{input}
+    {error && <p className="text-[11px] text-red-500 mt-1 break-words">{error}</p>}</div>
 }
 
 function CodeConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
   const formatCode = useOrgStore(s => s.formatCode)
   const [busy, setBusy] = useState(false)
   const lang = config.language || 'python'
+  // Flag JS syntax errors as you type. Tokens resolve to literals at runtime,
+  // so replace {{...}} with `null` before parsing. Python has no browser parser —
+  // it stays flagged on actual run (shown in OUTPUT).
+  const codeErr = useMemo(() => {
+    if (lang !== 'javascript' || !config.code) return null
+    try { new Function(config.code.replace(/\{\{[^}]+\}\}/g, 'null')); return null }
+    catch (e) { return e.message }
+  }, [config.code, lang])
   async function fmt() {
     setBusy(true)
     const r = await formatCode(config.code || '', lang)
@@ -1158,12 +1424,91 @@ function CodeConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
             {busy ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />} Format
           </button>
         </div>
-        <Field type="textarea" value={config.code ?? ''}
-          placeholder={lang === 'python' ? "return {'doubled': input['n'] * 2}" : 'return { doubled: input.n * 2 }'}
-          dragActive={dragActive} onDropToken={dropToken && dropToken('code')}
-          onFocus={() => onFocusField && onFocusField('code')} onChange={v => onChange('code', v)} />
+        <CodeEditor value={config.code ?? ''} language={lang} error={codeErr}
+          onChange={v => onChange('code', v)} onFocus={() => onFocusField && onFocusField('code')} />
+        {codeErr && <p className="text-[11px] text-red-500 mt-1 break-words">{codeErr}</p>}
       </div>
     </>
+  )
+}
+
+// Language config for the editor: the CodeMirror extension + the Lezer parser
+// used for linting. JSON, JS and Python all supported.
+function langExt(language) {
+  if (language === 'json') return json()
+  if (language === 'javascript') return javascript()
+  return python()
+}
+function langParser(language) {
+  if (language === 'json') return jsonLanguage.parser
+  if (language === 'javascript') return javascriptLanguage.parser
+  return pythonLanguage.parser
+}
+
+// Live syntax linter. We parse a TOKEN-MASKED copy so runtime {{tokens}} aren't
+// flagged: in JSON a token becomes a same-length string literal ("___"), elsewhere
+// a same-length `_` identifier — positions stay aligned. Lezer error nodes → red.
+function maskTokens(s, language) {
+  return s.replace(/\{\{[^}]*\}\}/g, m =>
+    language === 'json' ? '"' + '_'.repeat(Math.max(0, m.length - 2)) + '"' : '_'.repeat(m.length))
+}
+function syntaxLinter(language) {
+  const parser = langParser(language)
+  return linter(view => {
+    const doc = view.state.doc
+    const text = maskTokens(doc.toString(), language)
+    if (!text.trim()) return []
+    const diags = []
+    parser.parse(text).iterate({
+      enter: node => {
+        if (node.type.isError) {
+          const from = Math.min(node.from, doc.length)
+          const to = Math.min(Math.max(node.to, from + 1), doc.length)
+          diags.push({ from, to, severity: 'error', message: 'Syntax error' })
+        }
+      },
+    })
+    return diags
+  }, { delay: 400 })
+}
+
+// Render each {{token}} as a single highlighted pill so the code highlighter
+// doesn't colour its insides like real code (which looked "broken"). Purely visual.
+const WF_TOKEN_RE = /\{\{[^}]*\}\}/g
+const tokenMark = Decoration.mark({ class: 'cm-wf-token' })
+const tokenHighlighter = ViewPlugin.fromClass(class {
+  constructor(view) { this.decorations = this.build(view) }
+  update(u) { if (u.docChanged || u.viewportChanged) this.decorations = this.build(u.view) }
+  build(view) {
+    const b = new RangeSetBuilder()
+    for (const { from, to } of view.visibleRanges) {
+      const text = view.state.doc.sliceString(from, to)
+      let m
+      WF_TOKEN_RE.lastIndex = 0
+      while ((m = WF_TOKEN_RE.exec(text))) b.add(from + m.index, from + m.index + m[0].length, tokenMark)
+    }
+    return b.finish()
+  }
+}, { decorations: v => v.decorations })
+const tokenTheme = EditorView.theme({
+  '.cm-wf-token': { backgroundColor: 'rgba(99,102,241,0.12)', borderRadius: '3px' },
+  '.cm-wf-token, .cm-wf-token span': { color: '#4f46e5' },
+})
+
+// CodeMirror editor — syntax highlighting, line numbers, live error linting, {{token}}
+// pills, and native drag-drop that inserts the dragged token at the drop caret.
+function CodeEditor({ value, language, error, onChange, onFocus }) {
+  const ext = useMemo(() => [
+    langExt(language), syntaxLinter(language), lintGutter(), tokenHighlighter, tokenTheme,
+  ], [language])
+  return (
+    <div className={`rounded-lg overflow-hidden border ${error ? 'border-red-400' : 'border-gray-200'}`}>
+      <CodeMirror
+        value={value || ''} extensions={ext} onChange={onChange} onFocus={onFocus}
+        minHeight="120px" maxHeight="340px"
+        basicSetup={{ lineNumbers: true, foldGutter: false, highlightActiveLine: false, autocompletion: false }}
+        className="text-xs" />
+    </div>
   )
 }
 
@@ -1258,6 +1603,18 @@ function TriggerConfig({ config, onChange, webhookUrl }) {
             </div>
           ) : <p className="text-[11px] text-amber-600">Save the workflow to generate its webhook URL.</p>}
           <p className="text-[11px] text-gray-400">POST to this URL to trigger the workflow. During a Test it captures the next real call.</p>
+          <div className="pt-1">
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">Respond</label>
+            <select value={config.responseMode || 'auto'} onChange={e => onChange('responseMode', e.target.value)} className={base}>
+              <option value="auto">Automatically (final node output)</option>
+              <option value="respond">Using "Respond to Webhook" node</option>
+            </select>
+            <p className="text-[10px] text-gray-400 mt-1">
+              {(config.responseMode || 'auto') === 'respond'
+                ? 'The caller receives the payload from your Respond to Webhook node (only on live calls — a Test returns an ack).'
+                : 'The caller receives the last node’s output. Add a Respond to Webhook node + pick the option above to control the response.'}
+            </p>
+          </div>
         </div>
       )}
 
@@ -1332,9 +1689,7 @@ function TriggerConfig({ config, onChange, webhookUrl }) {
       {/* Sample/test input — available for every type */}
       <div className="border-t border-gray-100 pt-3">
         <label className="block text-[11px] font-medium text-gray-500 mb-1">Test input (JSON, optional)</label>
-        <textarea value={typeof config.sample === 'string' ? config.sample : (config.sample ? JSON.stringify(config.sample, null, 2) : '')}
-          onChange={e => onChange('sample', e.target.value)} rows={3}
-          placeholder='{ "example": "value" }' className={`${base} font-mono text-xs`} />
+        <JsonEditorField value={config.sample} onChange={v => onChange('sample', v)} />
         <p className="text-[10px] text-gray-400 mt-1">Used as the trigger payload when you Test the workflow.</p>
       </div>
     </div>
@@ -1387,10 +1742,8 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
   const opts = config.options || {}
   const setOpt = (k, v) => onChange('options', { ...opts, [k]: v })
   const ring = dragActive ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : ''
-  const dropProps = (key) => ({
-    onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' },
-    onDrop: e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t && dropToken) dropToken(key)(t) },
-  })
+  // Native drop inserts at the caret (see Field) — don't intercept.
+  const dropProps = () => ({})
   return (
     <div className="space-y-3">
       <div>
@@ -1420,10 +1773,12 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
             <option value="json">JSON</option>
             <option value="raw">Raw / text</option>
           </select>
-          <textarea value={config.body ?? ''} onFocus={() => onFocusField && onFocusField('body')}
-            onChange={e => onChange('body', e.target.value)} {...dropProps('body')} rows={4}
-            placeholder={config.bodyType === 'raw' ? 'raw body…' : '{ "key": "{{Trigger.value}}" }'}
-            className={`${base} font-mono text-xs${ring}`} />
+          {config.bodyType === 'raw'
+            ? <textarea value={config.body ?? ''} onFocus={() => onFocusField && onFocusField('body')}
+                onChange={e => onChange('body', e.target.value)} {...dropProps('body')} rows={4}
+                placeholder="raw body…" className={`${base} font-mono text-xs${ring}`} />
+            : <CodeEditor value={config.body ?? ''} language="json"
+                onChange={v => onChange('body', v)} onFocus={() => onFocusField && onFocusField('body')} />}
         </div>
       </HttpSection>
 
@@ -1453,6 +1808,68 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
           <option value="continue">Continue (ignore 4xx/5xx)</option>
         </select>
         <p className="text-[11px] text-gray-400 mt-1.5">A 4xx/5xx response fails the node so an <b>Error Trigger</b> can catch the message — unless set to Continue.</p>
+      </div>
+    </div>
+  )
+}
+
+// Edit Fields (Set) — n8n-style: Manual Mapping (typed Name/Type/Value rows, drag
+// input fields in or Add Field) or JSON (one object). Manual rows → `fields`, JSON → `assignments`.
+const SET_TYPES = ['String', 'Number', 'Boolean', 'Array', 'Object']
+function tokenToName(t) {
+  const m = t.match(/\{\{\s*([^}]+?)\s*\}\}/)
+  return ((m ? m[1] : t).split('.').pop() || '').trim()
+}
+function SetConfig({ config, onChange }) {
+  const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
+  const mode = config.mode || (config.assignments ? 'json' : 'manual')
+  const fields = config.fields || []
+  const setFields = f => onChange('fields', f)
+  const updateField = (i, patch) => setFields(fields.map((r, j) => j === i ? { ...r, ...patch } : r))
+  const addField = (preset = {}) => setFields([...fields, { name: '', type: 'string', value: '', ...preset }])
+  const onDropZone = e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t) addField({ name: tokenToName(t), value: t }) }
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Mode</label>
+        <select value={mode} onChange={e => onChange('mode', e.target.value)} className={base}>
+          <option value="manual">Manual Mapping</option>
+          <option value="json">JSON</option>
+        </select>
+      </div>
+
+      {mode === 'json' ? (
+        <div>
+          <label className="block text-[11px] font-medium text-gray-500 mb-1">Fields to set (JSON: name → value/template)</label>
+          <JsonEditorField value={config.assignments} onChange={v => onChange('assignments', v)} />
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <label className="block text-[11px] font-medium text-gray-500">Fields to Set</label>
+          {fields.map((f, i) => (
+            <div key={i} className="border border-gray-200 rounded-lg p-2 space-y-1.5 bg-gray-50/50">
+              <div className="flex items-center gap-1.5">
+                <input value={f.name || ''} onChange={e => updateField(i, { name: e.target.value })} placeholder="Field name" className={base} />
+                <button onClick={() => setFields(fields.filter((_, j) => j !== i))} className="text-gray-300 hover:text-red-500 shrink-0" title="Remove"><Trash2 size={13} /></button>
+              </div>
+              <select value={f.type || 'string'} onChange={e => updateField(i, { type: e.target.value })} className={`${base} text-xs`}>
+                {SET_TYPES.map(t => <option key={t} value={t.toLowerCase()}>{t}</option>)}
+              </select>
+              <input value={f.value || ''} onChange={e => updateField(i, { value: e.target.value })}
+                placeholder="Value (drag a field or type; supports {{tokens}})" className={`${base} font-mono text-xs`} />
+            </div>
+          ))}
+          <div onDragOver={e => e.preventDefault()} onDrop={onDropZone}
+            className="border border-dashed border-gray-300 rounded-lg px-3 py-3 text-center text-[11px] text-gray-400">
+            Drag input fields here&nbsp;·&nbsp;
+            <button onClick={() => addField()} className="text-indigo-600 hover:underline font-medium">Add Field</button>
+          </div>
+        </div>
+      )}
+
+      <div className="border-t border-gray-100 pt-3 flex items-center justify-between">
+        <label className="text-xs text-gray-600">Include other input fields</label>
+        <Toggle on={!config.keep_only} onClick={() => onChange('keep_only', !config.keep_only)} />
       </div>
     </div>
   )
