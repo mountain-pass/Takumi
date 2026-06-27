@@ -141,7 +141,7 @@ export const useOrgStore = create((set, get) => ({
     if (!res.ok) return null
     const run = await res.json()
     const steps = {}, order = []
-    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error, input_tokens: s.input_tokens, output_tokens: s.output_tokens }; if (!order.includes(s.node_id)) order.push(s.node_id) }
     set({ wfRun: { runId: run.id, status: run.status, steps, order } })
     return run
   },
