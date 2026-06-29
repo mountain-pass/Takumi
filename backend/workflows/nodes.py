@@ -40,14 +40,43 @@ class NodeContext:
 _TPL = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
+def _builtins(ctx: NodeContext) -> dict:
+    """Built-in variables available in any {{token}} — current date/time plus
+    workflow/run metadata. Usable bare ({{today}}) or namespaced ({{$vars.today}})."""
+    from datetime import datetime
+    now = datetime.now()
+    wf = ctx.workflow or {}
+    return {
+        "now": now.isoformat(timespec="seconds"),       # 2026-06-28T08:00:00
+        "datetime": now.isoformat(timespec="seconds"),
+        "today": now.strftime("%Y-%m-%d"),              # 2026-06-28
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),               # 08:00:00
+        "timestamp": int(now.timestamp()),              # unix seconds
+        "year": now.strftime("%Y"), "month": now.strftime("%m"), "day": now.strftime("%d"),
+        "weekday": now.strftime("%A"),
+        "workflow": {"id": wf.get("id", ""), "name": wf.get("name", "")},
+        "run": {"id": ctx.run_id, "mode": getattr(ctx, "mode", "")},
+    }
+
+
 def _resolve_path(path: str, ctx: NodeContext, inputs: dict) -> Any:
-    """Resolve a dotted path like 'nodeId.body.title' or '$.field' (current input)."""
+    """Resolve a dotted path like 'nodeId.body.title', '$.field' (current input),
+    or a built-in like 'today' / '$vars.now' / 'workflow.name'."""
     parts = path.split(".")
-    if parts[0] in ("$", "input", "json"):
+    head = parts[0]
+    bi = _builtins(ctx)
+    if head in ("$", "input", "json"):
         cur: Any = inputs
         parts = parts[1:]
-    elif parts[0] in ctx.context:
-        cur = ctx.context[parts[0]]
+    elif head in ctx.context:                 # a node's output (id/label) wins over built-ins
+        cur = ctx.context[head]
+        parts = parts[1:]
+    elif head in ("$vars", "vars"):
+        cur = bi
+        parts = parts[1:]
+    elif head in bi:
+        cur = bi[head]
         parts = parts[1:]
     else:
         cur = ctx.context
@@ -172,20 +201,60 @@ async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return result
 
 
-# A deliberately small, safe environment for the code node. No imports, no
-# builtins beyond a curated map. This is NOT a hardened sandbox — see plan.
+# A deliberately small, safe environment for the code node. This is NOT a hardened
+# sandbox — see plan. Imports are limited to a stdlib whitelist (no os/sys/subprocess).
+import datetime as _dt, math as _math, random as _random, statistics as _stats, textwrap as _textwrap
+import collections as _collections, itertools as _itertools, functools as _functools
+import time as _time, string as _string, decimal as _decimal, uuid as _uuid
+import base64 as _base64, hashlib as _hashlib
+
+# Modules a code node may `import` (or use directly — they're pre-injected into scope).
+# `time` is required because the C datetime module imports it internally. Deliberately
+# excludes os/sys/subprocess/socket/importlib etc.
+_SAFE_MODULES = {
+    "datetime": _dt, "math": _math, "re": re, "random": _random, "statistics": _stats,
+    "textwrap": _textwrap, "json": json, "collections": _collections,
+    "itertools": _itertools, "functools": _functools, "time": _time, "string": _string,
+    "decimal": _decimal, "uuid": _uuid, "base64": _base64, "hashlib": _hashlib,
+}
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """Restricted __import__ for code nodes — only the stdlib whitelist above."""
+    base = name.split(".")[0]
+    if base in _SAFE_MODULES:
+        return _SAFE_MODULES[base]
+    raise ImportError(f"import of '{name}' is not allowed in code nodes "
+                      f"(allowed: {', '.join(sorted(_SAFE_MODULES))})")
+
+
 _SAFE_BUILTINS = {
     "len": len, "range": range, "min": min, "max": max, "sum": sum, "sorted": sorted,
     "abs": abs, "round": round, "str": str, "int": int, "float": float, "bool": bool,
     "list": list, "dict": dict, "set": set, "tuple": tuple, "enumerate": enumerate,
     "zip": zip, "map": map, "filter": filter, "any": any, "all": all, "json": json,
+    "reversed": reversed, "repr": repr, "print": print, "isinstance": isinstance,
+    "__import__": _safe_import,
 }
+
+# Common modules + helpers pre-injected into the code node's globals so simple scripts
+# work even without an import line (e.g. `date.today()`, `re.findall(...)`).
+_SAFE_GLOBALS_EXTRA = {**_SAFE_MODULES, "date": _dt.date, "time": _dt.time,
+                       "timedelta": _dt.timedelta}
+
+
+# Models (and users) often wrap a token in their own quotes, e.g. `x = """{{a.b}}"""`.
+# Since the token is substituted as a COMPLETE literal, those wrapping quotes produce
+# invalid code when the value contains quotes/newlines ("unterminated string literal").
+# Strip quotes that directly enclose a lone token before substituting.
+_QUOTED_TOKEN = re.compile(r'("""|\'\'\'|"|\')\s*(\{\{[^}]+\}\})\s*\1')
 
 
 def _render_code_tokens(code: str, ctx: NodeContext, inputs: dict, lang: str) -> str:
     """Resolve {{Node.field}} tokens dragged into code to LITERAL values so the
     code stays valid: JSON literals for JS, Python literals for Python."""
     is_js = lang in ("javascript", "js", "node")
+    code = _QUOTED_TOKEN.sub(r"\2", code)   # unwrap model-added quotes around a lone token
 
     def sub(m):
         val = _resolve_path(m.group(1).strip(), ctx, inputs)
@@ -207,7 +276,7 @@ async def code_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
 
     import re as _re
     import textwrap as _tw
-    env = {"__builtins__": _SAFE_BUILTINS}
+    env = {"__builtins__": _SAFE_BUILTINS, **_SAFE_GLOBALS_EXTRA}
     local = {"input": inputs, "context": ctx.context, "output": None}
     has_return = bool(_re.search(r"(^|\n)[ \t]*return\b", code))
     if has_return:
@@ -558,45 +627,148 @@ async def merge_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return {"items": items, "count": len(items)}
 
 
+# Operating instructions for the standalone workflow agent — websearch-first,
+# loop, take notes / use memory, and self-evaluate before answering.
+_WF_AGENT_PREAMBLE = """\
+You are an autonomous task agent running inside an automated workflow. You have FULL access to \
+every tool in this system — web search, web fetch, a real browser, file read/write, shell, risk \
+checks, and any connected MCP servers. Use whatever the task needs.
+
+Work rigorously:
+- PLAN: briefly decide what information and steps the task actually requires.
+- GATHER (websearch-first): your training data is out of date. For ANY real-world fact — prices, \
+news, dates, who/what is current — you MUST use web_search (or the browser) to get up-to-date \
+information. Never answer real-world questions from memory alone.
+- USE MEMORY: as you work, keep track of key findings. For larger tasks, persist intermediate \
+notes with write_file and read them back so you don't lose context across steps.
+- LOOP: keep calling tools, one at a time, until you genuinely have what you need.
+- SELF-EVALUATE: before your final answer, check that it fully satisfies the task and is grounded \
+in the data you gathered. If it falls short, do another round of gathering.
+Then write your final answer as plain text (no tool-call block)."""
+
+
+async def _build_workflow_agent(node: dict, cfg: dict, ctx: NodeContext):
+    """Build an ephemeral, self-contained agent for an LLM node: its own provider/
+    model/system prompt, and EVERY available skill + MCP server granted. Separate
+    from the organisation's agents — the node defines its own role and task."""
+    from ..models import AgentConfig, LLMProvider
+    from ..skills.registry import SKILL_REGISTRY
+    from .. import database, runtime_settings
+
+    orch = ctx.orchestrator
+    if orch is None:
+        raise ValueError("No runtime available to run the LLM node")
+
+    # Grant all built-in skills + every enabled MCP server.
+    skills = list(SKILL_REGISTRY.keys())
+    try:
+        for s in await database.get_all_mcp_servers():
+            if s.get("enabled", 1):
+                skills.append(f"mcp:{s['id']}")
+    except Exception:
+        pass
+
+    rt = runtime_settings.get()
+    node_system = render(cfg.get("system") or "", ctx, {})
+    system_prompt = (node_system + "\n\n" + _WF_AGENT_PREAMBLE).strip() if node_system else _WF_AGENT_PREAMBLE
+    prov_str = rt.get("llm_provider") or "ollama"
+    try:
+        provider = LLMProvider(prov_str)
+    except ValueError:
+        provider = LLMProvider.OLLAMA
+
+    config = AgentConfig(
+        name=(node.get("data") or {}).get("label") or "Workflow Agent",
+        role="Autonomous workflow task agent",
+        description="Runs a single workflow task with full tool access.",
+        system_prompt=system_prompt,
+        llm_provider=provider,
+        llm_model=cfg.get("model") or rt.get("llm_model") or "",
+        skills=skills,
+        api_provider_id=cfg.get("api_provider_id") or None,
+        max_iterations=int(cfg.get("max_iterations") or 12),
+        # Hard ceiling so a looping research task can't burn unbounded tokens; the
+        # agent forces a final answer once it's hit. Override per-node if needed.
+        token_budget=int(cfg.get("token_budget") or 1_000_000),
+    )
+    from ..agents.base_agent import BaseAgent
+    agent = BaseAgent(config, orch.bus, orch.settings)
+    agent.set_orchestrator(orch)
+    if config.api_provider_id:
+        await orch._resolve_agent_adapter(agent, config.api_provider_id)
+    else:
+        from ..llm_adapters import get_adapter
+        agent._adapter = get_adapter(provider, orch.settings, rt)
+    return agent
+
+
+# Models love to wrap a whole answer in a ```html / ```json fence even when asked for
+# raw output. If the ENTIRE response is one fenced block, unwrap it so files/HTTP bodies
+# get the real artefact — but leave inline code blocks inside prose untouched.
+_OUTER_FENCE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\n(.*)\n```\s*$", re.S)
+
+
+def _strip_outer_fence(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    m = _OUTER_FENCE.match(text.strip())
+    return m.group(1) if m and "```" not in m.group(1) else text
+
+
 async def llm_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Run a prompt against a chosen agent, optionally overriding which provider
-    and model run the task (like n8n's agent node). The compliance gate is applied
-    by the engine AFTER this returns (it needs the run/step context)."""
+    """Run the node's task on a STANDALONE agent (its own provider/model/system/prompt,
+    independent of the organisation's agents). The agent has every skill + MCP server,
+    runs a full tool-calling loop (websearch-first, browser, files, memory) and
+    self-evaluates before answering. The engine applies the compliance gate after."""
     cfg = _cfg(node)
     prompt = render(cfg.get("prompt") or "", ctx, inputs)
-    system = cfg.get("system") or "You are a helpful assistant inside an automated workflow."
-    agent_id = cfg.get("agent_id") or ""
-    orch = ctx.orchestrator
-
-    agent = None
-    if orch is not None:
-        agents = orch.get_agents()
-        if agent_id:
-            agent = next((a for a in agents if a.config.id == agent_id), None)
-        if agent is None:
-            agent = next((a for a in agents if not a.config.is_ceo), None) or (agents[0] if agents else None)
-    if agent is None:
-        raise ValueError("No agent available to run the LLM node")
-
-    # Provider/model override: build a fresh adapter for the chosen provider.
-    adapter = agent._adapter
-    model = cfg.get("model") or agent.config.llm_model
-    provider_id = cfg.get("api_provider_id")
-    if provider_id:
-        from ..llm_adapters.factory import get_adapter_for_provider
-        adapter = get_adapter_for_provider(provider_id, agent.settings)
-
     if not prompt:
         prompt = json.dumps(inputs)[:4000] if inputs else "Proceed."
-    resp = await adapter.complete(
-        system_prompt=system,
-        messages=[{"role": "user", "content": str(prompt)}],
-        model=model,
-        max_tokens=int(cfg.get("max_tokens") or 1024),
-    )
+
+    agent = await _build_workflow_agent(node, cfg, ctx)
+    resp = await agent._do_work_with_tools(str(prompt), messages=[{"role": "user", "content": str(prompt)}])
+
     # Record token usage on the step (engine reads ctx.step_tokens after the call).
     ctx.step_tokens[node["id"]] = (resp.input_tokens or 0, resp.output_tokens or 0)
-    return {"text": resp.content, "agent": agent.config.name, "agent_id": agent.config.id, "model": model}
+    return {"text": _strip_outer_fence(resp.content), "agent": agent.config.name, "model": agent.config.llm_model}
+
+
+async def websearch_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Search the web in REAL TIME (independent of any LLM's training data) and return
+    fresh results. Use upstream of an LLM/Set node so the flow always works on live data.
+
+    For higher confidence, `fetch_content` (default on) also pulls the actual page text
+    of the top results — so a downstream LLM reasons over real current content instead of
+    a possibly-stale search snippet."""
+    from ..skills.web_search import web_search, web_fetch, UNAVAILABLE_PREFIX
+    cfg = _cfg(node)
+    query = render(str(cfg.get("query") or ""), ctx, inputs)
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Web Search: a query is required")
+    query = query.strip()
+    try:
+        n = max(1, min(int(cfg.get("max_results") or 5), 20))
+    except Exception:
+        n = 5
+    results = await web_search(query, n)
+    ok = not str(results).startswith(UNAVAILABLE_PREFIX)
+
+    pages: list[dict] = []
+    if ok and cfg.get("fetch_content", True):
+        # Fetch the top few result pages in parallel so the flow has real content, not
+        # just snippets. Bounded (≤3, capped chars) to stay fast and within token budgets.
+        urls = re.findall(r"https?://[^\s]+", results)
+        seen, picked = set(), []
+        for u in urls:
+            if u not in seen:
+                seen.add(u); picked.append(u)
+            if len(picked) >= min(3, n):
+                break
+        fetched = await asyncio.gather(*[web_fetch(u, 4000) for u in picked], return_exceptions=True)
+        pages = [{"url": u, "content": f if isinstance(f, str) else f"Failed: {f}"}
+                 for u, f in zip(picked, fetched)]
+
+    return {"query": query, "results": results, "pages": pages, "ok": ok}
 
 
 async def wait_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -637,6 +809,38 @@ async def variable_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
 # parent dirs auto-created; reads capped). Paths/content are templated.
 _FILE_READ_CAP = 100_000
 
+# Common keys that carry the human-readable payload of a node output. When content
+# resolves to a node's whole output dict (mis-wiring, or a default fallthrough), write
+# the readable text instead of dumping raw JSON — only genuinely structured data
+# becomes pretty JSON. ponytail: heuristic key list, extend if a node uses another key.
+_TEXT_KEYS = ("text", "content", "output", "body", "result", "value", "message")
+
+
+def _coerce_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for k in _TEXT_KEYS:
+            v = content.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    return json.dumps(content, indent=2, default=str)
+
+
+def _demo():
+    assert _coerce_text({"text": "# Report\nhi", "agent": "x"}) == "# Report\nhi"
+    assert _coerce_text("plain") == "plain"
+    assert _coerce_text({"a": 1}) == json.dumps({"a": 1}, indent=2)
+    assert _strip_outer_fence("```html\n<h1>hi</h1>\n```") == "<h1>hi</h1>"
+    assert _strip_outer_fence("plain text") == "plain text"
+    # Don't unwrap markdown that legitimately contains a code block.
+    assert _strip_outer_fence("# Doc\n```js\nx()\n```") == "# Doc\n```js\nx()\n```"
+
+
+if __name__ == "__main__":
+    _demo()
+    print("ok")
+
 
 async def write_file_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Write (templated) content to a file. mode='overwrite' (default) or 'append'."""
@@ -649,7 +853,7 @@ async def write_file_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     content = render(cfg.get("content"), ctx, inputs)
     if content is None:
         content = inputs
-    text = content if isinstance(content, str) else json.dumps(content, indent=2, default=str)
+    text = _coerce_text(content)
     file_mode = "a" if str(cfg.get("mode") or "overwrite").lower().startswith("a") else "w"
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -747,4 +951,5 @@ NODE_HANDLERS = {
     "variable": variable_node,
     "write_file": write_file_node,
     "read_file": read_file_node,
+    "websearch": websearch_node,
 }

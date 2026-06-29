@@ -71,7 +71,11 @@ async def _run_compliance(node: dict, output: dict, workflow: dict, run_id: str,
             "status": "blocked" if record.get("verdict") == "block" else "reviewed",
             "level": record.get("level"),
             "score": record.get("score"),
+            "threshold": record.get("threshold"),
             "verdict": record.get("verdict"),
+            "rationale": record.get("rationale"),
+            "categories": record.get("categories"),
+            "findings": record.get("findings"),
             "reviewer": rc.config.name,
         }
     except Exception as e:
@@ -165,7 +169,10 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                              {"run_id": run_id, "node_id": node_id, "status": "failed", "label": label})
             raise ValueError(f"Unknown node type '{ntype}'")
         try:
-            output = await asyncio.wait_for(handler(node, inputs, ctx), timeout=NODE_TIMEOUT)
+            # LLM nodes run a full agentic tool loop (web search, browser, …) which
+            # can take minutes — give them the agent work budget, not the 120s default.
+            node_timeout = 960 if ntype == "llm" else NODE_TIMEOUT
+            output = await asyncio.wait_for(handler(node, inputs, ctx), timeout=node_timeout)
             if not isinstance(output, dict):
                 output = {"value": output}
         except Exception as e:
@@ -181,17 +188,25 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
         _lbl = (node.get("data") or {}).get("label")
         if _lbl:
             ctx.context[_lbl] = output
-        # A compliance agent that BLOCKS the output fails the node when the gate is
-        # strict ('all'). Under 'unless_excluded'/'off' it's recorded but allowed.
+        # When this workflow requires compliance review, the output must clear the
+        # Risk & Compliance agent before reaching downstream steps. A BLOCK verdict —
+        # or NO compliance agent being set up at all — fails the node. (_run_compliance
+        # only returns 'blocked'/'unchecked' when require_compliance is on, so the
+        # per-workflow flag is authoritative regardless of the org-wide mode.)
         tokens = ctx.step_tokens.get(node_id)
-        if comp and comp.get("status") == "blocked" and compliance.get_mode() == "all":
-            await database.finish_run_step(step_id, status="failed", output=output, compliance=comp, tokens=tokens,
-                                           error=f"Blocked by compliance ({comp.get('level')}, score {comp.get('score')})")
+        if comp and comp.get("status") in ("blocked", "unchecked"):
+            if comp.get("status") == "unchecked":
+                err = ("Compliance review is required for this workflow, but no Risk & Compliance "
+                       "agent is set up. Add a compliance agent in Risk & Compliance so this workflow "
+                       "can run according to the rules.")
+            else:
+                err = f"Blocked by compliance review ({comp.get('level')}, score {comp.get('score')})"
+            await database.finish_run_step(step_id, status="failed", output=output, compliance=comp,
+                                           tokens=tokens, error=err)
             await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                              {"run_id": run_id, "node_id": node_id, "status": "failed",
-                              "label": label, "output": output, "compliance": comp,
-                              "error": "Blocked by compliance review"})
-            raise RuntimeError(f"Compliance blocked '{label}'")
+                              "label": label, "output": output, "compliance": comp, "error": err})
+            raise RuntimeError(err)
         await database.finish_run_step(step_id, status="success", output=output, compliance=comp, tokens=tokens)
         await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                          {"run_id": run_id, "node_id": node_id, "status": "success",
@@ -284,41 +299,66 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                 run_status = "failed"; run_error = str(e)[:500]
                 failed_label = (single.get("data") or {}).get("label") or _node_type(single)
                 failed_id = only_node
-        for node_id in ([] if only_node else _topo_order(list(nodes.values()), edges)):
-            if node_id in consumed or node_id in error_branch:
-                continue
+        # Wave scheduler: run all nodes whose predecessors are settled CONCURRENTLY,
+        # so independent branches (e.g. several Web Search nodes) fire in parallel, and
+        # a join node still waits for every upstream because it only becomes ready once
+        # all its predecessors have finished. Falls back to nothing in only_node mode.
+        async def _run_one(node_id):
             node = nodes[node_id]
             ntype = node.get("type") or (node.get("data") or {}).get("type") or "trigger"
             in_edges = incoming.get(node_id, [])
             is_start = ntype == "trigger" or not in_edges
             live_sources = [e["source"] for e in in_edges if edge_is_live(e)]
-            if not is_start and not live_sources:
-                continue  # pruned branch — skip silently
-
             inputs = (trigger_payload or {}) if is_start else assemble_inputs(
                 node_id, {s: outputs.get(s, {}) for s in live_sources}, in_edges)
-
-            try:
-                output, _ = await exec_node(node, inputs)
-            except Exception as e:
-                run_status = "failed"; run_error = str(e)[:500]
-                failed_label = (node.get("data") or {}).get("label") or ntype
-                failed_id = node_id
-                break
-
-            # Loop nodes fan their body sub-branch out per item, then continue via 'done'.
+            output, _ = await exec_node(node, inputs)
             if ntype == "loop":
                 items = output.get("items") if isinstance(output, dict) else []
-                results = await run_loop_body(node_id, items or [])
-                output = {**output, "results": results}
+                output = {**output, "results": await run_loop_body(node_id, items or [])}
                 branch_of[node_id] = "done"
-            elif "_branch" in output:
+            elif isinstance(output, dict) and "_branch" in output:
                 branch_of[node_id] = output["_branch"]
-
             outputs[node_id] = output
             executed.add(node_id)
-            if until_node and node_id == until_node:
-                break  # 'Execute step' — stop after the requested node
+
+        if not only_node:
+            skipped: set[str] = set()
+            pending = {nid for nid in _topo_order(list(nodes.values()), edges)
+                       if nid not in consumed and nid not in error_branch}
+
+            def _settled(nid):
+                return nid in executed or nid in consumed or nid in error_branch or nid in skipped
+
+            stop = False
+            while pending and not stop:
+                ready = [nid for nid in pending
+                         if all(_settled(e["source"]) for e in incoming.get(nid, []))]
+                if not ready:
+                    break  # remaining nodes are unreachable (cycle/disconnected) — leave them
+                wave = []
+                for nid in ready:
+                    node = nodes[nid]
+                    ntype = node.get("type") or (node.get("data") or {}).get("type") or "trigger"
+                    in_edges = incoming.get(nid, [])
+                    is_start = ntype == "trigger" or not in_edges
+                    if not is_start and not [e for e in in_edges if edge_is_live(e)]:
+                        skipped.add(nid); pending.discard(nid)   # pruned branch
+                    else:
+                        wave.append(nid)
+                if not wave:
+                    continue  # this round only pruned; re-evaluate readiness
+                results = await asyncio.gather(*[_run_one(nid) for nid in wave],
+                                               return_exceptions=True)
+                for nid, r in zip(wave, results):
+                    pending.discard(nid)
+                    if isinstance(r, asyncio.CancelledError):
+                        raise r
+                    if isinstance(r, Exception) and run_status != "failed":
+                        run_status = "failed"; run_error = str(r)[:500]
+                        failed_label = (nodes[nid].get("data") or {}).get("label") or nid
+                        failed_id = nid; stop = True
+                if until_node and until_node in executed:
+                    stop = True  # 'Execute step' — stop after the requested node ran
     except asyncio.CancelledError:
         # Stopped from the editor — finalise the run record then re-raise so the
         # awaiting request unwinds.

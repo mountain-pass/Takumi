@@ -614,8 +614,14 @@ function OrganisationFlow() {
         posRef.current[a.config.id] = pos
         const data = { config: a.config, providers: allProviders }
         const selected = a.config.id === selectedId
-        return ex ? { ...ex, position: pos, data, selected }
-                  : { id: a.config.id, type: 'agent', position: pos, data, selected }
+        // Seed measured dimensions so edges always have endpoints to draw from —
+        // RF v12 hides an edge whenever either node lacks `measured`, and the value
+        // can be momentarily absent when a node object is rebuilt (the race that made
+        // connections vanish). Real measurement overwrites this a frame later.
+        const measured = ex?.measured || { width: NODE_W, height: 96 }
+        return ex ? { ...ex, position: pos, data, selected, measured }
+                  : { id: a.config.id, type: 'agent', position: pos, data, selected,
+                      width: NODE_W, height: 96, measured }
       })
     })
   }, [agents, allProviders, selectedId])

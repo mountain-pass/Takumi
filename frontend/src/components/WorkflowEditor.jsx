@@ -99,6 +99,11 @@ const NODE_META = {
     { key: 'path', label: 'File path', type: 'filepath', pickMode: 'read', placeholder: '/tmp/input.json' },
     { key: 'parse_json', label: 'Parse content as JSON (adds a json field)', type: 'checkbox' },
   ] },
+  websearch: { label: 'Web Search', desc: 'Search the web in real time for fresh data', icon: Search, color: '#7c3aed', fields: [
+    { key: 'query', label: 'Search query (supports {{tokens}})', type: 'textarea', placeholder: 'latest AI chip news {{today}}' },
+    { key: 'max_results', label: 'Max results', type: 'number', placeholder: '5' },
+    { key: 'fetch_content', label: 'Fetch full page content of top results (higher accuracy)', type: 'checkbox' },
+  ] },
 }
 
 // Palette grouping (n8n-style categories).
@@ -108,7 +113,7 @@ const CATEGORIES = [
   { id: 'flow', label: 'Flow', kinds: ['if', 'switch', 'loop', 'merge', 'filter', 'stop_error'] },
   { id: 'transform', label: 'Data transformation', kinds: ['set', 'variable', 'datetime', 'code'] },
   { id: 'files', label: 'Files', kinds: ['read_file', 'write_file'] },
-  { id: 'ai', label: 'AI', kinds: ['llm'] },
+  { id: 'ai', label: 'AI', kinds: ['llm', 'websearch'] },
   { id: 'hitl', label: 'Human in the loop', hint: 'Coming soon', kinds: [], comingSoon: true },
 ]
 
@@ -241,17 +246,32 @@ function ComplianceBadge({ c }) {
 
 // Conversational workflow builder. Chats with the user, captures the business
 // objective first, then writes the AI-generated graph onto the canvas each turn.
-function AIAssistPanel({ objective, getGraph, onApply, onClose }) {
-  const [messages, setMessages] = useState([
-    { role: 'assistant', content: objective
-      ? `This flow's objective is: "${objective}". Tell me what you'd like to add or change and I'll update the workflow.`
-      : 'What is the main business objective for this flow — and why does it matter to your business? Tell me the outcome you\'re after, not the technical steps, so I can design the best workflow for it.' },
-  ])
+// Last-resort guard: never render a raw JSON blob in the chat. If a reply still
+// looks like the builder's {"reply":...,"graph":...} object, pull out the reply.
+function cleanReply(reply) {
+  const s = String(reply || '').trim()
+  if (!s) return '(no reply)'
+  if (s.startsWith('{') && /"reply"\s*:/.test(s)) {
+    const m = s.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+    if (m) return m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n')
+    return "I've updated the workflow. Tell me what else you'd like to change."
+  }
+  return s
+}
+
+function AIAssistPanel({ objective, getGraph, onApply, onClose, history, onHistory }) {
+  const [messages, setMessages] = useState(
+    (history && history.length) ? history : [
+      { role: 'assistant', content: objective
+        ? `This flow's objective is: "${objective}". Tell me what you'd like to add or change and I'll update the workflow.`
+        : 'What is the main business objective for this flow — and why does it matter to your business? Tell me the outcome you\'re after, not the technical steps, so I can design the best workflow for it.' },
+    ])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [obj, setObj] = useState(objective || '')
   const [error, setError] = useState('')
   const scrollRef = useRef(null)
+  const inputRef = useRef(null)
   useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight) }, [messages, busy])
 
   async function send() {
@@ -263,6 +283,7 @@ function AIAssistPanel({ objective, getGraph, onApply, onClose }) {
     const nextObj = obj || (isFirstUser ? text : '')
     const convo = [...messages, { role: 'user', content: text }]
     setMessages(convo); setInput(''); setBusy(true); setError(''); setObj(nextObj)
+    if (inputRef.current) inputRef.current.style.height = 'auto'
     try {
       const res = await fetch('/api/workflows/ai-build', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -273,7 +294,9 @@ function AIAssistPanel({ objective, getGraph, onApply, onClose }) {
       const finalObj = data.objective || nextObj
       setObj(finalObj)
       onApply(data.graph || getGraph(), finalObj)
-      setMessages(m => [...m, { role: 'assistant', content: data.reply || '(no reply)' }])
+      const next = [...convo, { role: 'assistant', content: cleanReply(data.reply) }]
+      setMessages(next)
+      onHistory && onHistory(next)
     } catch (e) { setError(String(e.message || e)) } finally { setBusy(false) }
   }
 
@@ -303,10 +326,11 @@ function AIAssistPanel({ objective, getGraph, onApply, onClose }) {
       </div>
       <div className="p-3 border-t border-gray-100">
         <div className="flex items-end gap-2">
-          <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
+          <textarea ref={inputRef} rows={1} value={input}
+            onChange={e => { setInput(e.target.value); const t = e.target; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 160) + 'px' }}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
             placeholder="Ask anything…"
-            className="flex-1 resize-none border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 max-h-32" />
+            className="flex-1 resize-none border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 overflow-y-auto" style={{ maxHeight: 160 }} />
           <button onClick={send} disabled={busy || !input.trim()}
             className="p-2 rounded-xl bg-indigo-600 text-white disabled:opacity-40 hover:bg-indigo-700"><ChevronRight size={18} /></button>
         </div>
@@ -350,7 +374,9 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
   const [showObjective, setShowObjective] = useState(false)
   const [showVersions, setShowVersions] = useState(false)
   const [improveBanner, setImproveBanner] = useState(null)
+  const [improveProgress, setImproveProgress] = useState(null)  // {step,total,label} while applying
   const [assistOpen, setAssistOpen] = useState(!!aiAssist)   // AI builder panel — on by default for AI-created flows
+  const [aiChat, setAiChat] = useState([])                   // persisted AI Assist conversation
 
   const renameNode = useCallback((id, label) => {
     setNodes(ns => ns.map(n => n.id === id ? { ...n, data: { ...n.data, label } } : n))
@@ -360,7 +386,7 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
     const wf = await getWorkflow(workflowId)
     if (!wf) return
     setName(wf.name); setStatus(wf.status); setRequireCompliance(!!wf.require_compliance)
-    setTriggerConfig(wf.trigger_config || {}); setObjective(wf.objective || '')
+    setTriggerConfig(wf.trigger_config || {}); setObjective(wf.objective || ''); setAiChat(wf.ai_chat || [])
     setNodes((wf.graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
     setEdges((wf.graph?.edges || []).map(e => ({
       ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
@@ -409,7 +435,9 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
 
   function addNode(kind) {
     const id = newId(kind)
-    const cfg = kind === 'switch' ? { rules: [{ condition: '', label: '' }] } : {}
+    const cfg = kind === 'switch' ? { rules: [{ condition: '', label: '' }] }
+      : kind === 'websearch' ? { fetch_content: true }
+      : {}
     // Drop the node at the center of whatever the user is currently viewing.
     let position = { x: 360, y: 160 }
     const pane = document.querySelector('.react-flow')
@@ -505,7 +533,20 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
 
   // Replace the canvas with an AI-generated graph (used by the AI Assist builder).
   function applyGraph(graph) {
-    setNodes((graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
+    // Reconcile in place: preserve each kept node's measured dimensions (and seed a
+    // default for new ones) so edges keep rendering. RF v12 hides an edge whenever an
+    // endpoint lacks `measured` — and rapid successive applyGraph calls during streaming
+    // would otherwise rebuild nodes bare and make every edge vanish.
+    setNodes(prev => {
+      const byId = new Map(prev.map(n => [n.id, n]))
+      return (graph?.nodes || []).map(n => {
+        const ex = byId.get(n.id)
+        const base = { ...n, type: n.type, data: { ...n.data, kind: n.type } }
+        const measured = ex?.measured || { width: 220, height: 80 }
+        return ex ? { ...ex, ...base, position: n.position || ex.position, measured }
+                  : { ...base, width: 220, height: 80, measured }
+      })
+    })
     setEdges((graph?.edges || []).map(e => ({
       ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
     })))
@@ -553,20 +594,47 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
     } finally { setImproving(false) }
   }
 
-  // Let the AI generate the improved graph and apply it to the canvas as a draft.
+  // Apply suggestions one at a time, streaming progress: the canvas updates live as
+  // the AI implements each suggestion, then a final review pass stitches it together.
   async function handleApplyImprove() {
     setImproving(true)
+    const total = improveResult?.suggestions?.length || 1
     try {
       await handleSave()
-      const res = await fetch(`/api/workflows/${workflowId}/improve/apply`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
-      const data = await res.json()
-      applyGraph(data.graph)
-      requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 }))
       setImproveResult(null)
-      setImproveBanner(data.summary || 'AI improvements applied as a draft.')
+      setImproveBanner(null)
+      setImproveProgress({ step: 0, total, label: 'Starting…' })
+      const res = await fetch(`/api/workflows/${workflowId}/improve/apply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suggestions: improveResult?.suggestions || [], analysis: improveResult?.analysis || '' }),
+      })
+      if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
+
+      const reader = res.body.getReader()
+      const dec = new TextDecoder()
+      let buf = '', lastError = ''
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2)
+          if (!line.startsWith('data:')) continue
+          let ev; try { ev = JSON.parse(line.slice(5).trim()) } catch { continue }
+          if (ev.graph) { applyGraph(ev.graph); requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 })) }
+          if (ev.type === 'step') setImproveProgress({ step: ev.index + 1, total: ev.total, label: ev.title })
+          else if (ev.type === 'review') setImproveProgress({ step: total, total, label: 'Reviewing & stitching the flow together…' })
+          else if (ev.type === 'verify') setImproveProgress({ step: total, total,
+            label: ev.ok ? '✓ Verified — flow is connected and wired'
+                         : `Verifying (attempt ${ev.attempt}/${ev.max}) — fixing ${ev.problems.length} issue(s)…` })
+          else if (ev.type === 'done') { setImproveProgress(null); setImproveBanner(ev.summary || 'AI improvements applied as a draft.') }
+          else if (ev.type === 'error') lastError = ev.message
+        }
+      }
+      if (lastError) { setImproveProgress(null); setImproveResult({ error: lastError, suggestions: [] }) }
     } catch (e) {
-      setImproveResult({ error: String(e.message || e), suggestions: [] })
+      setImproveProgress(null); setImproveResult({ error: String(e.message || e), suggestions: [] })
     } finally { setImproving(false) }
   }
 
@@ -733,7 +801,26 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
         </button>
       </div>
 
-      {improveBanner && (
+      {improveProgress && (
+        <div className="px-4 py-2.5 bg-violet-50 border-b border-violet-200 text-xs text-violet-800">
+          <div className="flex items-center gap-2">
+            <Loader2 size={14} className="shrink-0 animate-spin" />
+            <span className="flex-1 leading-relaxed truncate">
+              <b>AI is improving your flow…</b> step {Math.min(improveProgress.step, improveProgress.total)} of {improveProgress.total}
+              {improveProgress.label ? ` — ${improveProgress.label}` : ''}
+            </span>
+            <span className="shrink-0 tabular-nums font-medium">
+              {Math.round((Math.min(improveProgress.step, improveProgress.total) / Math.max(improveProgress.total, 1)) * 100)}%
+            </span>
+          </div>
+          <div className="mt-1.5 h-1.5 w-full rounded-full bg-violet-200 overflow-hidden">
+            <div className="h-full rounded-full bg-violet-600 transition-all duration-500 ease-out"
+              style={{ width: `${Math.round((Math.min(improveProgress.step, improveProgress.total) / Math.max(improveProgress.total, 1)) * 100)}%` }} />
+          </div>
+        </div>
+      )}
+
+      {improveBanner && !improveProgress && (
         <div className="flex items-start gap-2 px-4 py-2.5 bg-violet-50 border-b border-violet-200 text-xs text-violet-800">
           <Sparkles size={14} className="shrink-0 mt-0.5" />
           <span className="flex-1 leading-relaxed"><b>AI draft applied:</b> {improveBanner}</span>
@@ -772,6 +859,8 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
           <AIAssistPanel
             objective={objective}
             getGraph={buildGraph}
+            history={aiChat}
+            onHistory={(msgs) => { setAiChat(msgs); if (workflowId) saveWorkflow(workflowId, { ai_chat: msgs }) }}
             onApply={(graph, obj) => { applyGraph(graph); if (obj) setObjective(obj); requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 })) }}
             onClose={() => setAssistOpen(false)}
           />
@@ -1029,11 +1118,33 @@ function WorkflowDocs({ onClose }) {
           <Section title="Using data from previous nodes">
             <p>In the node detail view, the <b>Input</b> pane (left) lists every upstream node's output. <b>Drag a field</b> into a parameter box, or click it, to insert a reference like <Code>{'{{HTTP Request.body.id}}'}</Code>. Tokens resolve at run time and work by node name.</p>
           </Section>
+          <Section title="Built-in variables">
+            <p>These are always available in any <Code>{'{{token}}'}</Code> field — no upstream node needed (great for filenames, timestamps, etc.):</p>
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[12px]">
+              {[
+                ['{{today}}', 'Date — 2026-06-28'],
+                ['{{now}}', 'Date & time (ISO)'],
+                ['{{time}}', 'Time — 08:00:00'],
+                ['{{timestamp}}', 'Unix seconds'],
+                ['{{year}} {{month}} {{day}}', 'Date parts'],
+                ['{{weekday}}', 'e.g. Monday'],
+                ['{{workflow.name}}', "This workflow's name"],
+                ['{{workflow.id}}', "This workflow's id"],
+                ['{{run.id}}', 'Current execution id'],
+                ['{{run.mode}}', 'test or live'],
+              ].map(([t, d]) => (
+                <div key={t} className="flex items-baseline gap-2">
+                  <Code>{t}</Code><span className="text-gray-400">{d}</span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-2 text-gray-400">Tip: <Code>tech_news_{'{{today}}'}.txt</Code> → <Code>tech_news_2026-06-28.txt</Code>. (They're also reachable as <Code>{'{{$vars.today}}'}</Code>.)</p>
+          </Section>
           <Section title="Code node">
             <p>Choose <b>Python</b> or <b>JavaScript</b>. <Code>input</Code> is the incoming data, <Code>context</Code> holds every node's output. Produce a result with <Code>return {'{...}'}</Code> (or set <Code>output</Code>). Dragged <Code>{'{{tokens}}'}</Code> are replaced with literal values before running. Use <b>Format</b> to tidy the code.</p>
           </Section>
           <Section title="AI / Agent node & compliance">
-            <p>The AI node runs a prompt through an org agent — optionally overriding the provider & model. If <b>Require compliance review</b> is on, the org's Risk & Compliance agent assesses the output; with no such agent the step is flagged <b>unchecked</b> but still runs.</p>
+            <p>The AI node is a <b>self-contained agent</b>: give it a provider, model, system prompt and task. It has every tool (web search, browser, files, shell, MCP), loops to gather accurate data, and self-evaluates before answering. If <b>Compliance review</b> is on (the chip on the canvas), the org's Risk & Compliance agent must clear the output before it flows on — a block, <i>or having no compliance agent set up</i>, fails the step.</p>
           </Section>
           <Section title="Error handling">
             <p>Add an <b>Error Trigger</b> node (Add Trigger group). It sits outside the normal flow and runs only when any node fails, receiving <Code>{'{{Error Trigger.error}}'}</Code> so you can notify, log, or recover.</p>
@@ -1100,6 +1211,10 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
   const ordered = orderIds.map(id => ({ node: byId[id], step: steps[id] })).filter(x => x.node && x.step)
   // Total AI tokens for this run (only LLM nodes contribute; 0 when none involved).
   const runTokens = ordered.reduce((t, { step }) => t + (step.input_tokens || 0) + (step.output_tokens || 0), 0)
+  // Compliance review cards — LLM steps that were actually assessed (not 'off'/'skipped').
+  const complianceItems = ordered
+    .filter(({ step }) => step.compliance && !['skipped'].includes(step.compliance.status))
+    .map(({ node, step }) => ({ node, c: step.compliance }))
   return (
     <div className="flex-1 flex min-h-0">
       <aside className="w-72 border-r border-gray-100 overflow-y-auto shrink-0">
@@ -1159,7 +1274,101 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
           </div>
         )}
       </main>
+      {selId && complianceItems.length > 0 && <ComplianceReviewPanel items={complianceItems} />}
     </div>
+  )
+}
+
+// ── Compliance review panel (Executions tab) ──────────────────────────────────
+const RISK_LEVEL_STYLE = {
+  low:      { dot: 'bg-green-500',  text: 'text-green-700',  bg: 'bg-green-50 border-green-200' },
+  medium:   { dot: 'bg-amber-500',  text: 'text-amber-700',  bg: 'bg-amber-50 border-amber-200' },
+  high:     { dot: 'bg-orange-500', text: 'text-orange-700', bg: 'bg-orange-50 border-orange-200' },
+  critical: { dot: 'bg-red-500',    text: 'text-red-700',    bg: 'bg-red-50 border-red-200' },
+}
+
+function ComplianceReviewPanel({ items }) {
+  return (
+    <aside className="w-[380px] border-l border-gray-100 overflow-y-auto shrink-0 bg-gray-50/50">
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 bg-white">
+        <ShieldCheck size={15} className="text-indigo-600" />
+        <div>
+          <div className="text-sm font-semibold text-gray-800">Compliance review</div>
+          <div className="text-[11px] text-gray-400">How Risk &amp; Compliance scored each AI output</div>
+        </div>
+      </div>
+
+      <div className="p-3 space-y-3">
+        {items.map(({ node, c }) => {
+          const lvl = (c.level || '').toLowerCase()
+          const st = RISK_LEVEL_STYLE[lvl] || RISK_LEVEL_STYLE.medium
+          const blocked = c.status === 'blocked'
+          const cats = Object.entries(c.categories || {}).filter(([, v]) => v && (v.score || v.note))
+          return (
+            <div key={node.id} className={`rounded-xl border ${st.bg} p-3 space-y-2.5`}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[13px] font-semibold text-gray-800 truncate">{node.data.label}</span>
+                <span className={`shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold ${st.text}`}>
+                  <span className={`w-2 h-2 rounded-full ${st.dot}`} /> {(c.level || 'n/a').toUpperCase()}
+                </span>
+              </div>
+
+              {c.status === 'unchecked' ? (
+                <p className="text-xs text-amber-700">No Risk &amp; Compliance agent is set up, so this output
+                  could not be reviewed. Add one in Risk &amp; Compliance.</p>
+              ) : c.status === 'error' ? (
+                <p className="text-xs text-gray-500">Review error: {c.reason}</p>
+              ) : (
+                <>
+                  <div className="flex items-center gap-3 text-xs">
+                    <span className={`font-semibold px-2 py-0.5 rounded-full ${blocked ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+                      {blocked ? 'Blocked' : 'Cleared'}
+                    </span>
+                    <span className="text-gray-600">
+                      Risk score <b className="text-gray-800">{c.score ?? '—'}</b>
+                      {c.threshold != null && <span className="text-gray-400"> / block at {c.threshold}</span>}
+                    </span>
+                  </div>
+
+                  {c.rationale && (
+                    <div>
+                      <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-0.5">Why</div>
+                      <p className="text-xs text-gray-700 leading-relaxed">{c.rationale}</p>
+                    </div>
+                  )}
+
+                  {cats.length > 0 && (
+                    <div>
+                      <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Risk breakdown</div>
+                      <div className="space-y-1">
+                        {cats.map(([name, v]) => (
+                          <div key={name} className="flex items-start gap-2 text-[11px]">
+                            <span className="capitalize font-medium text-gray-700 w-20 shrink-0">{name}</span>
+                            <span className="text-gray-400 shrink-0">L{v.likelihood}×C{v.consequence}={v.score}</span>
+                            {v.note && <span className="text-gray-500 flex-1">{v.note}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {(c.findings || []).length > 0 && (
+                    <p className="text-[11px] text-red-600">⚠ {c.findings.length} sensitive value(s) detected in output.</p>
+                  )}
+
+                  {c.reviewer && <p className="text-[10px] text-gray-400">Reviewed by {c.reviewer}</p>}
+                </>
+              )}
+            </div>
+          )
+        })}
+
+        <p className="text-[10px] text-gray-400 leading-relaxed px-1 pt-1">
+          Coming soon: when an output exceeds the risk level, the compliance agent will hand it back to the
+          AI agent with its findings to revise — a self-improving review loop.
+        </p>
+      </div>
+    </aside>
   )
 }
 
@@ -1452,28 +1661,28 @@ function LlmConfig({ config, agents, onChange, onFocusField, dragActive, dropTok
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
   return (
     <>
-      <div>
-        <label className="block text-[11px] font-medium text-gray-500 mb-1">Agent (identity & compliance)</label>
-        <select value={config.agent_id || ''} onChange={e => onChange('agent_id', e.target.value)} className={base}>
-          <option value="">Auto (first non-manager)</option>
-          {(agents || []).map(a => <option key={a.config.id} value={a.config.id}>{a.config.name}</option>)}
-        </select>
+      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-indigo-50/60 border border-indigo-100">
+        <Sparkles size={14} className="text-indigo-500 shrink-0 mt-0.5" />
+        <p className="text-[11px] text-indigo-700/90 leading-relaxed">
+          This is a self-contained AI agent: it has <b>every tool</b> (web search, browser, files, shell, MCP) and
+          loops to gather accurate data before answering. Just give it a provider, model, and the task.
+        </p>
       </div>
       <div>
-        <label className="block text-[11px] font-medium text-gray-500 mb-1">Provider (override)</label>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Provider</label>
         <select value={config.api_provider_id || ''} onChange={e => { onChange('api_provider_id', e.target.value); onChange('model', '') }} className={base}>
-          <option value="">Use the agent's provider</option>
+          <option value="">Default provider</option>
           {(providers || []).map(p => <option key={p.id} value={p.id}>{p.name} ({p.provider})</option>)}
         </select>
       </div>
       <div>
         <label className="block text-[11px] font-medium text-gray-500 mb-1">Model</label>
         <ModelSelect value={config.model || ''} models={models} onChange={v => onChange('model', v)}
-          placeholder={config.api_provider_id ? 'Select or type a model' : "Agent's default model"} />
+          placeholder={config.api_provider_id ? 'Select or type a model' : 'Default model'} />
       </div>
-      <Field label="System prompt" type="textarea" value={config.system || ''} placeholder="You are a helpful assistant…" onChange={v => onChange('system', v)} onFocus={() => onFocusField && onFocusField('system')} dragActive={dragActive} onDropToken={dropToken && dropToken('system')} />
-      <Field label="Prompt (templates: {{nodeId.field}})" type="textarea" value={config.prompt || ''} onChange={v => onChange('prompt', v)} onFocus={() => onFocusField && onFocusField('prompt')} dragActive={dragActive} onDropToken={dropToken && dropToken('prompt')} />
-      <Field label="Max tokens" type="number" value={config.max_tokens ?? ''} onChange={v => onChange('max_tokens', v)} />
+      <Field label="System prompt (the agent's role & rules)" type="textarea" value={config.system || ''} placeholder="You are a financial news research analyst…" onChange={v => onChange('system', v)} onFocus={() => onFocusField && onFocusField('system')} dragActive={dragActive} onDropToken={dropToken && dropToken('system')} />
+      <Field label="Prompt — the task (templates: {{nodeId.field}})" type="textarea" value={config.prompt || ''} onChange={v => onChange('prompt', v)} onFocus={() => onFocusField && onFocusField('prompt')} dragActive={dragActive} onDropToken={dropToken && dropToken('prompt')} />
+      <Field label="Max tool-call rounds" type="number" value={config.max_iterations ?? ''} placeholder="12" onChange={v => onChange('max_iterations', v)} />
     </>
   )
 }

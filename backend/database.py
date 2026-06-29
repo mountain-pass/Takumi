@@ -330,6 +330,8 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agent_tasks ADD COLUMN watchdog_flags TEXT NOT NULL DEFAULT '{}'",
         # Workflow objective (AI-assist builder captures it; used to evaluate runs).
         "ALTER TABLE workflows ADD COLUMN objective TEXT NOT NULL DEFAULT ''",
+        # AI Assist chat history (so users can revisit the conversation that built the flow).
+        "ALTER TABLE workflows ADD COLUMN ai_chat TEXT NOT NULL DEFAULT '[]'",
         # Token usage per step (only AI Agent/LLM nodes populate these).
         "ALTER TABLE workflow_run_steps ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_run_steps ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
@@ -1391,18 +1393,22 @@ def _wf_row(row) -> dict:
             d[k] = json.loads(d.get(k) or ("{}" if k == "trigger_config" else '{"nodes":[],"edges":[]}'))
         except Exception:
             d[k] = {} if k == "trigger_config" else {"nodes": [], "edges": []}
+    try:
+        d["ai_chat"] = json.loads(d.get("ai_chat") or "[]")
+    except Exception:
+        d["ai_chat"] = []
     return d
 
 
 async def create_workflow(wf: dict) -> dict:
     await _conn().execute(
         "INSERT INTO workflows(id, name, description, graph, status, require_compliance, "
-        "trigger_type, trigger_config, objective) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "trigger_type, trigger_config, objective, ai_chat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (wf["id"], wf.get("name", "Untitled workflow"), wf.get("description", ""),
          json.dumps(wf.get("graph", {"nodes": [], "edges": []})), wf.get("status", "draft"),
          1 if wf.get("require_compliance", True) else 0,
          wf.get("trigger_type", "manual"), json.dumps(wf.get("trigger_config", {})),
-         wf.get("objective", "")),
+         wf.get("objective", ""), json.dumps(wf.get("ai_chat", []))),
     )
     await _conn().commit()
     await _ensure_initial_version(wf["id"])   # seed version 1 (active)
@@ -1436,6 +1442,8 @@ async def update_workflow(wf_id: str, updates: dict) -> dict | None:
         fields.append("graph = ?"); values.append(json.dumps(updates["graph"]))
     if "trigger_config" in updates and updates["trigger_config"] is not None:
         fields.append("trigger_config = ?"); values.append(json.dumps(updates["trigger_config"]))
+    if "ai_chat" in updates and updates["ai_chat"] is not None:
+        fields.append("ai_chat = ?"); values.append(json.dumps(updates["ai_chat"]))
     fields.append("updated_at = datetime('now')")
     values.append(wf_id)
     await _conn().execute(f"UPDATE workflows SET {', '.join(fields)} WHERE id = ?", values)

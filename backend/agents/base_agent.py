@@ -309,7 +309,8 @@ class BaseAgent:
 
     # ── Work execution (internal tool loop) ─────────────────────────────────
 
-    async def _do_work_with_tools(self, task_content: str, max_rounds: int | None = None) -> LLMResponse:
+    async def _do_work_with_tools(self, task_content: str, max_rounds: int | None = None,
+                                  *, system_extra: str = "", messages: list | None = None) -> LLMResponse:
         """Execute work using tools. All tool calls happen INTERNALLY.
         Only the final synthesized result is returned.
 
@@ -318,8 +319,14 @@ class BaseAgent:
 
         Honours the agent's autonomy boundaries: max_iterations (tool-call cycles)
         and token_budget (hard per-task token cap).
+
+        `system_extra` appends task-specific instructions to the system prompt
+        (used by the workflow LLM node). `messages` overrides the starting context
+        (so a workflow run is isolated from the agent's chat memory).
         """
         system = await self._build_system_prompt()
+        if system_extra:
+            system += "\n\n## Task-specific instructions (follow these exactly)\n" + system_extra
         total_input = 0
         total_output = 0
 
@@ -341,7 +348,7 @@ class BaseAgent:
 
         # Start with the agent's existing conversation context
         # (includes prior messages for context) but tool rounds go into work_messages
-        work_messages = list(self._conversation[-self.config.max_context_messages:])
+        work_messages = list(messages) if messages is not None else list(self._conversation[-self.config.max_context_messages:])
         tools_used = 0
         confused_nudges = 0
         # Enforced (not LLM-discretionary) verification: an agent that HAS web_search

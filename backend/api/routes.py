@@ -380,6 +380,21 @@ async def save_org(req: OrgRequest):
     return runtime_settings.get()
 
 
+async def _assist_llm():
+    """Adapter + model for the workflow AI helpers (AI Assist builder, Improve flow,
+    Apply with AI). Uses the platform's configured LLM — the same model the Manager
+    uses — set on the System Settings page."""
+    from ..llm_adapters.factory import get_adapter
+    from ..config import get_settings
+    rt = runtime_settings.get()
+    provider_str = rt.get("llm_provider")
+    if not provider_str:
+        raise HTTPException(400, "No LLM configured. Complete setup first.")
+    adapter = get_adapter(LLMProvider(provider_str), get_settings(), rt)
+    model = rt.get("llm_model") or _default_model(provider_str)
+    return adapter, model
+
+
 class HeartbeatRequest(BaseModel):
     seconds: int
 
@@ -1798,6 +1813,7 @@ class WorkflowReq(BaseModel):
     trigger_type: str | None = None
     trigger_config: dict | None = None
     objective: str | None = None
+    ai_chat: list | None = None
 
 
 @router.get("/workflows")
@@ -1834,23 +1850,37 @@ class WorkflowAIBuildReq(BaseModel):
 
 
 _AI_BUILD_SYSTEM = """You are an automation **workflow builder** (like n8n's AI assistant). \
-You design a workflow WITH the user through conversation, and you emit the workflow graph as JSON.
+You BUILD and UPDATE the actual workflow as you talk — you are not just an interviewer. Every turn \
+you return the full, updated workflow graph that reflects the conversation so far.
 
-Hard rules:
-- The FIRST thing to establish is the business objective AND the reason behind it. The user's first \
-message answers "What is the main business objective for this flow, and why does it matter?". Capture \
-the objective as `objective` and make sure you understand the WHY (the business outcome/motivation).
-- If their answer is a purely technical solution (e.g. "call this API then write a file") with no \
-business reason, ask a follow-up: WHY do they want this / what outcome are they really after — before \
-building. Use that reason to design a better workflow than a literal technical spec.
-- Then ask SHORT clarifying questions, ONE topic at a time, and incrementally build the graph as you learn more.
-- Keep `reply` conversational and brief (1-3 sentences). Never dump JSON into `reply`.
-- Always keep the existing node with id "trigger" as the entry point.
+How to work:
+- The user's first message is the business objective + why it matters. Capture it as `objective` and \
+understand the WHY. If they gave only a technical spec with no reason, ask once for the outcome.
+- As SOON as you have the objective, BUILD a complete first-draft workflow that achieves it — don't \
+wait for lots of clarification. Add every node the outcome needs (trigger → steps → output) and \
+**fully configure each node** (e.g. http needs method+url; write_file needs path+content; llm needs \
+system+prompt; if/filter need a condition). Use sensible defaults and {{tokens}} to wire data between \
+nodes ({{Node Label.field}}); state any assumptions in `reply`.
+- Each following turn, actually CHANGE the graph to match what the user asks — add/remove/rewire/reconfigure \
+nodes. Never reply with only a question when you could also improve the graph. Ask a question ONLY when \
+you genuinely cannot proceed, and even then build your best guess first.
+- Keep `reply` short (1-3 sentences) describing what you just built/changed and what they can tweak. \
+Never put JSON in `reply`. Always keep the node with id "trigger" as the entry point.
+"""
 
+
+# Shared graph reference (node catalogue + shape + quality bar) — used by both the
+# conversational builder and the "Apply improvements" route so both know what nodes
+# exist and how to wire/configure them.
+_GRAPH_SPEC = """
 Available node `type` values:
-- trigger (entry), http (API call: config.method, config.url), code (config.language js|python, config.code),
+- trigger (entry), http (config.method, config.url, config.body), code (config.language js|python, config.code),
 - set (edit fields), if (config.condition, config.lang), switch (config.rules), loop (config.items_field),
-- merge, filter (config.condition), llm (AI agent: config.prompt, config.system, config.agent_id),
+- merge, filter (config.condition), llm (a full-tool AI agent — config.system = its role, config.prompt = the task;
+  it can already web-search/browse/use files, so just describe what it should produce),
+- websearch (REAL-TIME web search — config.query, config.max_results; output `.results` is live result text.
+  Prefer this when the flow needs CURRENT data: place it BEFORE an llm node and feed {{<id>.results}} into the
+  llm prompt so the agent works from fresh facts, not stale memory),
 - respond (config.body), wait (config.seconds), datetime, variable (config.name, config.value),
 - read_file (config.path), write_file (config.path, config.content), stop_error, noop, subworkflow.
 
@@ -1858,7 +1888,76 @@ Graph JSON shape (return the FULL graph every time, never a diff):
 {"nodes":[{"id":"<unique>","type":"<type>","position":{"x":N,"y":N},"data":{"label":"Human label","kind":"<type>","config":{...}}}],
  "edges":[{"id":"e-a-b","source":"<id>","target":"<id>","sourceHandle":"true|false|0|loop|done"(optional)}]}
 Layout left→right: x starts at 80, +240 per step; y around 160; offset branches by ±130 in y.
+When you ADD a node, also ADD the edge(s) that wire it into the flow (rewire neighbours so it sits in the
+right place) — a new node with no edges does nothing. Give new nodes fresh unique ids.
 
+=== DATA WIRING CONTRACT (this is NOT n8n — read carefully) ===
+This platform passes data between nodes with double-brace tokens. A node reads an UPSTREAM node's output
+field with EXACTLY this syntax: {{<sourceNodeId>.<field>}}  — e.g. {{llm_research.text}} or {{web1.results}}.
+Use the source node's `id` (not its label), and reference a field that node ACTUALLY outputs (listed below).
+Edges control execution order; tokens control data flow — you must set BOTH. An edge with no matching token
+in the target's config means the target ignores the upstream data (a broken flow); a token pointing at a
+node id or field that doesn't exist resolves to empty (also broken). When you insert a node B between A and C,
+you MUST (1) rewire edges A→B and B→C, AND (2) update C's config tokens to read from B instead of A.
+
+Each node type's OUTPUT fields you may reference in {{id.field}}:
+- trigger: the trigger payload (use {{trigger.<key>}} for posted fields)
+- websearch: .results (text), .query, .ok          - http: .body, .status, .headers, .ok
+- llm: .text  (ONLY .text — never .output/.result)  - code: whatever the code returns (e.g. {{code1.html}}); default {{code1.result}}
+- set: the fields you defined on it                 - datetime: .datetime
+- read_file: .content, .path, .bytes                - write_file: .path, .bytes, .ok
+- variable: .value, .name                           - merge: .items, .count
+Built-in tokens (no node needed): {{today}}, {{now}}, {{trigger.date}} style date helpers.
+
+USE REAL NODE IDS: a token must reference a node `id` that ALREADY EXISTS in the graph JSON you were given
+(or one you add in this same response). The ids in any example here (web1, ai1, …) are ILLUSTRATIVE — never
+copy them literally; look up the real id of the node you mean in the current graph and use that.
+
+CODE NODES — how to read upstream data (this is where flows break most):
+- A {{id.field}} token in a code node is replaced with a COMPLETE LITERAL value (a Python value via repr,
+  or a JSON value for JS) BEFORE the code runs. So you must NOT wrap it in your own quotes.
+  CORRECT (python):   r1 = {{web1.results}}            # becomes  r1 = 'the results text...'
+  WRONG (breaks):     r1 = \"\"\"{{web1.results}}\"\"\"   # the value's own quotes/newlines break the string
+- Alternatively, read the single upstream output via the `input` variable (e.g. input['results']). For a
+  code node with MULTIPLE upstream nodes, prefer {{<id>.field}} tokens (one per source) because `input`
+  shallow-merges them and same-named fields collide.
+- Every {{id}} you write in code must be a real upstream node id. If you add two websearch nodes, give them
+  clear distinct ids and reference those exact ids — do not invent web1/web2 unless those are the real ids.
+- Code runs in a RESTRICTED sandbox. Python may only use these stdlib modules (import them or use directly):
+  datetime, math, re, json, random, statistics, textwrap, collections, itertools, functools, time, string,
+  decimal, uuid, base64, hashlib. NO os / sys / subprocess / network / file access in a code node. For the
+  current date prefer the built-in {{today}} token over importing datetime.
+
+Worked example — websearch → llm → write_file (replace ids with the REAL ones in your graph):
+  llm.config.prompt: "Summarise these results into HTML:\\n{{<websearch id>.results}}"
+  write_file.config.content: "{{<llm id>.text}}"   and   path: "/reports/market_{{today}}.html"
+Every token in the graph you return must point at an existing node id + a real field above. Self-check this.
+
+QUALITY BAR — you are a senior automation engineer, not a hobbyist. Sloppy configs are unacceptable:
+- LLM/AI nodes: `config.system` is a real role + rules (2-4 sentences: who it is, what good output looks \
+like, constraints). `config.prompt` is a specific, self-contained task that names the EXACT output format \
+required (e.g. "Return a clean Markdown report with a # title, ## sections and bullet points. Output ONLY \
+the report text — no JSON, no preamble, no code fences."). Never write one-line vague prompts like \
+"summarise the news".
+- FORMAT IS A CONTRACT: when the user asks for a specific output format (HTML, CSV, JSON, XML, Markdown, \
+plain text), the `config.prompt` MUST spell it out verbatim and end with an explicit anti-wrapper clause: \
+"Output ONLY raw <format> — start at the very first character of the document (e.g. <!DOCTYPE html> for \
+HTML), no ``` code fences, no backticks, no language tag, no explanation before or after." Mirror the exact \
+format the user named; never silently downgrade to JSON or Markdown.
+- Wiring an LLM node into write_file / respond / email: map ONLY its text field — `{{<llmNodeId>.text}}`. \
+NEVER map the whole node ({{nodeId}}) and NEVER invent fields like `.output`/`.result` on an LLM node; \
+its only output field is `.text`. Reference nodes by their `id`, not their label, in tokens.
+- write_file producing a human document: `config.content` must be `{{<llmNodeId>.text}}` (or other plain \
+text), never the raw upstream object — the file must be the finished, formatted document, not JSON.
+- Give every node a clear human `data.label`; keep ids short and stable (don't rename a node's id between \
+turns or you break existing wiring).
+- Self-check before responding: would a careful engineer ship this? Is every config field filled with \
+something specific (no placeholders), every token pointing at a field that exists, and every output that \
+reaches a file/message a finished artefact rather than a data dump? Fix it before you reply.
+"""
+
+
+_AI_BUILD_SYSTEM = _AI_BUILD_SYSTEM + _GRAPH_SPEC + """
 Respond with ONLY a JSON object (no markdown fences, no prose outside it):
 {"reply":"<chat message>","objective":"<captured objective or empty>","graph":<full graph>,"done":<true when complete & user is happy>}
 """
@@ -1882,7 +1981,10 @@ def _extract_json(text: str) -> dict:
     a, b = s.find("{"), s.rfind("}")
     if a == -1 or b == -1:
         raise ValueError("no JSON object found")
-    return _json.loads(s[a:b + 1])
+    chunk = s[a:b + 1]
+    # strict=False tolerates the literal newlines/tabs models leave inside string
+    # values (prompt text especially) — the most common cause of parse failures.
+    return _json.loads(chunk, strict=False)
 
 
 def _salvage_improve(raw: str) -> dict:
@@ -1905,11 +2007,6 @@ async def workflow_ai_build_route(req: WorkflowAIBuildReq):
     from ..llm_adapters.factory import get_adapter
     from ..config import get_settings
 
-    rt = runtime_settings.get()
-    provider_str = rt.get("llm_provider", "")
-    if not provider_str:
-        raise HTTPException(400, "No LLM configured. Complete setup first.")
-
     graph = req.graph or {"nodes": [], "edges": []}
     system = (_AI_BUILD_SYSTEM
               + f"\n\nCurrent objective: {req.objective or '(none yet)'}"
@@ -1920,26 +2017,48 @@ async def workflow_ai_build_route(req: WorkflowAIBuildReq):
         msgs = [{"role": "user", "content": "Let's start."}]
 
     try:
-        provider = LLMProvider(provider_str)
-        adapter = get_adapter(provider, get_settings(), rt)
-        model = rt.get("llm_model") or _default_model(provider_str)
+        adapter, model = await _assist_llm()
         resp = await adapter.complete(system_prompt=system, messages=msgs, model=model,
-                                      max_tokens=2200, temperature=0.4)
+                                      max_tokens=8000, temperature=0.4)
     except Exception as e:
         raise HTTPException(500, str(e))
 
     try:
         data = _extract_json(resp.content)
+        objective = (data.get("objective") or req.objective or "").strip()
+        g = data.get("graph") if isinstance(data.get("graph"), dict) else graph
+        reply = str(data.get("reply", "")).strip()
+        # Physically verify the freshly-built graph and auto-fix bad wiring (orphans,
+        # broken {{token}} ids) before returning it to the canvas.
+        g, problems, fixes = await _verify_and_fix_graph(adapter, model, objective or "(not set)", g)
+        if problems:
+            reply += (f"\n\n⚠ Heads up: {len(problems)} wiring issue(s) remain (e.g. {problems[0]}). "
+                      "Worth a look before running.")
+        return {"reply": reply, "objective": objective, "graph": g, "done": bool(data.get("done"))}
     except Exception:
-        # Model didn't return JSON — treat the whole thing as a chat reply, keep graph.
-        return {"reply": resp.content.strip(), "objective": req.objective or "", "graph": graph, "done": False}
+        # Malformed/truncated JSON (big graphs can get cut off): salvage just the
+        # readable reply so raw JSON never leaks into the chat, and keep the last
+        # good graph since the new one can't be trusted.
+        return _salvage_ai_build(resp.content, graph, req.objective or "")
 
-    return {
-        "reply": str(data.get("reply", "")).strip(),
-        "objective": (data.get("objective") or req.objective or "").strip(),
-        "graph": data.get("graph") if isinstance(data.get("graph"), dict) else graph,
-        "done": bool(data.get("done")),
-    }
+
+def _salvage_ai_build(raw: str, graph: dict, objective: str) -> dict:
+    s = _clean_fences(raw)
+    rm = re.search(r'"reply"\s*:\s*"(.*?)("\s*,\s*"(?:objective|graph|done)"|"\s*\}|$)', s, re.S)
+    reply = (rm.group(1) if rm else s).replace('\\"', '"').replace('\\n', '\n').strip()
+    # If we still couldn't isolate a reply (no "reply" key at all), don't echo raw JSON.
+    if not rm and (reply.startswith("{") or '"graph"' in reply):
+        reply = "I've updated the workflow. Tell me what else you'd like to change."
+    om = re.search(r'"objective"\s*:\s*"(.*?)"\s*,', s, re.S)
+    obj = om.group(1).replace('\\"', '"') if om else objective
+    g = graph
+    gm = re.search(r'"graph"\s*:\s*(\{.*\})\s*(?:,\s*"done"|\}\s*$)', s, re.S)
+    if gm:
+        try:
+            g = _json.loads(gm.group(1))
+        except Exception:
+            pass
+    return {"reply": reply, "objective": (obj or "").strip(), "graph": g if isinstance(g, dict) else graph, "done": False}
 
 
 def _runs_digest(runs: list[dict]) -> tuple[str, int]:
@@ -1995,12 +2114,10 @@ async def workflow_improve_route(wf_id: str):
            "This workflow has no AI/LLM nodes, so there are no token costs to optimise.\n")
     )
     try:
-        provider = LLMProvider(rt["llm_provider"])
-        adapter = get_adapter(provider, get_settings(), rt)
-        model = rt.get("llm_model") or _default_model(rt["llm_provider"])
+        adapter, model = await _assist_llm()
         resp = await adapter.complete(system_prompt=_IMPROVE_SYSTEM,
                                       messages=[{"role": "user", "content": user_msg}],
-                                      model=model, max_tokens=2000, temperature=0.3)
+                                      model=model, max_tokens=8000, temperature=0.3)
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -2013,49 +2130,303 @@ async def workflow_improve_route(wf_id: str):
     return data
 
 
-_IMPROVE_APPLY_SYSTEM = """You are a workflow optimisation engineer. Given a workflow's BUSINESS \
-OBJECTIVE, its current node graph, and recent execution history, produce an IMPROVED version of the \
-graph that better achieves the objective: fix broken token references, remove dead/disconnected nodes, \
-reduce AI tokens, and simplify — without breaking the objective. Always keep the node with id "trigger". \
-Preserve node ids for nodes you keep. Use the same graph JSON shape as the input.
+_IMPROVE_APPLY_SYSTEM = """You are a senior workflow automation engineer. You get a workflow's BUSINESS \
+OBJECTIVE, its current node graph, recent execution history, and a list of APPROVED improvement suggestions. \
+IMPLEMENT every feasible suggestion by returning a small list of EDIT OPERATIONS against the current graph — \
+do NOT rewrite the whole graph. Output ONLY what changes; untouched nodes are left exactly as they are.
 
+If a suggestion says "add a web search node" → add_node a websearch node + add_edge to wire it in (and \
+rewire the node that used to feed the next step). "strip code fences" → add_node a code node and route the \
+upstream output through it. "split the LLM step" → add_node a second llm node and rewire. Always keep node \
+id "trigger". Give brand-new nodes fresh unique ids.
+""" + _GRAPH_SPEC + """
+Return ONLY a JSON object (no markdown fences) with this shape:
+{"summary":"<which suggestions you applied + key changes>",
+ "ops":[
+   {"op":"add_node","node":{"id":"<new id>","type":"<type>","position":{"x":N,"y":N},"data":{"label":"...","kind":"<type>","config":{...}}}},
+   {"op":"update_node","id":"<existing id>","config":{<keys to set/merge>},"label":"<optional new label>"},
+   {"op":"remove_node","id":"<id>"},
+   {"op":"add_edge","source":"<id>","target":"<id>","sourceHandle":"<optional>"},
+   {"op":"remove_edge","source":"<id>","target":"<id>"}
+ ]}
+Only include ops for things that change. When you add or remove a node, also add/remove the edges so the \
+flow stays connected end to end.
+
+CRITICAL — keep the output SMALL: never paste large templates, full HTML pages or long CSS into an op. \
+If a suggestion implies a big template, instead add a compact node (e.g. a code node that strips fences, \
+or an llm node whose PROMPT describes the desired format) — describe the intent in a sentence, don't inline \
+hundreds of lines. Keep the whole response well under the token limit and finish the JSON."""
+
+
+def _salvage_ops(raw: str) -> list:
+    """Recover the ops list when the overall JSON is malformed — usually one op carries
+    a big HTML/code blob with unescaped quotes. Parse each balanced {...} object inside
+    the `ops` array independently and keep the valid ones, dropping the broken one."""
+    s = _clean_fences(raw)
+    i = s.find('"ops"')
+    if i == -1:
+        return []
+    start = s.find("[", i)
+    if start == -1:
+        return []
+    ops, depth, j, obj_start = [], 0, start + 1, None
+    while j < len(s):
+        c = s[j]
+        if c == "{":
+            if depth == 0:
+                obj_start = j
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                try:
+                    ops.append(_json.loads(s[obj_start:j + 1]))
+                except Exception:
+                    pass
+                obj_start = None
+        elif c == "]" and depth == 0:
+            break
+        j += 1
+    return ops
+
+
+def _apply_ops(graph: dict, ops: list) -> tuple[dict, list[str]]:
+    """Apply edit operations to a deep copy of the graph. Returns (new_graph, applied
+    descriptions). Untouched node configs are preserved byte-for-byte — the model never
+    re-emits them, which is what makes this reliable for graphs with large prompts."""
+    import copy
+    g = copy.deepcopy(graph or {})
+    nodes = g.setdefault("nodes", [])
+    edges = g.setdefault("edges", [])
+    by_id = {n.get("id"): n for n in nodes}
+    applied: list[str] = []
+
+    def _edge_key(e): return (e.get("source"), e.get("target"), e.get("sourceHandle") or "")
+
+    for op in (ops or []):
+        kind = (op.get("op") or "").lower()
+        if kind == "add_node" and isinstance(op.get("node"), dict):
+            n = op["node"]
+            nid = n.get("id")
+            if nid and nid not in by_id:
+                n.setdefault("type", (n.get("data") or {}).get("kind"))
+                n.setdefault("position", {"x": 120 + 240 * len(nodes), "y": 160})
+                nodes.append(n); by_id[nid] = n
+                applied.append(f"added node {nid} ({n.get('type')})")
+        elif kind == "update_node" and op.get("id") in by_id:
+            n = by_id[op["id"]]
+            data = n.setdefault("data", {})
+            cfg = data.setdefault("config", {})
+            if isinstance(op.get("config"), dict):
+                cfg.update(op["config"])
+            if op.get("label"):
+                data["label"] = op["label"]
+            applied.append(f"updated node {op['id']}")
+        elif kind == "remove_node" and op.get("id") in by_id and op.get("id") != "trigger":
+            rid = op["id"]
+            nodes[:] = [n for n in nodes if n.get("id") != rid]; by_id.pop(rid, None)
+            edges[:] = [e for e in edges if e.get("source") != rid and e.get("target") != rid]
+            applied.append(f"removed node {rid}")
+        elif kind == "add_edge" and op.get("source") in by_id and op.get("target") in by_id:
+            e = {"id": f"e-{op['source']}-{op.get('sourceHandle') or ''}-{op['target']}",
+                 "source": op["source"], "target": op["target"]}
+            if op.get("sourceHandle"):
+                e["sourceHandle"] = op["sourceHandle"]
+            if _edge_key(e) not in {_edge_key(x) for x in edges}:
+                edges.append(e); applied.append(f"wired {op['source']}→{op['target']}")
+        elif kind == "remove_edge":
+            before = len(edges)
+            edges[:] = [e for e in edges if not (e.get("source") == op.get("source") and e.get("target") == op.get("target"))]
+            if len(edges) < before:
+                applied.append(f"removed edge {op.get('source')}→{op.get('target')}")
+    return g, applied
+
+
+class ImproveApplyReq(BaseModel):
+    suggestions: list[dict] | None = None   # the analysis suggestions the user is acting on
+    analysis: str | None = None
+
+
+_REVIEW_SYSTEM = """You are a senior workflow engineer doing a FINAL review of a graph that was just \
+edited suggestion-by-suggestion. Find and fix problems so the flow actually works end to end for the \
+objective: orphaned/disconnected nodes, duplicate nodes doing the same job, broken or missing edges, \
+broken {{token}} references, and any node that got deleted leaving a gap. The flow must run from the \
+"trigger" node through to its final output with every node connected. Return ONLY edit operations to \
+fix it (do not rewrite the graph). If nothing needs fixing, return an empty ops list.
+""" + _GRAPH_SPEC + """
 Return ONLY a JSON object (no markdown fences):
-{"summary":"<1-3 sentences describing what you changed>","graph":<the full improved workflow graph>}"""
+{"summary":"<what you fixed, or 'no changes needed'>","ops":[ ...same op shapes as before... ]}"""
+
+
+_TOKEN_BUILTINS = {"today", "now", "trigger", "workflow", "run", "vars", "$vars", "$",
+                   "input", "json", "date", "time", "timestamp", "year", "month", "day", "weekday"}
+
+
+def _validate_graph(graph: dict) -> list[str]:
+    """Cheap, no-LLM check that the flow is actually runnable. Returns a list of problem
+    descriptions (empty = looks good). Catches the breaks the LLM most often leaves:
+    orphaned nodes, dangling edges, and tokens pointing at non-existent node ids."""
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    ids = {n.get("id") for n in nodes if n.get("id")}
+    problems: list[str] = []
+    if "trigger" not in ids:
+        problems.append("no entry node with id 'trigger'")
+    # Dangling edges
+    for e in edges:
+        if e.get("source") not in ids:
+            problems.append(f"edge from missing node '{e.get('source')}'")
+        if e.get("target") not in ids:
+            problems.append(f"edge to missing node '{e.get('target')}'")
+    # Reachability from trigger
+    adj: dict = {}
+    for e in edges:
+        adj.setdefault(e.get("source"), []).append(e.get("target"))
+    seen, stack = set(), ["trigger"]
+    while stack:
+        x = stack.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        stack += adj.get(x, [])
+    for n in nodes:
+        nid = n.get("id")
+        if nid and nid != "trigger" and nid not in seen:
+            problems.append(f"node '{nid}' ({n.get('type')}) is not connected from trigger")
+    # Token references → must point at a real node id (or a built-in)
+    tok = re.compile(r"\{\{\s*([^}|.\s]+)")
+    for n in nodes:
+        cfg = (n.get("data") or {}).get("config") or {}
+        for v in cfg.values():
+            if isinstance(v, str):
+                for head in tok.findall(v):
+                    if head not in ids and head not in _TOKEN_BUILTINS:
+                        problems.append(f"node '{n.get('id')}' references unknown id '{head}' in a {{{{token}}}}")
+    # De-dup while preserving order
+    return list(dict.fromkeys(problems))
+
+
+async def _verify_and_fix_graph(adapter, model, objective: str, graph: dict, max_attempts: int = 3):
+    """Physically validate the graph; while it has problems, ask the model to fix the
+    SPECIFIC problems against the LATEST graph, re-applying and re-validating. Capped so
+    it can't burn tokens. Returns (graph, remaining_problems, applied)."""
+    applied: list[str] = []
+    problems = _validate_graph(graph)
+    attempts = 0
+    while problems and attempts < max_attempts:
+        note = ("The flow has these problems — fix them with edit ops. Rewire edges, connect orphaned "
+                "nodes, and correct every {{token}} so it uses a real node id THAT EXISTS in the graph "
+                "below (not invented ids):\n- " + "\n- ".join(problems[:8]))
+        um = f"Business objective: {objective}\n\nLatest graph JSON:\n{_json.dumps(graph)}\n\n" + note
+        ops = await _request_ops(adapter, model, _REVIEW_SYSTEM, um)
+        if not ops:
+            break
+        graph, fixed = _apply_ops(graph, ops)
+        applied += fixed
+        problems = _validate_graph(graph)
+        attempts += 1
+    return graph, problems, applied
+
+
+async def _request_ops(adapter, model, system: str, user_msg: str) -> list:
+    """One LLM call → list of edit ops, tolerant of malformed/partial JSON."""
+    try:
+        resp = await adapter.complete(system_prompt=system,
+                                      messages=[{"role": "user", "content": user_msg}],
+                                      model=model, max_tokens=4000, temperature=0.2)
+    except Exception:
+        return []
+    try:
+        ops = _extract_json(resp.content).get("ops")
+    except Exception:
+        ops = None
+    return ops if (isinstance(ops, list) and ops) else _salvage_ops(resp.content)
 
 
 @router.post("/workflows/{wf_id}/improve/apply")
-async def workflow_improve_apply_route(wf_id: str):
-    """AI produces an improved graph (applied client-side as a draft new version)."""
-    from ..llm_adapters.factory import get_adapter
-    from ..config import get_settings
+async def workflow_improve_apply_route(wf_id: str, req: ImproveApplyReq | None = None):
+    """Apply approved suggestions ONE AT A TIME, streaming the graph after each so the
+    UI updates live, then a final review pass that stitches everything together.
+    Server-Sent Events: each line is `data: {json}` — types: step, review, done, error."""
+    from fastapi.responses import StreamingResponse
 
     wf = await database.get_workflow(wf_id)
     if not wf:
         raise HTTPException(404, "Workflow not found")
-    rt = runtime_settings.get()
-    if not rt.get("llm_provider"):
+    if not runtime_settings.get().get("llm_provider"):
         raise HTTPException(400, "No LLM configured. Complete setup first.")
-
-    runs = await database.list_runs(wf_id, limit=5)
-    runs = [await database.get_run(r["id"]) for r in runs]
-    digest, _ = _runs_digest([r for r in runs if r])
-    user_msg = (f"Business objective: {wf.get('objective') or '(not set)'}\n\n"
-                f"Current graph JSON:\n{_json.dumps(wf.get('graph', {}))}\n\n"
-                f"Recent executions:\n{digest}")
     try:
-        provider = LLMProvider(rt["llm_provider"])
-        adapter = get_adapter(provider, get_settings(), rt)
-        model = rt.get("llm_model") or _default_model(rt["llm_provider"])
-        resp = await adapter.complete(system_prompt=_IMPROVE_APPLY_SYSTEM,
-                                      messages=[{"role": "user", "content": user_msg}],
-                                      model=model, max_tokens=2600, temperature=0.2)
-        data = _extract_json(resp.content)
+        adapter, model = await _assist_llm()
     except Exception as e:
         raise HTTPException(500, str(e))
-    graph = data.get("graph")
-    if not isinstance(graph, dict) or not graph.get("nodes"):
-        raise HTTPException(500, "The AI did not return a valid improved graph.")
-    return {"summary": str(data.get("summary", "")).strip(), "graph": graph}
+
+    objective = wf.get("objective") or "(not set)"
+    sugg = (req.suggestions if req else None) or []
+    tasks = [f"{s.get('title','')}: {s.get('detail','')}".strip(": ").strip() for s in sugg] \
+        or ["Improve this workflow to better achieve the objective: fix broken token references, "
+            "remove dead nodes, and make it more reliable."]
+
+    async def gen():
+        graph = wf.get("graph", {}) or {}
+        applied_all: list[str] = []
+        for i, task in enumerate(tasks):
+            um = (f"Business objective: {objective}\n\nCurrent graph JSON:\n{_json.dumps(graph)}\n\n"
+                  "The graph above may ALREADY include nodes from earlier steps — reuse/extend them, "
+                  "do NOT add duplicates, and keep every node connected. Make ONLY the changes for:\n" + task)
+            ops = await _request_ops(adapter, model, _IMPROVE_APPLY_SYSTEM, um)
+            applied = []
+            if ops:
+                graph, applied = _apply_ops(graph, ops)
+                applied_all += applied
+            yield "data: " + _json.dumps({
+                "type": "step", "index": i, "total": len(tasks),
+                "title": task[:80], "applied": applied, "graph": graph,
+            }) + "\n\n"
+
+        # Review + VERIFY loop: fix, then check the flow is actually runnable; if not,
+        # loop back and fix the specific problems. Capped at 3 attempts so a model that
+        # can't converge doesn't burn unbounded tokens.
+        MAX_VERIFY = 3
+        problems_note = "Review and fix any problems so the whole flow runs end to end."
+        ok = False
+        for attempt in range(MAX_VERIFY):
+            rum = (f"Business objective: {objective}\n\nGraph after edits:\n{_json.dumps(graph)}\n\n"
+                   + problems_note)
+            rops = await _request_ops(adapter, model, _REVIEW_SYSTEM, rum)
+            if rops:
+                graph, fixed = _apply_ops(graph, rops)
+                applied_all += fixed
+            problems = _validate_graph(graph)
+            ok = not problems
+            yield "data: " + _json.dumps({
+                "type": "verify", "attempt": attempt + 1, "max": MAX_VERIFY,
+                "ok": ok, "problems": problems[:8], "graph": graph,
+            }) + "\n\n"
+            if ok:
+                break
+            # Feed the concrete problems back into the next fix pass.
+            problems_note = ("The flow still has these problems — FIX them with edit ops "
+                             "(rewire edges, correct {{token}} ids, connect orphaned nodes):\n- "
+                             + "\n- ".join(problems[:8]))
+
+        if not applied_all:
+            yield "data: " + _json.dumps({"type": "error",
+                "message": "The AI couldn't produce valid changes. Try again, or apply one suggestion "
+                           "at a time via AI Assist."}) + "\n\n"
+            return
+        final_problems = _validate_graph(graph)
+        verified = not final_problems
+        summary = f"Applied {len(applied_all)} change(s): " + "; ".join(applied_all)
+        if not verified:
+            summary += (f" — ⚠ verification still found {len(final_problems)} issue(s) after "
+                        f"{MAX_VERIFY} attempts: {final_problems[0]}. Review before saving.")
+        yield "data: " + _json.dumps({
+            "type": "done", "graph": graph, "verified": verified,
+            "problems": final_problems[:8], "summary": summary,
+        }) + "\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Workflow versions ─────────────────────────────────────────────────────────
