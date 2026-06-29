@@ -116,14 +116,22 @@ export const useOrgStore = create((set, get) => ({
       return res.ok ? await res.json() : null
     } catch { return null }
   },
-  async executeStep(id, nodeId, payload = {}) {
+  async listDir(path = '') {
+    const res = await fetch(`${API}/workflows/fs/list?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return null
+    return res.json()
+  },
+  async executeStep(id, nodeId, payload = {}, single = false, context = null) {
     const res = await fetch(`${API}/workflows/${id}/test`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ payload, until: nodeId }),
+      body: JSON.stringify({ payload, until: nodeId, single, context }),
     })
     if (!res.ok) return null
     const d = await res.json()
-    const steps = {}, order = []
+    // 'This step only' (single) re-runs one node — keep the prior run's other steps
+    // so the INPUT pane (upstream outputs) doesn't vanish.
+    const prev = single ? (get().wfRun || {}) : {}
+    const steps = { ...(prev.steps || {}) }, order = [...(prev.order || [])]
     for (const s of (d.run?.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
     set({ wfRun: { runId: d.run_id, status: d.run?.status || 'success', steps, order } })
     return d.run
@@ -133,7 +141,7 @@ export const useOrgStore = create((set, get) => ({
     if (!res.ok) return null
     const run = await res.json()
     const steps = {}, order = []
-    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error }; if (!order.includes(s.node_id)) order.push(s.node_id) }
+    for (const s of (run.steps || [])) { steps[s.node_id] = { status: s.status, output: s.output, input: s.input, compliance: s.compliance, error: s.error, input_tokens: s.input_tokens, output_tokens: s.output_tokens }; if (!order.includes(s.node_id)) order.push(s.node_id) }
     set({ wfRun: { runId: run.id, status: run.status, steps, order } })
     return run
   },

@@ -3,7 +3,12 @@
  * Nodes are freely draggable. Click-drag from a right port to connect agents.
  * Click a connection line to edit its label or delete it.
  */
-import React, { useState, useRef, useCallback, useEffect } from 'react'
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import {
+  ReactFlow, ReactFlowProvider, Background, Controls, MiniMap,
+  applyNodeChanges, Handle, Position, MarkerType,
+} from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
 import { Plus, X, Trash2, Check, Network, Pencil, KeyRound } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 import { useBackdropDismiss } from './useBackdropDismiss'
@@ -20,9 +25,6 @@ import AIPromptWizard from './AIPromptWizard'
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const NODE_W  = 220
-const NODE_H  = 96
-const PORT_R  = 7
-const GRID    = 24
 const COLORS  = ['#4F46E5','#DC2626','#059669','#D97706','#7C3AED','#0891B2','#DB2777']
 const PROVIDERS = ['anthropic','openai','ollama','gemini','glm','minimax','custom']
 const DEFAULT_MODELS = {
@@ -32,63 +34,6 @@ const DEFAULT_MODELS = {
 
 function initials(name = '') {
   return name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()
-}
-
-// ── Port geometry ─────────────────────────────────────────────────────────────
-
-function outPort(pos) { return { x: pos.x + NODE_W / 2, y: pos.y + NODE_H } }
-function inPort(pos)  { return { x: pos.x + NODE_W / 2, y: pos.y } }
-
-// Smart bezier that bends based on relative node positions.
-// When the target is to the right, control points extend horizontally.
-// When the target is to the left (backwards), the curve loops around.
-function smartBezier(x1, y1, x2, y2) {
-  const dx = x2 - x1
-  const dy = y2 - y1
-  const absDx = Math.abs(dx)
-  const absDy = Math.abs(dy)
-  const minArm = 50
-
-  if (dy > 0) {
-    // Target is below — vertical S-curve dropping down
-    const arm = Math.max(minArm, absDy * 0.4)
-    return {
-      d: `M${x1} ${y1} C${x1} ${y1 + arm}, ${x2} ${y2 - arm}, ${x2} ${y2}`,
-      labelX: (x1 + x2) / 2 + (dx > 0 ? 12 : -12),
-      labelY: (y1 + y2) / 2,
-    }
-  }
-
-  // Target is above — loop around horizontally
-  const loop = Math.max(minArm, absDy * 0.5, 80)
-  const hOff = absDx < 40 ? 80 : absDx * 0.6
-  const sign = x1 <= x2 ? 1 : -1
-
-  return {
-    d: `M${x1} ${y1} C${x1 + sign * hOff} ${y1 + loop}, ${x2 + sign * hOff} ${y2 - loop}, ${x2} ${y2}`,
-    labelX: ((x1 + x2) / 2) + sign * hOff * 0.5,
-    labelY: (y1 + y2) / 2,
-  }
-}
-
-function previewBezier(x1, y1, x2, y2) {
-  const arm = Math.max(40, Math.abs(y2 - y1) * 0.35)
-  return `M${x1} ${y1} C${x1} ${y1 + arm}, ${x2} ${y2 - arm}, ${x2} ${y2}`
-}
-
-// ── Dot-grid ──────────────────────────────────────────────────────────────────
-
-function DotGrid() {
-  return (
-    <svg className="absolute inset-0 w-full h-full pointer-events-none" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <pattern id="dots" x="0" y="0" width={GRID} height={GRID} patternUnits="userSpaceOnUse">
-          <circle cx="1.5" cy="1.5" r="1.2" fill="var(--dot-color)" />
-        </pattern>
-      </defs>
-      <rect width="100%" height="100%" fill="url(#dots)" />
-    </svg>
-  )
 }
 
 // ── Label modal (create + edit) ───────────────────────────────────────────────
@@ -125,7 +70,7 @@ function LabelModal({ title, initial, onConfirm, onCancel }) {
 function ConnPopover({ x, y, label, onEdit, onDelete, onClose }) {
   return (
     <div
-      className="absolute z-40"
+      className="fixed z-50"
       style={{ left: x, top: y, transform: 'translate(-50%, -100%)' }}
     >
       <div className="bg-white rounded-xl shadow-xl border border-gray-100 px-1 py-1 flex items-center gap-0.5 mb-2">
@@ -567,36 +512,28 @@ function EditPanel({ agent, onClose, onSave, onRemove }) {
   )
 }
 
-// ── Agent node ────────────────────────────────────────────────────────────────
+// ── Agent node (ReactFlow custom node) ──────────────────────────────────────────
 
-function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onPortMouseDown, onInPortMouseUp, onClick, onDoubleClick, providers = [] }) {
-  const { config } = agent
+function AgentNode({ data, selected }) {
+  const { config, providers = [] } = data
+  const prov = providers.find(p => p.id === config.api_provider_id)
+  const provLabel = prov ? `${prov.provider || config.llm_provider}` : config.llm_provider
 
   return (
     <div
-      style={{ left: pos.x, top: pos.y, width: NODE_W, position: 'absolute' }}
-      className={`group select-none rounded-2xl border-2 bg-white shadow-sm cursor-grab active:cursor-grabbing transition-shadow
-        ${selected       ? 'border-indigo-500 shadow-indigo-100 shadow-lg' : ''}
-        ${isConnectTarget ? 'border-indigo-400 shadow-indigo-100 shadow-md' : ''}
-        ${!selected && !isConnectTarget ? 'border-gray-200 hover:border-gray-300 hover:shadow-md' : ''}`}
-      onMouseDown={e => {
-        if (e.target.closest('[data-port]')) return
-        onNodeMouseDown(agent, e)
-      }}
-      onClick={e => {
-        e.stopPropagation()
-        onClick(agent)
-      }}
-      onDoubleClick={e => {
-        e.stopPropagation()
-        onDoubleClick(agent)
-      }}
+      style={{ width: NODE_W }}
+      className={`group relative select-none rounded-2xl border-2 bg-white shadow-sm transition-shadow
+        ${selected ? 'border-indigo-500 shadow-indigo-100 shadow-lg' : 'border-gray-200 hover:border-gray-300 hover:shadow-md'}`}
     >
       {config.is_ceo && (
         <span className="absolute -top-2.5 left-3 text-[9px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-600 uppercase tracking-wide z-10">
           Manager
         </span>
       )}
+
+      {/* Input handle — top */}
+      <Handle type="target" position={Position.Top}
+        className="!w-3 !h-3 !bg-white !border-2 !border-gray-300 hover:!border-indigo-400" />
 
       <div className="p-3 flex items-center gap-3">
         <div className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold text-sm shrink-0"
@@ -610,48 +547,18 @@ function AgentNode({ agent, pos, selected, isConnectTarget, onNodeMouseDown, onP
       </div>
       <div className="px-3 pb-3">
         <span className="text-[10px] text-gray-300 font-mono truncate block">
-          {(() => {
-            const prov = providers.find(p => p.id === config.api_provider_id)
-            const provLabel = prov
-              ? `${prov.provider || config.llm_provider}`
-              : config.llm_provider
-            return `${provLabel}/${config.llm_model}`
-          })()}
+          {`${provLabel}/${config.llm_model}`}
         </span>
       </div>
 
-      {/* Input port — top */}
-      <div
-        data-port="in"
-        className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex items-center justify-center cursor-crosshair"
-        style={{ width: PORT_R * 2 + 10, height: PORT_R * 2 + 10 }}
-        onMouseDown={e => e.stopPropagation()}
-        onMouseUp={e => { e.stopPropagation(); onInPortMouseUp(agent) }}
-      >
-        <div
-          className={`rounded-full border-2 transition-all pointer-events-none
-            ${isConnectTarget
-              ? 'bg-indigo-400 border-indigo-500 scale-150'
-              : 'bg-white border-gray-300 group-hover:border-indigo-400 group-hover:scale-110'}`}
-          style={{ width: PORT_R * 2, height: PORT_R * 2 }}
-        />
-      </div>
-
-      {/* Output port — bottom */}
-      <div
-        data-port="out"
-        className="absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-1/2 z-20 flex items-center justify-center cursor-crosshair"
-        style={{ width: PORT_R * 2 + 10, height: PORT_R * 2 + 10 }}
-        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); onPortMouseDown(agent, e) }}
-      >
-        <div
-          className="rounded-full border-2 bg-white border-gray-300 hover:border-indigo-500 hover:bg-indigo-100 hover:scale-125 transition-all pointer-events-none"
-          style={{ width: PORT_R * 2, height: PORT_R * 2 }}
-        />
-      </div>
+      {/* Output handle — bottom */}
+      <Handle type="source" position={Position.Bottom}
+        className="!w-3 !h-3 !bg-white !border-2 !border-gray-300 hover:!border-indigo-500" />
     </div>
   )
 }
+
+const nodeTypes = { agent: AgentNode }
 
 // ── Main view ─────────────────────────────────────────────────────────────────
 
@@ -662,7 +569,7 @@ function getDefaultPos(agent, index) {
   return { x: 80 + col * 260, y: 220 + row * 150 }
 }
 
-export default function OrganisationView() {
+function OrganisationFlow() {
   // TanStack queries — cached, auto-refetched, invalidated on mutations
   const { data: agentsData = [] } = useAgents()
   const { data: connectionsData = [] } = useConnections()
@@ -670,7 +577,6 @@ export default function OrganisationView() {
 
   // Also keep WS-driven agents for real-time status updates
   const wsAgents = useOrgStore(s => s.agents)
-  // Prefer TanStack data for positions (authoritative from DB), merge WS status
   const agents = agentsData.length > 0 ? agentsData : wsAgents
 
   // Mutations with automatic cache invalidation
@@ -681,322 +587,156 @@ export default function OrganisationView() {
   const deleteConnMut  = useDeleteConnection()
   const savePosMut     = useSaveCanvasPositions()
 
-  const canvasRef = useRef(null)
-
-  const posRef = useRef({})
-  const [positions, setPositions] = useState({})
-
-  const [connections, setConnections] = useState([])
-  const [selected, setSelected]       = useState(null)
-  const [panelOpen, setPanelOpen]     = useState(false)
-  const [selectedConn, setSelectedConn] = useState(null)
-  const [showAddAgent, setShowAddAgent] = useState(false)
-  const [labelModal, setLabelModal]   = useState(null)
-
-  const nodeDrag = useRef(null)
-  const connDrag = useRef(null)
-  const [connLine, setConnLine] = useState(null)
+  const posRef    = useRef({})
   const saveTimer = useRef(null)
 
-  // Sync connections from TanStack query data
+  const [nodes, setNodes] = useState([])
+  const [edges, setEdges] = useState([])
+  const [selectedId, setSelectedId]   = useState(null)
+  const [panelOpen, setPanelOpen]     = useState(false)
+  const [labelModal, setLabelModal]   = useState(null)
+  const [edgePopover, setEdgePopover] = useState(null)
+  const [showAddAgent, setShowAddAgent] = useState(false)
+
+  // Reconcile ReactFlow nodes from agents, in place — spreading the existing node
+  // preserves ReactFlow's measured dimensions (without which edges won't render).
+  // Position priority: existing node → saved canvas_x/y → computed default.
   useEffect(() => {
-    if (connectionsData.length > 0 || connections.length === 0) {
-      setConnections(connectionsData.map(c => ({ fromId: c.from_id, toId: c.to_id, label: c.label })))
-    }
+    setNodes(prev => {
+      const byId = new Map(prev.map(n => [n.id, n]))
+      return agents.map((a, i) => {
+        const ex = byId.get(a.config.id)
+        let pos = ex?.position || posRef.current[a.config.id]
+        if (!pos) {
+          const { canvas_x: cx, canvas_y: cy } = a.config
+          pos = (cx != null && cy != null && (cx || cy)) ? { x: cx, y: cy } : getDefaultPos(a, i)
+        }
+        posRef.current[a.config.id] = pos
+        const data = { config: a.config, providers: allProviders }
+        const selected = a.config.id === selectedId
+        // Seed measured dimensions so edges always have endpoints to draw from —
+        // RF v12 hides an edge whenever either node lacks `measured`, and the value
+        // can be momentarily absent when a node object is rebuilt (the race that made
+        // connections vanish). Real measurement overwrites this a frame later.
+        const measured = ex?.measured || { width: NODE_W, height: 96 }
+        return ex ? { ...ex, position: pos, data, selected, measured }
+                  : { id: a.config.id, type: 'agent', position: pos, data, selected,
+                      width: NODE_W, height: 96, measured }
+      })
+    })
+  }, [agents, allProviders, selectedId])
+
+  // Build ReactFlow edges from connections — smoothstep + animated to match the
+  // Workflow editor's connecting lines.
+  useEffect(() => {
+    setEdges(connectionsData.map(c => ({
+      id: `${c.from_id}-${c.to_id}`, source: c.from_id, target: c.to_id,
+      label: c.label || undefined, type: 'smoothstep', animated: true,
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#b1b1b7', width: 18, height: 18 },
+      style: { stroke: '#b1b1b7', strokeWidth: 1.5 },
+      labelStyle: { fontSize: 10, fill: '#4f46e5', fontWeight: 600 },
+      labelBgStyle: { fill: '#eef2ff' }, labelBgPadding: [6, 3], labelBgBorderRadius: 6,
+    })))
   }, [connectionsData])
 
-  // Sync canvas positions from TanStack agents data
-  const dbLoaded = useRef(false)
-  useEffect(() => {
-    if (dbLoaded.current || agentsData.length === 0) return
-    const loaded = {}
-    for (const a of agentsData) {
-      const cx = a.config?.canvas_x
-      const cy = a.config?.canvas_y
-      if (cx != null && cy != null && (cx !== 0 || cy !== 0)) {
-        loaded[a.config.id] = { x: cx, y: cy }
-        posRef.current[a.config.id] = { x: cx, y: cy }
-      }
-    }
-    if (Object.keys(loaded).length > 0) {
-      dbLoaded.current = true
-      setPositions(prev => ({ ...prev, ...loaded }))
-    }
-  }, [agentsData])
-
-  // Debounced save of canvas positions after drag
+  // Debounced save of canvas positions after drag.
   function scheduleSavePositions() {
     if (saveTimer.current) clearTimeout(saveTimer.current)
-    saveTimer.current = setTimeout(() => {
-      savePosMut.mutate(posRef.current)
-    }, 800)
+    saveTimer.current = setTimeout(() => savePosMut.mutate(posRef.current), 800)
   }
 
-  function getPosFor(agent, i) {
-    if (posRef.current[agent.config.id]) return posRef.current[agent.config.id]
-    const p = getDefaultPos(agent, i)
-    posRef.current[agent.config.id] = p
-    return p
-  }
-
-  // ── Canvas mouse handlers ──────────────────────────────────────────────────
-
-  const handleMouseMove = useCallback(e => {
-    const rect = canvasRef.current?.getBoundingClientRect()
-    if (!rect) return
-    const mx = e.clientX - rect.left
-    const my = e.clientY - rect.top
-
-    if (nodeDrag.current) {
-      const { agentId, offsetX, offsetY } = nodeDrag.current
-      const newPos = { x: mx - offsetX, y: my - offsetY }
-      posRef.current[agentId] = newPos
-      setPositions(prev => ({ ...prev, [agentId]: newPos }))
-    }
-
-    if (connDrag.current) {
-      setConnLine({ x1: connDrag.current.x1, y1: connDrag.current.y1, x2: mx, y2: my })
-    }
+  const onNodesChange = useCallback(changes => {
+    setNodes(ns => applyNodeChanges(changes, ns))
+    for (const c of changes) if (c.type === 'position' && c.position) posRef.current[c.id] = c.position
+    if (changes.some(c => c.type === 'position' && c.dragging === false)) scheduleSavePositions()
   }, [])
 
-  const handleMouseUp = useCallback(() => {
-    if (nodeDrag.current) {
-      nodeDrag.current = null
-      scheduleSavePositions()
-    }
-    if (connDrag.current) {
-      connDrag.current = null
-      setConnLine(null)
-    }
+  // Drag from one node's bottom handle to another's top handle → label & create.
+  const onConnect = useCallback(params => {
+    if (params.source === params.target) return
+    setLabelModal({ fromId: params.source, toId: params.target, initial: null })
+    setEdgePopover(null)
   }, [])
 
-  function handleNodeMouseDown(agent, e) {
+  const onEdgeClick = useCallback((e, edge) => {
     e.stopPropagation()
-    const rect = canvasRef.current?.getBoundingClientRect()
-    if (!rect) return
-    const pos = posRef.current[agent.config.id] || { x: 0, y: 0 }
-    nodeDrag.current = {
-      agentId: agent.config.id,
-      offsetX: e.clientX - rect.left - pos.x,
-      offsetY: e.clientY - rect.top  - pos.y,
-    }
-  }
-
-  function handlePortMouseDown(agent, e) {
-    const rect = canvasRef.current?.getBoundingClientRect()
-    if (!rect) return
-    const pos = posRef.current[agent.config.id]
-    if (!pos) return
-    const p = outPort(pos)
-    connDrag.current = { fromId: agent.config.id, x1: p.x, y1: p.y }
-    setConnLine({ x1: p.x, y1: p.y, x2: p.x, y2: p.y })
-    setSelected(null)
-    setSelectedConn(null)
-  }
-
-  function handleInPortMouseUp(toAgent) {
-    if (!connDrag.current) return
-    const { fromId } = connDrag.current
-    connDrag.current = null
-    setConnLine(null)
-    const toId = toAgent.config.id
-    if (fromId === toId) return
-    if (connections.some(c => c.fromId === fromId && c.toId === toId)) return
-    setLabelModal({ fromId, toId, initial: null })
-  }
+    const conn = connectionsData.find(c => c.from_id === edge.source && c.to_id === edge.target)
+    setEdgePopover({ x: e.clientX, y: e.clientY, fromId: edge.source, toId: edge.target, label: conn?.label || '' })
+    setSelectedId(null)
+    setPanelOpen(false)
+  }, [connectionsData])
 
   async function confirmConnection(label) {
     if (!labelModal) return
     const { fromId, toId, initial } = labelModal
-
     if (initial != null) {
-      setConnections(prev => prev.map(c =>
-        c.fromId === fromId && c.toId === toId ? { ...c, label } : c
-      ))
       updateConnMut.mutate({ from_id: fromId, to_id: toId, label })
-    } else {
-      setConnections(prev => [...prev, { fromId, toId, label }])
+    } else if (!connectionsData.some(c => c.from_id === fromId && c.to_id === toId)) {
       createConnMut.mutate({ from_id: fromId, to_id: toId, label })
     }
     setLabelModal(null)
-    setSelectedConn(null)
-  }
-
-  function handleConnClick(conn, labelX, labelY) {
-    setSelectedConn({ ...conn, x: labelX, y: labelY })
-    setSelected(null)
-    setPanelOpen(false)
   }
 
   function handleEditConn() {
-    if (!selectedConn) return
-    const conn = connections.find(c => c.fromId === selectedConn.fromId && c.toId === selectedConn.toId)
-    setLabelModal({ fromId: selectedConn.fromId, toId: selectedConn.toId, initial: conn?.label || '' })
-    setSelectedConn(null)
+    if (!edgePopover) return
+    setLabelModal({ fromId: edgePopover.fromId, toId: edgePopover.toId, initial: edgePopover.label })
+    setEdgePopover(null)
   }
 
   function handleDeleteConn() {
-    if (!selectedConn) return
-    setConnections(prev => prev.filter(c => !(c.fromId === selectedConn.fromId && c.toId === selectedConn.toId)))
-    deleteConnMut.mutate({ from_id: selectedConn.fromId, to_id: selectedConn.toId })
-    setSelectedConn(null)
+    if (!edgePopover) return
+    deleteConnMut.mutate({ from_id: edgePopover.fromId, to_id: edgePopover.toId })
+    setEdgePopover(null)
   }
 
   async function handleRemove(agent) {
     if (!confirm(`Remove ${agent.config.name}?`)) return
     removeAgentMut.mutate(agent.config.id)
     delete posRef.current[agent.config.id]
-    setPositions(prev => { const n = { ...prev }; delete n[agent.config.id]; return n })
-    setConnections(prev => prev.filter(c => c.fromId !== agent.config.id && c.toId !== agent.config.id))
-    if (selected?.config?.id === agent.config.id) setSelected(null)
+    if (selectedId === agent.config.id) { setSelectedId(null); setPanelOpen(false) }
   }
 
   async function handleSave(form) {
-    await updateAgentMut.mutateAsync({ id: selected.config.id, data: form })
+    await updateAgentMut.mutateAsync({ id: selectedId, data: form })
   }
 
-  const selectedAgent = selected ? agents.find(a => a.config.id === selected.config.id) : null
+  const selectedAgent = selectedId ? agents.find(a => a.config.id === selectedId) : null
 
-  // Build connection paths with smart bezier
-  const livePaths = connections.map(conn => {
-    const fp = posRef.current[conn.fromId]
-    const tp = posRef.current[conn.toId]
-    if (!fp || !tp) return null
-    const p1 = outPort(fp), p2 = inPort(tp)
-    const { d, labelX, labelY } = smartBezier(p1.x, p1.y, p2.x, p2.y)
-    const isSelected = selectedConn?.fromId === conn.fromId && selectedConn?.toId === conn.toId
-    return { ...conn, d, labelX, labelY, isSelected }
-  }).filter(Boolean)
-
-  function handleCanvasClick() {
-    setSelected(null)
-    setSelectedConn(null)
+  function clearSelection() {
+    setSelectedId(null)
     setPanelOpen(false)
+    setEdgePopover(null)
   }
 
   return (
-    <div className="flex h-full overflow-hidden bg-slate-50">
+    <div className="flex h-full overflow-hidden bg-white">
 
       {/* Canvas */}
-      <div
-        ref={canvasRef}
-        className="flex-1 relative overflow-hidden"
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onClick={handleCanvasClick}
-      >
-        <DotGrid />
+      <div className="flex-1 relative">
+        <ReactFlow
+          nodes={nodes} edges={edges} nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange} onConnect={onConnect} onEdgeClick={onEdgeClick}
+          onNodeClick={(_, n) => { setSelectedId(n.id); setEdgePopover(null) }}
+          onNodeDoubleClick={(_, n) => { setSelectedId(n.id); setPanelOpen(true); setEdgePopover(null) }}
+          onPaneClick={clearSelection}
+          fitView proOptions={{ hideAttribution: true }}
+          defaultEdgeOptions={{ type: 'smoothstep', animated: true }}
+          connectionLineType="smoothstep"
+          connectionLineStyle={{ stroke: '#f59e0b', strokeWidth: 2 }}
+        >
+          <Background color="#e5e7eb" gap={18} />
+          <Controls showInteractive={false} />
+          <MiniMap pannable zoomable className="!bg-gray-50" />
+        </ReactFlow>
 
-        {/* SVG: connections + preview */}
-        {/* SVG layer 1: visible lines (below nodes) */}
-        <svg className="absolute inset-0 w-full h-full pointer-events-none z-10">
-          <defs>
-            <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
-              <path d="M0,0 L0,8 L10,4 z" fill="#818cf8" />
-            </marker>
-            <marker id="arr-sel" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
-              <path d="M0,0 L0,8 L10,4 z" fill="#6366f1" />
-            </marker>
-            <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
-              <path d="M0,0 L0,8 L10,4 z" fill="#f59e0b" />
-            </marker>
-          </defs>
-
-          {livePaths.map(p => (
-            <g key={`${p.fromId}-${p.toId}`}>
-              <path
-                d={p.d}
-                fill="none"
-                stroke={p.isSelected ? '#6366f1' : '#a5b4fc'}
-                strokeWidth={p.isSelected ? 2.5 : 2}
-                markerEnd={p.isSelected ? 'url(#arr-sel)' : 'url(#arr)'}
-              />
-              {p.label && (
-                <g>
-                  <rect
-                    x={p.labelX - p.label.length * 3.2 - 8}
-                    y={p.labelY - 10}
-                    width={p.label.length * 6.4 + 16}
-                    height={18}
-                    rx={9}
-                    fill={p.isSelected ? '#eef2ff' : 'white'}
-                    stroke={p.isSelected ? '#a5b4fc' : '#e5e7eb'}
-                    strokeWidth="1"
-                  />
-                  <text x={p.labelX} y={p.labelY + 3} textAnchor="middle" fontSize="10" fontWeight="500"
-                    fill={p.isSelected ? '#4338ca' : '#6366f1'}>{p.label}</text>
-                </g>
-              )}
-            </g>
-          ))}
-
-          {connLine && (
-            <path
-              d={previewBezier(connLine.x1, connLine.y1, connLine.x2, connLine.y2)}
-              fill="none" stroke="#f59e0b" strokeWidth="2" strokeDasharray="6 3"
-              markerEnd="url(#arr-p)"
-            />
-          )}
-        </svg>
-
-        {/* SVG layer 2: invisible hit areas (above nodes) */}
-        <svg className="absolute inset-0 w-full h-full" style={{ pointerEvents: 'none', zIndex: 25 }}>
-          {livePaths.map(p => (
-            <path
-              key={`hit-${p.fromId}-${p.toId}`}
-              d={p.d}
-              fill="none"
-              stroke="transparent"
-              strokeWidth="24"
-              style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
-              onClick={e => { e.stopPropagation(); handleConnClick(p, p.labelX, p.labelY) }}
-            />
-          ))}
-        </svg>
-
-        {/* Connection popover */}
-        {selectedConn && (
+        {/* Connection popover (fixed at click point) */}
+        {edgePopover && (
           <ConnPopover
-            x={selectedConn.x}
-            y={selectedConn.y}
-            label={selectedConn.label}
-            onEdit={handleEditConn}
-            onDelete={handleDeleteConn}
-            onClose={() => setSelectedConn(null)}
+            x={edgePopover.x} y={edgePopover.y} label={edgePopover.label}
+            onEdit={handleEditConn} onDelete={handleDeleteConn}
+            onClose={() => setEdgePopover(null)}
           />
         )}
-
-        {/* Nodes */}
-        <div className="absolute inset-0 z-20 pointer-events-none [&>*]:pointer-events-auto">
-          {agents.map((agent, i) => {
-            const pos = getPosFor(agent, i)
-            const isConnectTarget = !!connDrag.current && connDrag.current.fromId !== agent.config.id
-            return (
-              <AgentNode
-                key={agent.config.id}
-                agent={agent}
-                providers={allProviders}
-                pos={positions[agent.config.id] || pos}
-                selected={selectedAgent?.config?.id === agent.config.id}
-                isConnectTarget={isConnectTarget}
-                onNodeMouseDown={handleNodeMouseDown}
-                onPortMouseDown={handlePortMouseDown}
-                onInPortMouseUp={handleInPortMouseUp}
-                onClick={a => {
-                  setSelectedConn(null)
-                  setSelected(prev => prev?.config?.id === a.config.id ? prev : a)
-                  setPanelOpen(false)
-                }}
-                onDoubleClick={a => {
-                  setSelectedConn(null)
-                  setSelected(a)
-                  setPanelOpen(true)
-                }}
-              />
-            )
-          })}
-        </div>
 
         {/* Empty state */}
         {agents.length === 0 && (
@@ -1016,16 +756,11 @@ export default function OrganisationView() {
             className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium shadow-md transition-colors">
             <Plus size={15} /> Add Agent
           </button>
-          {connLine && (
-            <div className="px-3 py-2 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700 font-medium shadow">
-              Drop on a node's left port to connect
-            </div>
-          )}
         </div>
 
         {/* Stats */}
         <div className="absolute bottom-4 left-4 z-30 text-xs text-gray-400 bg-white/80 px-3 py-1.5 rounded-xl border border-gray-100 shadow-sm select-none">
-          {agents.length} agent{agents.length !== 1 ? 's' : ''} · {connections.length} connection{connections.length !== 1 ? 's' : ''}
+          {agents.length} agent{agents.length !== 1 ? 's' : ''} · {connectionsData.length} connection{connectionsData.length !== 1 ? 's' : ''}
         </div>
       </div>
 
@@ -1033,7 +768,7 @@ export default function OrganisationView() {
       {selectedAgent && panelOpen && (
         <EditPanel
           agent={selectedAgent}
-          onClose={() => { setSelected(null); setPanelOpen(false) }}
+          onClose={() => { setSelectedId(null); setPanelOpen(false) }}
           onSave={handleSave}
           onRemove={handleRemove}
         />
@@ -1048,11 +783,10 @@ export default function OrganisationView() {
         />
       )}
       {showAddAgent && <AgentModal onClose={() => setShowAddAgent(false)} />}
-
-      {/* Hover styles for connections */}
-      <style>{`
-        .conn-hover-trigger:hover ~ path { stroke: #4f46e5 !important; }
-      `}</style>
     </div>
   )
+}
+
+export default function OrganisationView() {
+  return <ReactFlowProvider><OrganisationFlow /></ReactFlowProvider>
 }

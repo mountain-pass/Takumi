@@ -276,6 +276,19 @@ CREATE TABLE IF NOT EXISTS workflow_run_steps (
     finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_wf_run_steps ON workflow_run_steps(run_id, started_at);
+
+-- Workflow version history. Exactly one row per workflow has active=1; that
+-- version's graph is mirrored into workflows.graph (what triggers run).
+CREATE TABLE IF NOT EXISTS workflow_versions (
+    id          TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    version     INTEGER NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    graph       TEXT NOT NULL DEFAULT '{"nodes":[],"edges":[]}',
+    active      INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_wf_versions ON workflow_versions(workflow_id, version);
 """
 
 
@@ -315,6 +328,13 @@ async def init(data_dir: str) -> None:
         "ALTER TABLE agent_tasks ADD COLUMN last_heartbeat TEXT",
         "ALTER TABLE agent_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_tasks ADD COLUMN watchdog_flags TEXT NOT NULL DEFAULT '{}'",
+        # Workflow objective (AI-assist builder captures it; used to evaluate runs).
+        "ALTER TABLE workflows ADD COLUMN objective TEXT NOT NULL DEFAULT ''",
+        # AI Assist chat history (so users can revisit the conversation that built the flow).
+        "ALTER TABLE workflows ADD COLUMN ai_chat TEXT NOT NULL DEFAULT '[]'",
+        # Token usage per step (only AI Agent/LLM nodes populate these).
+        "ALTER TABLE workflow_run_steps ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_run_steps ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await _db.execute(migration)
@@ -1373,19 +1393,25 @@ def _wf_row(row) -> dict:
             d[k] = json.loads(d.get(k) or ("{}" if k == "trigger_config" else '{"nodes":[],"edges":[]}'))
         except Exception:
             d[k] = {} if k == "trigger_config" else {"nodes": [], "edges": []}
+    try:
+        d["ai_chat"] = json.loads(d.get("ai_chat") or "[]")
+    except Exception:
+        d["ai_chat"] = []
     return d
 
 
 async def create_workflow(wf: dict) -> dict:
     await _conn().execute(
         "INSERT INTO workflows(id, name, description, graph, status, require_compliance, "
-        "trigger_type, trigger_config) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+        "trigger_type, trigger_config, objective, ai_chat) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (wf["id"], wf.get("name", "Untitled workflow"), wf.get("description", ""),
          json.dumps(wf.get("graph", {"nodes": [], "edges": []})), wf.get("status", "draft"),
          1 if wf.get("require_compliance", True) else 0,
-         wf.get("trigger_type", "manual"), json.dumps(wf.get("trigger_config", {}))),
+         wf.get("trigger_type", "manual"), json.dumps(wf.get("trigger_config", {})),
+         wf.get("objective", ""), json.dumps(wf.get("ai_chat", []))),
     )
     await _conn().commit()
+    await _ensure_initial_version(wf["id"])   # seed version 1 (active)
     return await get_workflow(wf["id"])
 
 
@@ -1407,7 +1433,7 @@ async def update_workflow(wf_id: str, updates: dict) -> dict | None:
         return None
     cur = dict(row)
     fields, values = [], []
-    for col in ("name", "description", "status", "trigger_type"):
+    for col in ("name", "description", "status", "trigger_type", "objective"):
         if col in updates and updates[col] is not None:
             fields.append(f"{col} = ?"); values.append(updates[col])
     if "require_compliance" in updates and updates["require_compliance"] is not None:
@@ -1416,9 +1442,17 @@ async def update_workflow(wf_id: str, updates: dict) -> dict | None:
         fields.append("graph = ?"); values.append(json.dumps(updates["graph"]))
     if "trigger_config" in updates and updates["trigger_config"] is not None:
         fields.append("trigger_config = ?"); values.append(json.dumps(updates["trigger_config"]))
+    if "ai_chat" in updates and updates["ai_chat"] is not None:
+        fields.append("ai_chat = ?"); values.append(json.dumps(updates["ai_chat"]))
     fields.append("updated_at = datetime('now')")
     values.append(wf_id)
     await _conn().execute(f"UPDATE workflows SET {', '.join(fields)} WHERE id = ?", values)
+    # Keep the active version's graph in sync with manual edits (the active version
+    # IS the working copy). Explicit new versions are created via create_version().
+    if "graph" in updates and updates["graph"] is not None:
+        await _ensure_initial_version(wf_id)
+        await _conn().execute("UPDATE workflow_versions SET graph = ? WHERE workflow_id = ? AND active = 1",
+                              (json.dumps(updates["graph"]), wf_id))
     await _conn().commit()
     return await get_workflow(wf_id)
 
@@ -1426,6 +1460,77 @@ async def update_workflow(wf_id: str, updates: dict) -> dict | None:
 async def delete_workflow(wf_id: str) -> None:
     await _conn().execute("DELETE FROM workflows WHERE id = ?", (wf_id,))
     await _conn().commit()
+
+
+# ── Workflow versions ─────────────────────────────────────────────────────────
+
+def _version_row(row) -> dict:
+    d = dict(row)
+    try:
+        d["graph"] = json.loads(d.get("graph") or '{"nodes":[],"edges":[]}')
+    except Exception:
+        d["graph"] = {"nodes": [], "edges": []}
+    d["active"] = bool(d.get("active"))
+    return d
+
+
+async def _ensure_initial_version(wf_id: str) -> None:
+    """Back-fill a v1 (active) from the workflow's current graph if it has none."""
+    row = await (await _conn().execute(
+        "SELECT COUNT(*) FROM workflow_versions WHERE workflow_id = ?", (wf_id,))).fetchone()
+    if row and row[0]:
+        return
+    wf = await get_workflow(wf_id)
+    if not wf:
+        return
+    import uuid as _uuid
+    await _conn().execute(
+        "INSERT INTO workflow_versions(id, workflow_id, version, label, graph, active) "
+        "VALUES(?, ?, 1, 'Initial', ?, 1)",
+        (_uuid.uuid4().hex, wf_id, json.dumps(wf.get("graph", {"nodes": [], "edges": []}))))
+    await _conn().commit()
+
+
+async def list_versions(wf_id: str) -> list[dict]:
+    await _ensure_initial_version(wf_id)
+    rows = await (await _conn().execute(
+        "SELECT * FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC", (wf_id,))).fetchall()
+    return [_version_row(r) for r in rows]
+
+
+async def create_version(wf_id: str, graph: dict, label: str = "", activate: bool = True) -> dict:
+    """Snapshot `graph` as the next version. When active, mirror it into workflows.graph."""
+    import uuid as _uuid
+    await _ensure_initial_version(wf_id)
+    row = await (await _conn().execute(
+        "SELECT MAX(version) FROM workflow_versions WHERE workflow_id = ?", (wf_id,))).fetchone()
+    nextv = (row[0] or 0) + 1
+    vid = _uuid.uuid4().hex
+    if activate:
+        await _conn().execute("UPDATE workflow_versions SET active = 0 WHERE workflow_id = ?", (wf_id,))
+    await _conn().execute(
+        "INSERT INTO workflow_versions(id, workflow_id, version, label, graph, active) VALUES(?, ?, ?, ?, ?, ?)",
+        (vid, wf_id, nextv, label or f"Version {nextv}", json.dumps(graph), 1 if activate else 0))
+    if activate:
+        await _conn().execute("UPDATE workflows SET graph = ?, updated_at = datetime('now') WHERE id = ?",
+                              (json.dumps(graph), wf_id))
+    await _conn().commit()
+    return _version_row(await (await _conn().execute(
+        "SELECT * FROM workflow_versions WHERE id = ?", (vid,))).fetchone())
+
+
+async def activate_version(wf_id: str, version: int) -> dict | None:
+    """Make a version active (revert/promote): mirror its graph into workflows.graph."""
+    await _ensure_initial_version(wf_id)
+    row = await (await _conn().execute(
+        "SELECT graph FROM workflow_versions WHERE workflow_id = ? AND version = ?", (wf_id, version))).fetchone()
+    if not row:
+        return None
+    await _conn().execute("UPDATE workflow_versions SET active = 0 WHERE workflow_id = ?", (wf_id,))
+    await _conn().execute("UPDATE workflow_versions SET active = 1 WHERE workflow_id = ? AND version = ?", (wf_id, version))
+    await _conn().execute("UPDATE workflows SET graph = ?, updated_at = datetime('now') WHERE id = ?", (row[0], wf_id))
+    await _conn().commit()
+    return await get_workflow(wf_id)
 
 
 async def create_run(run: dict) -> dict:
@@ -1508,11 +1613,14 @@ async def add_run_step(step: dict) -> None:
 
 
 async def finish_run_step(step_id: str, *, status: str, output: dict | None = None,
-                          compliance: dict | None = None, error: str = "") -> None:
+                          compliance: dict | None = None, error: str = "",
+                          tokens: tuple | None = None) -> None:
+    tin, tout = (tokens or (0, 0))
     await _conn().execute(
         "UPDATE workflow_run_steps SET status = ?, output = ?, compliance = ?, error = ?, "
-        "finished_at = datetime('now') WHERE id = ?",
+        "input_tokens = ?, output_tokens = ?, finished_at = datetime('now') WHERE id = ?",
         (status, json.dumps(output or {}),
-         json.dumps(compliance) if compliance is not None else None, error, step_id),
+         json.dumps(compliance) if compliance is not None else None, error,
+         int(tin or 0), int(tout or 0), step_id),
     )
     await _conn().commit()

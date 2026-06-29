@@ -157,6 +157,8 @@ export default function SystemSettingsView() {
         {/* LLM Provider */}
         <div className="space-y-4">
           <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">LLM Provider</h2>
+          <p className="text-xs text-gray-400 -mt-2">This is the platform's primary model — it powers the Manager
+            and the workflow AI helpers (AI Assist, Improve flow and Apply with AI).</p>
           <div className="grid grid-cols-3 gap-2">
             {PROVIDERS.map(p => (
               <button

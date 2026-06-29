@@ -13,13 +13,21 @@ import {
   addEdge, applyNodeChanges, applyEdgeChanges, Handle, Position, useReactFlow,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
+import CodeMirror from '@uiw/react-codemirror'
+import { javascript, javascriptLanguage } from '@codemirror/lang-javascript'
+import { python, pythonLanguage } from '@codemirror/lang-python'
+import { json, jsonLanguage } from '@codemirror/lang-json'
+import { linter, lintGutter } from '@codemirror/lint'
+import { Decoration, ViewPlugin, EditorView } from '@codemirror/view'
+import { RangeSetBuilder } from '@codemirror/state'
 import {
   ArrowLeft, Save, Play, Globe, Code2, GitFork, Repeat, Merge as MergeIcon,
   Sparkles, Hand, Loader2, CheckCircle2, AlertCircle, ShieldCheck, ShieldAlert,
   ShieldX, X, Copy, Timer, Workflow, Reply, CircleSlash, Plus, Search, Pencil,
   Split, Filter as FilterIcon, OctagonAlert, SlidersHorizontal, CalendarClock, Clock,
   UserCheck, Zap, Trash2, ChevronRight, ChevronLeft, ChevronDown, Hash, Type as TypeIcon,
-  ToggleLeft, Braces, Brackets, GripVertical, Info,
+  ToggleLeft, Braces, Brackets, GripVertical, Info, Variable, FileDown, FileUp,
+  FolderOpen, Folder, FileText, Ban, Target, History, Check,
 } from 'lucide-react'
 import { useOrgStore } from '../stores/orgStore'
 
@@ -29,11 +37,7 @@ const NODE_META = {
   trigger: { label: 'Trigger', desc: 'Entry point — manual, schedule, webhook or agent', icon: Zap, color: '#6366f1', custom: 'trigger', fields: [] },
   http: { label: 'HTTP Request', desc: 'Make an API call and use the response', icon: Globe, color: '#0ea5e9', custom: 'http', fields: [] },
   code: { label: 'Code', desc: 'Run custom Python or JavaScript', icon: Code2, color: '#a855f7', custom: 'code', fields: [] },
-  set: { label: 'Edit Fields', desc: 'Add, set or override fields on the item', icon: SlidersHorizontal, color: '#8b5cf6', fields: [
-    { key: 'assignments', label: 'Fields to set (JSON: name → value/template)', type: 'json',
-      placeholder: '{ "name": "{{trigger.first}}", "total": "{{http.body.amount}}" }' },
-    { key: 'keep_only', label: 'Keep only the fields set above', type: 'checkbox' },
-  ] },
+  set: { label: 'Edit Fields', desc: 'Add, set or override fields on the item', icon: SlidersHorizontal, color: '#8b5cf6', custom: 'set', fields: [] },
   datetime: { label: 'Date & Time', desc: 'Get or transform a timestamp', icon: CalendarClock, color: '#0d9488', fields: [
     { key: 'action', label: 'Action', type: 'select', options: ['now', 'format', 'add'] },
     { key: 'value', label: 'Source value (for format/add)', type: 'text', placeholder: '{{trigger.created_at}}' },
@@ -41,15 +45,33 @@ const NODE_META = {
     { key: 'seconds', label: 'Offset seconds (for add)', type: 'number' },
   ] },
   if: { label: 'If', desc: 'Route to true / false branches', icon: GitFork, color: '#f59e0b', fields: [
-    { key: 'condition', label: 'Condition (Python expression)', type: 'text', placeholder: "input['status'] == 200" },
+    { key: 'lang', label: 'Expression language', type: 'select', options: ['python', 'javascript'] },
+    { key: 'condition', label: 'Condition (supports {{tokens}}, && and ||)', type: 'text', placeholder: "{{Code.output}} > 1 && {{Code.output}} < 3" },
   ] },
   switch: { label: 'Switch', desc: 'Route to many outputs by ordered rules', icon: Split, color: '#f97316', custom: 'switch', fields: [] },
   loop: { label: 'Loop Over Items', desc: 'Iterate an array; run the body per item', icon: Repeat, color: '#14b8a6', fields: [
-    { key: 'items_field', label: 'Array field to iterate', type: 'text', placeholder: 'body.items' },
+    { key: 'items_field', label: 'Array field to iterate (one {{token}} or a path)', type: 'text', placeholder: '{{Code.items}}' },
   ] },
-  merge: { label: 'Merge', desc: 'Combine multiple inputs into one', icon: MergeIcon, color: '#64748b', fields: [] },
+  merge: { label: 'Merge', desc: 'Combine multiple inputs into one', icon: MergeIcon, color: '#64748b', fields: [
+    { key: 'mode', label: 'Mode', type: 'select', options: ['append', 'combine', 'chooseBranch'] },
+    { key: 'number_of_inputs', label: 'Number of inputs', type: 'select', options: ['2', '3', '4', '5', '6', '7', '8', '9', '10'],
+      showIf: c => (c.mode || 'append') !== 'combine' },
+    { key: 'combine_by', label: 'Combine by', type: 'select', options: ['matchingFields', 'position', 'allCombinations'],
+      showIf: c => c.mode === 'combine' },
+    { key: 'fields_to_match', label: 'Fields to match (comma-separated)', type: 'text', placeholder: 'id, email',
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'output_type', label: 'Output type', type: 'select', options: ['keepMatches', 'keepNonMatches', 'keepEverything', 'enrichInput1', 'enrichInput2'],
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'fuzzy', label: 'Fuzzy compare — treat "3" and 3 as equal', type: 'checkbox',
+      showIf: c => c.mode === 'combine' && (c.combine_by || 'matchingFields') === 'matchingFields' },
+    { key: 'clash', label: 'On clashing fields, prioritise', type: 'select', options: ['input2', 'input1'],
+      showIf: c => c.mode === 'combine' },
+    { key: 'branch', label: 'Branch to output, 1-based', type: 'number', placeholder: '1',
+      showIf: c => c.mode === 'chooseBranch' },
+  ] },
   filter: { label: 'Filter', desc: 'Continue only if the condition holds', icon: FilterIcon, color: '#22c55e', fields: [
-    { key: 'condition', label: 'Keep when (Python expression)', type: 'text', placeholder: "input['amount'] > 0" },
+    { key: 'lang', label: 'Expression language', type: 'select', options: ['python', 'javascript'] },
+    { key: 'condition', label: 'Keep when (supports {{tokens}}, && and ||)', type: 'text', placeholder: "{{Code.output}} > 0" },
   ] },
   stop_error: { label: 'Stop and Error', desc: 'Throw an error and fail the run', icon: OctagonAlert, color: '#ef4444', fields: [
     { key: 'message', label: 'Error message', type: 'text', placeholder: 'Payload was invalid' },
@@ -64,6 +86,24 @@ const NODE_META = {
   noop: { label: 'No Operation', desc: 'Do nothing — pass input through', icon: CircleSlash, color: '#94a3b8', fields: [] },
   llm: { label: 'AI Agent / LLM', desc: 'Run a prompt through an agent & model', icon: Sparkles, color: '#ec4899', custom: 'llm', fields: [] },
   error_trigger: { label: 'Error Trigger', desc: 'Catch-all — runs when any node fails', icon: OctagonAlert, color: '#dc2626', entry: true, fields: [] },
+  variable: { label: 'Variable', desc: 'Assign a named value (overwritable; read as {{name}})', icon: Variable, color: '#0d9488', fields: [
+    { key: 'name', label: 'Variable name', type: 'text', placeholder: 'myVar' },
+    { key: 'value', label: 'Value (supports {{tokens}}; defaults to input)', type: 'text', placeholder: '{{HTTP Request.body.id}}' },
+  ] },
+  write_file: { label: 'Write File', desc: 'Write content to a file on disk', icon: FileDown, color: '#0284c7', fields: [
+    { key: 'path', label: 'File path', type: 'filepath', pickMode: 'write', placeholder: '/tmp/output.json' },
+    { key: 'content', label: 'Content (supports {{tokens}}; defaults to input)', type: 'textarea', placeholder: '{{Code.output}}' },
+    { key: 'mode', label: 'Mode', type: 'select', options: ['overwrite', 'append'] },
+  ] },
+  read_file: { label: 'Read File', desc: 'Read a file from disk into the workflow', icon: FileUp, color: '#ca8a04', fields: [
+    { key: 'path', label: 'File path', type: 'filepath', pickMode: 'read', placeholder: '/tmp/input.json' },
+    { key: 'parse_json', label: 'Parse content as JSON (adds a json field)', type: 'checkbox' },
+  ] },
+  websearch: { label: 'Web Search', desc: 'Search the web in real time for fresh data', icon: Search, color: '#7c3aed', fields: [
+    { key: 'query', label: 'Search query (supports {{tokens}})', type: 'textarea', placeholder: 'latest AI chip news {{today}}' },
+    { key: 'max_results', label: 'Max results', type: 'number', placeholder: '5' },
+    { key: 'fetch_content', label: 'Fetch full page content of top results (higher accuracy)', type: 'checkbox' },
+  ] },
 }
 
 // Palette grouping (n8n-style categories).
@@ -71,8 +111,9 @@ const CATEGORIES = [
   { id: 'trigger', label: 'Add Trigger', hint: 'How this workflow starts', kinds: ['trigger', 'error_trigger'] },
   { id: 'core', label: 'Core', kinds: ['http', 'code', 'respond', 'subworkflow', 'wait', 'noop'] },
   { id: 'flow', label: 'Flow', kinds: ['if', 'switch', 'loop', 'merge', 'filter', 'stop_error'] },
-  { id: 'transform', label: 'Data transformation', kinds: ['set', 'datetime', 'code'] },
-  { id: 'ai', label: 'AI', kinds: ['llm'] },
+  { id: 'transform', label: 'Data transformation', kinds: ['set', 'variable', 'datetime', 'code'] },
+  { id: 'files', label: 'Files', kinds: ['read_file', 'write_file'] },
+  { id: 'ai', label: 'AI', kinds: ['llm', 'websearch'] },
   { id: 'hitl', label: 'Human in the loop', hint: 'Coming soon', kinds: [], comingSoon: true },
 ]
 
@@ -95,6 +136,14 @@ function outputHandles(data) {
   return [{ id: 'source', label: '', color: '#9ca3af' }]
 }
 
+// Merge shows N numbered input ports (n8n-style). Combine is always 2 inputs;
+// otherwise honour the configured Number of inputs.
+function inputHandles(data) {
+  if (data.kind !== 'merge') return null
+  const n = data.config?.mode === 'combine' ? 2 : (parseInt(data.config?.number_of_inputs) || 2)
+  return Array.from({ length: n }, (_, i) => ({ id: `input-${i}`, label: String(i + 1) }))
+}
+
 // ── Custom node ───────────────────────────────────────────────────────────────
 function WfNode({ id, data, selected }) {
   const meta = NODE_META[data.kind] || NODE_META.code
@@ -102,10 +151,12 @@ function WfNode({ id, data, selected }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(data.label || meta.label)
   const handles = outputHandles(data)
+  const inputs = inputHandles(data)
   const multi = handles.length > 1
-  // Grow the box so every output handle gets its own row (≈26px each) instead of
-  // cramming together and spilling below the node.
-  const minHeight = multi ? handles.length * 26 + 12 : undefined
+  // Grow the box so every output/input handle gets its own row (≈26px each)
+  // instead of cramming together and spilling below the node.
+  const rows = Math.max(handles.length, inputs?.length || 0)
+  const minHeight = rows > 1 ? rows * 26 + 12 : undefined
 
   function commit() {
     setEditing(false)
@@ -115,7 +166,19 @@ function WfNode({ id, data, selected }) {
   return (
     <div style={{ minHeight }} className={`bg-white rounded-xl border shadow-sm w-[190px] px-3 py-2.5 transition-all
       ${selected ? 'border-indigo-500 shadow-md' : 'border-gray-200'} ${STATUS_RING[data.status] || ''}`}>
-      {!NODE_META[data.kind]?.entry && data.kind !== 'trigger' && <Handle type="target" position={Position.Left} className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />}
+      {inputs ? inputs.map((h, i) => {
+        const top = `${(100 / (inputs.length + 1)) * (i + 1)}%`
+        return (
+          <React.Fragment key={h.id}>
+            <Handle id={h.id} type="target" position={Position.Left} style={{ top }}
+              className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />
+            {inputs.length > 1 && (
+              <span className="absolute text-[9px] text-gray-400 pointer-events-none"
+                style={{ top: `calc(${top} - 7px)`, left: -4, transform: 'translateX(-100%)' }}>{h.label}</span>
+            )}
+          </React.Fragment>
+        )
+      }) : (!NODE_META[data.kind]?.entry && data.kind !== 'trigger' && <Handle type="target" position={Position.Left} className="!w-2.5 !h-2.5 !bg-gray-300 !border-2 !border-white" />)}
       <div className="flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0" style={{ background: meta.color + '1a' }}>
           <Icon size={15} style={{ color: meta.color }} />
@@ -181,7 +244,102 @@ function ComplianceBadge({ c }) {
   return <span className={`inline-flex items-center gap-1 text-[11px] ${m.color}`}><m.icon size={12} /> {m.label}</span>
 }
 
-function EditorInner({ workflowId, onBack }) {
+// Conversational workflow builder. Chats with the user, captures the business
+// objective first, then writes the AI-generated graph onto the canvas each turn.
+// Last-resort guard: never render a raw JSON blob in the chat. If a reply still
+// looks like the builder's {"reply":...,"graph":...} object, pull out the reply.
+function cleanReply(reply) {
+  const s = String(reply || '').trim()
+  if (!s) return '(no reply)'
+  if (s.startsWith('{') && /"reply"\s*:/.test(s)) {
+    const m = s.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+    if (m) return m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n')
+    return "I've updated the workflow. Tell me what else you'd like to change."
+  }
+  return s
+}
+
+function AIAssistPanel({ objective, getGraph, onApply, onClose, history, onHistory }) {
+  const [messages, setMessages] = useState(
+    (history && history.length) ? history : [
+      { role: 'assistant', content: objective
+        ? `This flow's objective is: "${objective}". Tell me what you'd like to add or change and I'll update the workflow.`
+        : 'What is the main business objective for this flow — and why does it matter to your business? Tell me the outcome you\'re after, not the technical steps, so I can design the best workflow for it.' },
+    ])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [obj, setObj] = useState(objective || '')
+  const [error, setError] = useState('')
+  const scrollRef = useRef(null)
+  const inputRef = useRef(null)
+  useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight) }, [messages, busy])
+
+  async function send() {
+    const text = input.trim()
+    if (!text || busy) return
+    // The opener always asks for the objective, so the first user message IS the
+    // objective — capture it deterministically rather than relying on the model.
+    const isFirstUser = messages.every(m => m.role !== 'user')
+    const nextObj = obj || (isFirstUser ? text : '')
+    const convo = [...messages, { role: 'user', content: text }]
+    setMessages(convo); setInput(''); setBusy(true); setError(''); setObj(nextObj)
+    if (inputRef.current) inputRef.current.style.height = 'auto'
+    try {
+      const res = await fetch('/api/workflows/ai-build', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: convo, graph: getGraph(), objective: nextObj }),
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'AI build failed')
+      const data = await res.json()
+      const finalObj = data.objective || nextObj
+      setObj(finalObj)
+      onApply(data.graph || getGraph(), finalObj)
+      const next = [...convo, { role: 'assistant', content: cleanReply(data.reply) }]
+      setMessages(next)
+      onHistory && onHistory(next)
+    } catch (e) { setError(String(e.message || e)) } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="w-[340px] shrink-0 border-r border-gray-100 bg-white flex flex-col">
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center gap-2">
+        <div className="w-7 h-7 rounded-lg bg-indigo-100 flex items-center justify-center"><Sparkles size={15} className="text-indigo-600" /></div>
+        <div className="flex-1">
+          <div className="text-sm font-semibold text-gray-800">AI Assist</div>
+          <div className="text-[11px] text-gray-400">Build this flow by chatting</div>
+        </div>
+        {onClose && <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={16} /></button>}
+      </div>
+      {obj && (
+        <div className="px-4 py-2 bg-indigo-50/50 border-b border-indigo-100 text-[11px] text-indigo-700">
+          <span className="font-semibold">Objective:</span> {obj}
+        </div>
+      )}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
+        {messages.map((m, i) => (
+          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[85%] px-3 py-2 rounded-2xl text-[13px] whitespace-pre-wrap ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
+          </div>
+        ))}
+        {busy && <div className="flex justify-start"><div className="px-3 py-2 rounded-2xl bg-gray-100 text-gray-400 text-[13px] flex items-center gap-2"><Loader2 size={13} className="animate-spin" /> Thinking…</div></div>}
+        {error && <div className="text-[11px] text-red-500 bg-red-50 border border-red-100 rounded-lg px-2 py-1.5">{error}</div>}
+      </div>
+      <div className="p-3 border-t border-gray-100">
+        <div className="flex items-end gap-2">
+          <textarea ref={inputRef} rows={1} value={input}
+            onChange={e => { setInput(e.target.value); const t = e.target; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 160) + 'px' }}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
+            placeholder="Ask anything…"
+            className="flex-1 resize-none border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 overflow-y-auto" style={{ maxHeight: 160 }} />
+          <button onClick={send} disabled={busy || !input.trim()}
+            className="p-2 rounded-xl bg-indigo-600 text-white disabled:opacity-40 hover:bg-indigo-700"><ChevronRight size={18} /></button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EditorInner({ workflowId, onBack, aiAssist }) {
   const rf = useReactFlow()
   const agents = useOrgStore(s => s.agents)
   const getWorkflow = useOrgStore(s => s.getWorkflow)
@@ -210,24 +368,33 @@ function EditorInner({ workflowId, onBack }) {
   const [focusedKey, setFocusedKey] = useState(null)
   const [showDocs, setShowDocs] = useState(false)
   const [waitingHook, setWaitingHook] = useState(false)
+  const [objective, setObjective] = useState('')
+  const [improving, setImproving] = useState(false)
+  const [improveResult, setImproveResult] = useState(null)
+  const [showObjective, setShowObjective] = useState(false)
+  const [showVersions, setShowVersions] = useState(false)
+  const [improveBanner, setImproveBanner] = useState(null)
+  const [improveProgress, setImproveProgress] = useState(null)  // {step,total,label} while applying
+  const [assistOpen, setAssistOpen] = useState(!!aiAssist)   // AI builder panel — on by default for AI-created flows
+  const [aiChat, setAiChat] = useState([])                   // persisted AI Assist conversation
 
   const renameNode = useCallback((id, label) => {
     setNodes(ns => ns.map(n => n.id === id ? { ...n, data: { ...n.data, label } } : n))
   }, [])
 
-  useEffect(() => {
-    (async () => {
-      const wf = await getWorkflow(workflowId)
-      if (!wf) return
-      setName(wf.name); setStatus(wf.status); setRequireCompliance(!!wf.require_compliance)
-      setTriggerConfig(wf.trigger_config || {})
-      setNodes((wf.graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
-      setEdges((wf.graph?.edges || []).map(e => ({
-        ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
-      })))
-      setRuns(wf.runs || [])
-    })()
-  }, [workflowId])
+  const loadWorkflow = useCallback(async () => {
+    const wf = await getWorkflow(workflowId)
+    if (!wf) return
+    setName(wf.name); setStatus(wf.status); setRequireCompliance(!!wf.require_compliance)
+    setTriggerConfig(wf.trigger_config || {}); setObjective(wf.objective || ''); setAiChat(wf.ai_chat || [])
+    setNodes((wf.graph?.nodes || []).map(n => ({ ...n, type: n.type, data: { ...n.data, kind: n.type } })))
+    setEdges((wf.graph?.edges || []).map(e => ({
+      ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
+    })))
+    setRuns(wf.runs || [])
+  }, [workflowId, getWorkflow])
+
+  useEffect(() => { loadWorkflow() }, [loadWorkflow])
 
   const webhookUrl = triggerConfig.token
     ? `${window.location.origin}/api/hooks/workflow/${workflowId}?token=${triggerConfig.token}`
@@ -238,13 +405,39 @@ function EditorInner({ workflowId, onBack }) {
     ...n, data: { ...n.data, status: wfRun?.steps?.[n.id]?.status, onRename: renameNode },
   })), [nodes, wfRun, renameNode])
 
+  // Display edges: smoothstep so they bend at right angles (esp. backward loop-backs),
+  // loop-back edges drawn dashed/grey, and the loop's 'loop' edge labelled with the
+  // item count from the last run.
+  const displayEdges = useMemo(() => edges.map(e => {
+    const isBack = String(e.id || '').startsWith('wfback_')
+    const src = nodes.find(n => n.id === e.source)
+    // Count of items flowing down this edge from the source's last run (n8n-style).
+    const out = wfRun?.steps?.[e.source]?.output
+    let cnt
+    if (out != null) {
+      if (src?.data?.kind === 'loop') cnt = e.sourceHandle === 'loop' ? out.count : 1
+      else if (Array.isArray(out)) cnt = out.length
+      else if (Array.isArray(out.items)) cnt = out.items.length
+      else cnt = 1
+    }
+    const label = cnt != null ? `${cnt} item${cnt === 1 ? '' : 's'}` : undefined
+    return {
+      ...e, type: 'smoothstep', label,
+      style: isBack ? { stroke: '#94a3b8', strokeDasharray: '5 4' } : e.style,
+      labelStyle: { fontSize: 10, fill: '#4f46e5', fontWeight: 600 },
+      labelBgStyle: { fill: '#eef2ff' }, labelBgPadding: [4, 2], labelBgBorderRadius: 4,
+    }
+  }), [edges, nodes, wfRun])
+
   const onNodesChange = useCallback((c) => setNodes(ns => applyNodeChanges(c, ns)), [])
   const onEdgesChange = useCallback((c) => setEdges(es => applyEdgeChanges(c, es)), [])
   const onConnect = useCallback((params) => setEdges(es => addEdge({ ...params, animated: true }, es)), [])
 
   function addNode(kind) {
     const id = newId(kind)
-    const cfg = kind === 'switch' ? { rules: [{ condition: '', label: '' }] } : {}
+    const cfg = kind === 'switch' ? { rules: [{ condition: '', label: '' }] }
+      : kind === 'websearch' ? { fetch_content: true }
+      : {}
     // Drop the node at the center of whatever the user is currently viewing.
     let position = { x: 360, y: 160 }
     const pane = document.querySelector('.react-flow')
@@ -253,6 +446,24 @@ function EditorInner({ workflowId, onBack }) {
       const c = rf.screenToFlowPosition({ x: r.left + r.width / 2, y: r.top + r.height / 2 })
       position = { x: c.x - 95, y: c.y - 30 }   // offset by ~half node size so it lands centered
     }
+    // A Loop comes with a starter body: a "Replace Me" node on the loop branch whose
+    // end loops back into the Loop (n8n-style). The loop-back edge is visual only
+    // (id `wfback_*`) — the engine fans the body out per item on its own.
+    if (kind === 'loop') {
+      const bodyId = newId('noop')
+      setNodes(ns => [...ns,
+        { id, type: 'loop', position, data: { label: NODE_META.loop.label, kind: 'loop', config: {} } },
+        { id: bodyId, type: 'noop', position: { x: position.x + 240, y: position.y + 12 },
+          data: { label: 'Replace Me', kind: 'noop', config: {} } },
+      ])
+      setEdges(es => [...es,
+        { id: `${id}-loop-${bodyId}`, source: id, sourceHandle: 'loop', target: bodyId, animated: true },
+        { id: `wfback_${bodyId}_${id}`, source: bodyId, target: id, animated: true },
+      ])
+      setSelectedId(id)
+      setPaletteOpen(false)
+      return
+    }
     setNodes(ns => [...ns, {
       id, type: kind, position,
       data: { label: NODE_META[kind].label, kind, config: cfg },
@@ -260,6 +471,37 @@ function EditorInner({ workflowId, onBack }) {
     setSelectedId(id)       // place + select on the canvas; double-click opens its detail view
     setPaletteOpen(false)
   }
+
+  // Copy/paste the selected node with Cmd/Ctrl+C / Cmd/Ctrl+V. Ignored while typing
+  // in a field (input/textarea/CodeMirror) so normal text copy/paste still works.
+  const clipboardRef = useRef(null)   // { node, pastes }
+  useEffect(() => {
+    const editable = el => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey) || editable(document.activeElement)) return
+      const k = e.key.toLowerCase()
+      if (k === 'c') {
+        const n = nodes.find(x => x.id === selectedId)
+        if (n) { clipboardRef.current = { node: n, pastes: 0 }; e.preventDefault() }
+      } else if (k === 'v' && clipboardRef.current) {
+        e.preventDefault()
+        const { node: src } = clipboardRef.current
+        const kind = src.data.kind
+        const n = ++clipboardRef.current.pastes
+        const id = newId(kind)
+        const copy = {
+          id, type: src.type,
+          position: { x: (src.position?.x || 0) + 40 * n, y: (src.position?.y || 0) + 40 * n },
+          data: { label: `${src.data.label || NODE_META[kind].label} copy`, kind,
+                  config: JSON.parse(JSON.stringify(src.data.config || {})) },
+        }
+        setNodes(ns => [...ns, copy])
+        setSelectedId(id)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [nodes, selectedId])
 
   function updateNodeConfig(key, value) {
     setNodes(ns => ns.map(n => n.id === editingId
@@ -289,6 +531,27 @@ function EditorInner({ workflowId, onBack }) {
     }
   }
 
+  // Replace the canvas with an AI-generated graph (used by the AI Assist builder).
+  function applyGraph(graph) {
+    // Reconcile in place: preserve each kept node's measured dimensions (and seed a
+    // default for new ones) so edges keep rendering. RF v12 hides an edge whenever an
+    // endpoint lacks `measured` — and rapid successive applyGraph calls during streaming
+    // would otherwise rebuild nodes bare and make every edge vanish.
+    setNodes(prev => {
+      const byId = new Map(prev.map(n => [n.id, n]))
+      return (graph?.nodes || []).map(n => {
+        const ex = byId.get(n.id)
+        const base = { ...n, type: n.type, data: { ...n.data, kind: n.type } }
+        const measured = ex?.measured || { width: 220, height: 80 }
+        return ex ? { ...ex, ...base, position: n.position || ex.position, measured }
+                  : { ...base, width: 220, height: 80, measured }
+      })
+    })
+    setEdges((graph?.edges || []).map(e => ({
+      ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
+    })))
+  }
+
   async function handleSave() {
     setSaving(true)
     const trigger = pickTrigger(nodes)
@@ -296,8 +559,9 @@ function EditorInner({ workflowId, onBack }) {
     const trigger_type = tcfg.triggerType || 'manual'
     const trigger_config = { ...triggerConfig }
     if (trigger_type === 'schedule') trigger_config.cron = scheduleToCron(tcfg.schedule)
+    if (trigger_type === 'webhook') trigger_config.response_mode = tcfg.responseMode || 'auto'
     if (tcfg.sample) trigger_config.payload = tcfg.sample
-    const wf = await saveWorkflow(workflowId, { name, graph: buildGraph(), require_compliance: requireCompliance, trigger_type, trigger_config })
+    const wf = await saveWorkflow(workflowId, { name, graph: buildGraph(), require_compliance: requireCompliance, trigger_type, trigger_config, objective })
     if (wf?.trigger_config) setTriggerConfig(wf.trigger_config)   // pick up server-minted webhook token
     setSaving(false)
   }
@@ -316,6 +580,79 @@ function EditorInner({ workflowId, onBack }) {
     if (wf?.runs) setRuns(wf.runs)
     setTesting(false)
     if (d?.timeout) alert(d.message)
+  }
+
+  async function handleImprove() {
+    setImproving(true)
+    try {
+      await handleSave()   // persist latest objective + graph so the analysis is current
+      const res = await fetch(`/api/workflows/${workflowId}/improve`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
+      setImproveResult(await res.json())
+    } catch (e) {
+      setImproveResult({ error: String(e.message || e), suggestions: [] })
+    } finally { setImproving(false) }
+  }
+
+  // Apply suggestions one at a time, streaming progress: the canvas updates live as
+  // the AI implements each suggestion, then a final review pass stitches it together.
+  async function handleApplyImprove() {
+    setImproving(true)
+    const total = improveResult?.suggestions?.length || 1
+    try {
+      await handleSave()
+      setImproveResult(null)
+      setImproveBanner(null)
+      setImproveProgress({ step: 0, total, label: 'Starting…' })
+      const res = await fetch(`/api/workflows/${workflowId}/improve/apply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suggestions: improveResult?.suggestions || [], analysis: improveResult?.analysis || '' }),
+      })
+      if (!res.ok || !res.body) throw new Error((await res.json().catch(() => ({}))).detail || 'Improve failed')
+
+      const reader = res.body.getReader()
+      const dec = new TextDecoder()
+      let buf = '', lastError = ''
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2)
+          if (!line.startsWith('data:')) continue
+          let ev; try { ev = JSON.parse(line.slice(5).trim()) } catch { continue }
+          if (ev.graph) { applyGraph(ev.graph); requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 })) }
+          if (ev.type === 'step') setImproveProgress({ step: ev.index + 1, total: ev.total, label: ev.title })
+          else if (ev.type === 'review') setImproveProgress({ step: total, total, label: 'Reviewing & stitching the flow together…' })
+          else if (ev.type === 'verify') setImproveProgress({ step: total, total,
+            label: ev.ok ? '✓ Verified — flow is connected and wired'
+                         : `Verifying (attempt ${ev.attempt}/${ev.max}) — fixing ${ev.problems.length} issue(s)…` })
+          else if (ev.type === 'done') { setImproveProgress(null); setImproveBanner(ev.summary || 'AI improvements applied as a draft.') }
+          else if (ev.type === 'error') lastError = ev.message
+        }
+      }
+      if (lastError) { setImproveProgress(null); setImproveResult({ error: lastError, suggestions: [] }) }
+    } catch (e) {
+      setImproveProgress(null); setImproveResult({ error: String(e.message || e), suggestions: [] })
+    } finally { setImproving(false) }
+  }
+
+  // Snapshot the current canvas as a new (active) version. Label is optional —
+  // the backend names it "Version N" when blank.
+  async function saveAsNewVersion(label = '') {
+    await handleSave()
+    const res = await fetch(`/api/workflows/${workflowId}/versions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ graph: buildGraph(), label }),
+    })
+    if (res.ok) { setImproveBanner(null); await loadWorkflow() }
+    return res.ok
+  }
+
+  async function activateVersion(version) {
+    const res = await fetch(`/api/workflows/${workflowId}/versions/${version}/activate`, { method: 'POST' })
+    if (res.ok) { setImproveBanner(null); await loadWorkflow() }
   }
 
   async function handlePublish() {
@@ -340,10 +677,42 @@ function EditorInner({ workflowId, onBack }) {
     setStepping(false)
   }
 
-  // Cancel a test/step that's waiting for a webhook call.
+  // The input this node would receive from already-run upstream nodes (no re-run).
+  // Prefer this node's own captured input; else assemble from direct upstream outputs
+  // (single upstream → its output; multiple → merged), mirroring the engine.
+  function capturedInput(nodeId) {
+    const own = wfRun?.steps?.[nodeId]?.input
+    if (own) return own
+    const sources = [...new Set(edges.filter(e => e.target === nodeId).map(e => e.source))]
+    const outs = sources.map(s => wfRun?.steps?.[s]?.output).filter(o => o != null)
+    if (outs.length === 0) return null
+    if (outs.length === 1) return outs[0]
+    return Object.assign({}, ...outs.filter(o => typeof o === 'object'))
+  }
+
+  // Re-run ONLY this node using the input from upstream's last run — no upstream re-run.
+  async function handleStepOnly(nodeId) {
+    const input = capturedInput(nodeId)
+    if (!input) return
+    // Seed every already-run node's output by id AND label so {{Upstream.field}} tokens resolve.
+    const context = {}
+    for (const [id, s] of Object.entries(wfRun?.steps || {})) {
+      if (s?.output == null) continue
+      context[id] = s.output
+      const label = nodes.find(n => n.id === id)?.data?.label
+      if (label) context[label] = s.output
+    }
+    setStepping(true)
+    await handleSave()
+    await executeStep(workflowId, nodeId, input, true, context)
+    setStepping(false)
+  }
+
+  // Stop a running test/step — cancels a webhook wait AND an executing run.
   async function handleStop() {
     await stopTest(workflowId)
     setWaitingHook(false)
+    setStepping(false)
   }
 
   const editing = nodes.find(n => n.id === editingId)
@@ -386,11 +755,33 @@ function EditorInner({ workflowId, onBack }) {
               className={`px-3 py-1 text-xs font-medium rounded-md capitalize ${tab === t ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>{t}</button>
           ))}
         </div>
-        <label className="flex items-center gap-1.5 text-xs text-gray-500 ml-2 cursor-pointer">
-          <input type="checkbox" checked={requireCompliance} onChange={e => setRequireCompliance(e.target.checked)} />
-          Require compliance review
-        </label>
         <div className="flex-1" />
+
+        {/* AI / meta tools */}
+        <button onClick={() => setAssistOpen(o => !o)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg ${assistOpen ? 'text-white bg-indigo-600 border-indigo-600 hover:bg-indigo-700' : 'text-indigo-600 border-indigo-200 hover:bg-indigo-50'}`}
+          title="Build or refine this flow by chatting with AI">
+          <Sparkles size={14} /> AI Assist
+        </button>
+        <button onClick={handleImprove} disabled={improving}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-violet-600 border border-violet-200 rounded-lg hover:bg-violet-50 disabled:opacity-50"
+          title="Analyse this flow against its objective and suggest improvements">
+          {improving ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} Improve flow
+        </button>
+        <button onClick={() => setShowObjective(true)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg ${objective ? 'text-gray-700 border-gray-200 hover:bg-gray-50' : 'text-amber-700 border-amber-200 bg-amber-50 hover:bg-amber-100'}`}
+          title="Set the business objective for this workflow">
+          <Target size={14} /> {objective ? 'Objective' : 'Set objective'}
+        </button>
+        <button onClick={() => setShowVersions(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50"
+          title="Workflow versions — view, revert, and choose the active one">
+          <History size={14} /> Versions
+        </button>
+
+        <div className="w-px h-6 bg-gray-200 mx-1" />
+
+        {/* Run / save / publish */}
         <button onClick={handleTest} disabled={testing}
           className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-50 disabled:opacity-50">
           {testing ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} Test
@@ -409,6 +800,40 @@ function EditorInner({ workflowId, onBack }) {
           <Globe size={14} /> {status === 'live' ? 'Unpublish' : 'Publish'}
         </button>
       </div>
+
+      {improveProgress && (
+        <div className="px-4 py-2.5 bg-violet-50 border-b border-violet-200 text-xs text-violet-800">
+          <div className="flex items-center gap-2">
+            <Loader2 size={14} className="shrink-0 animate-spin" />
+            <span className="flex-1 leading-relaxed truncate">
+              <b>AI is improving your flow…</b> step {Math.min(improveProgress.step, improveProgress.total)} of {improveProgress.total}
+              {improveProgress.label ? ` — ${improveProgress.label}` : ''}
+            </span>
+            <span className="shrink-0 tabular-nums font-medium">
+              {Math.round((Math.min(improveProgress.step, improveProgress.total) / Math.max(improveProgress.total, 1)) * 100)}%
+            </span>
+          </div>
+          <div className="mt-1.5 h-1.5 w-full rounded-full bg-violet-200 overflow-hidden">
+            <div className="h-full rounded-full bg-violet-600 transition-all duration-500 ease-out"
+              style={{ width: `${Math.round((Math.min(improveProgress.step, improveProgress.total) / Math.max(improveProgress.total, 1)) * 100)}%` }} />
+          </div>
+        </div>
+      )}
+
+      {improveBanner && !improveProgress && (
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-violet-50 border-b border-violet-200 text-xs text-violet-800">
+          <Sparkles size={14} className="shrink-0 mt-0.5" />
+          <span className="flex-1 leading-relaxed"><b>AI draft applied:</b> {improveBanner}</span>
+          <button onClick={() => saveAsNewVersion()}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 shrink-0 whitespace-nowrap">
+            <Check size={13} /> Save as new version
+          </button>
+          <button onClick={() => { setImproveBanner(null); loadWorkflow() }}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-violet-800 bg-white border border-violet-300 rounded-lg hover:bg-violet-100 shrink-0 whitespace-nowrap">
+            <X size={13} /> Discard
+          </button>
+        </div>
+      )}
 
       {waitingHook && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-800">
@@ -430,9 +855,19 @@ function EditorInner({ workflowId, onBack }) {
         <ExecutionsView runs={runs} nodes={nodes} wfRun={wfRun} getRun={getRun} onRefresh={refreshRuns} workflowId={workflowId} />
       ) : (
       <div className="flex-1 flex min-h-0">
+        {assistOpen && (
+          <AIAssistPanel
+            objective={objective}
+            getGraph={buildGraph}
+            history={aiChat}
+            onHistory={(msgs) => { setAiChat(msgs); if (workflowId) saveWorkflow(workflowId, { ai_chat: msgs }) }}
+            onApply={(graph, obj) => { applyGraph(graph); if (obj) setObjective(obj); requestAnimationFrame(() => rf?.fitView?.({ padding: 0.2 })) }}
+            onClose={() => setAssistOpen(false)}
+          />
+        )}
         {/* Canvas */}
         <div className="flex-1 relative">
-          <ReactFlow nodes={liveNodes} edges={edges} nodeTypes={nodeTypes}
+          <ReactFlow nodes={liveNodes} edges={displayEdges} nodeTypes={nodeTypes}
             onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
             onNodeClick={(_, n) => setSelectedId(n.id)} onNodeDoubleClick={(_, n) => setEditingId(n.id)}
             onPaneClick={() => setSelectedId(null)}
@@ -447,6 +882,17 @@ function EditorInner({ workflowId, onBack }) {
             <Plus size={16} /> Add node
           </button>
 
+          {/* Compliance review toggle — floats on the canvas, not crammed in the toolbar */}
+          <button onClick={() => setRequireCompliance(v => !v)}
+            title="When on, AI-agent outputs in this workflow pass a compliance review before continuing."
+            className={`absolute top-3 left-3 flex items-center gap-2 pl-3 pr-2 py-2 text-sm font-medium rounded-lg shadow-sm border bg-white ${requireCompliance ? 'text-emerald-700 border-emerald-200' : 'text-gray-500 border-gray-200'}`}>
+            {requireCompliance ? <ShieldCheck size={16} className="text-emerald-600" /> : <ShieldAlert size={16} className="text-gray-300" />}
+            Compliance review
+            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${requireCompliance ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-400'}`}>
+              {requireCompliance ? 'ON' : 'OFF'}
+            </span>
+          </button>
+
           {paletteOpen && <NodePalette onAdd={addNode} onClose={() => setPaletteOpen(false)} />}
 
           {editing && (
@@ -457,6 +903,8 @@ function EditorInner({ workflowId, onBack }) {
               onClose={() => setEditingId(null)} onRename={updateNodeLabel}
               onConfig={updateNodeConfig} onFocusField={setFocusedKey}
               onInsert={insertToken} onDelete={deleteEditing} onStep={() => handleStep(editing.id)}
+              onStepOnly={() => handleStepOnly(editing.id)} hasInput={!!capturedInput(editing.id)}
+              onExecuteNode={handleStep}
               onStop={handleStop}
               prevNodes={(() => { const ids = [...new Set(edges.filter(e => e.target === editing.id).map(e => e.source))]; return ids.map(id => nodes.find(n => n.id === id)).filter(Boolean) })()}
               nextNodes={(() => { const ids = [...new Set(edges.filter(e => e.source === editing.id).map(e => e.target))]; return ids.map(id => nodes.find(n => n.id === id)).filter(Boolean) })()}
@@ -468,6 +916,172 @@ function EditorInner({ workflowId, onBack }) {
       )}
 
       {showDocs && <WorkflowDocs onClose={() => setShowDocs(false)} />}
+      {improveResult && <ImproveModal result={improveResult} objective={objective}
+        applying={improving} onApply={handleApplyImprove} onClose={() => setImproveResult(null)} />}
+      {showObjective && <ObjectiveModal value={objective}
+        onSave={async (v) => { setObjective(v); setShowObjective(false); await saveWorkflow(workflowId, { objective: v }) }}
+        onClose={() => setShowObjective(false)} />}
+      {showVersions && <VersionsPanel workflowId={workflowId}
+        onActivate={activateVersion} onSaveNew={saveAsNewVersion} onClose={() => setShowVersions(false)} />}
+    </div>
+  )
+}
+
+// ── Improve-flow modal ────────────────────────────────────────────────────────
+const IMPACT_STYLE = {
+  tokens: 'bg-amber-100 text-amber-700', reliability: 'bg-blue-100 text-blue-700',
+  simplicity: 'bg-emerald-100 text-emerald-700', accuracy: 'bg-violet-100 text-violet-700',
+}
+const MEETS_STYLE = {
+  yes: 'bg-emerald-100 text-emerald-700', partly: 'bg-amber-100 text-amber-700',
+  no: 'bg-red-100 text-red-700', unknown: 'bg-gray-100 text-gray-500',
+}
+
+function ImproveModal({ result, objective, applying, onApply, onClose }) {
+  const suggestions = Array.isArray(result.suggestions) ? result.suggestions : []
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <Sparkles size={16} className="text-violet-600" />
+            <h2 className="text-base font-semibold text-gray-800">Improve flow</h2>
+          </div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {result.error ? (
+            <p className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{result.error}</p>
+          ) : <>
+            {objective && <p className="text-xs text-gray-400"><span className="font-semibold text-gray-500">Objective:</span> {objective}</p>}
+            <div className="flex items-center gap-2 flex-wrap">
+              {result.meets_objective && (
+                <span className={`text-[11px] font-semibold px-2 py-1 rounded-full ${MEETS_STYLE[result.meets_objective] || MEETS_STYLE.unknown}`}>
+                  Meets objective: {result.meets_objective}
+                </span>
+              )}
+              {result.total_tokens != null && (
+                <span className="text-[11px] font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-600">
+                  {result.total_tokens.toLocaleString()} AI tokens (recent runs)
+                </span>
+              )}
+            </div>
+            {result.analysis && <p className="text-sm text-gray-700 leading-relaxed">{result.analysis}</p>}
+            <div className="space-y-2">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Suggestions</h3>
+              {suggestions.length === 0 && <p className="text-sm text-gray-400">No suggestions — the flow looks good.</p>}
+              {suggestions.map((s, i) => (
+                <div key={i} className="border border-gray-200 rounded-xl p-3">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-sm font-medium text-gray-800">{s.title}</span>
+                    {s.impact && <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${IMPACT_STYLE[s.impact] || 'bg-gray-100 text-gray-600'}`}>{s.impact}</span>}
+                  </div>
+                  <p className="text-xs text-gray-500 leading-relaxed">{s.detail}</p>
+                </div>
+              ))}
+            </div>
+          </>}
+        </div>
+        <div className="px-5 py-3 border-t border-gray-100 flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50">Close</button>
+          {!result.error && (
+            <button onClick={onApply} disabled={applying}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-50">
+              {applying ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} Apply with AI
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Edit the workflow's business objective.
+function ObjectiveModal({ value, onSave, onClose }) {
+  const [text, setText] = useState(value || '')
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-5" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2"><Target size={16} className="text-amber-600" />
+            <h2 className="text-base font-semibold text-gray-800">Business objective</h2></div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <p className="text-xs text-gray-400 mb-3">What should this workflow achieve? Used to evaluate and improve the flow.</p>
+        <textarea autoFocus rows={4} value={text} onChange={e => setText(e.target.value)}
+          placeholder="e.g. Notify sales in Slack whenever a high-value order is placed."
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-400 resize-y" />
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50">Cancel</button>
+          <button onClick={() => onSave(text.trim())} className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700">Save</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// View, revert, and choose the active workflow version.
+function VersionsPanel({ workflowId, onActivate, onSaveNew, onClose }) {
+  const [versions, setVersions] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [label, setLabel] = useState('')
+  const refresh = useCallback(async () => {
+    const res = await fetch(`/api/workflows/${workflowId}/versions`)
+    if (res.ok) setVersions((await res.json()).versions || [])
+  }, [workflowId])
+  useEffect(() => { refresh() }, [refresh])
+
+  async function saveNew() {
+    setBusy(true)
+    try { const ok = await onSaveNew(label.trim()); if (ok) { setLabel(''); await refresh() } }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <div className="flex items-center gap-2"><History size={16} className="text-gray-600" />
+            <h2 className="text-base font-semibold text-gray-800">Versions</h2></div>
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X size={18} /></button>
+        </div>
+        <div className="px-5 py-3 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <input value={label} onChange={e => setLabel(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !busy) saveNew() }}
+              placeholder="Label (optional)"
+              className="flex-1 border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm outline-none focus:border-violet-400" />
+            <button onClick={saveNew} disabled={busy}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-violet-600 rounded-lg hover:bg-violet-700 disabled:opacity-50 shrink-0">
+              {busy ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />} Save as new version
+            </button>
+          </div>
+          <p className="text-[11px] text-gray-400 mt-1.5">Only the <b>active</b> version runs when the trigger fires.</p>
+        </div>
+        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {versions === null && <p className="text-sm text-gray-400 p-2">Loading…</p>}
+          {versions?.map(v => (
+            <div key={v.version} className={`border rounded-xl px-3 py-2.5 flex items-center gap-3 ${v.active ? 'border-green-300 bg-green-50/50' : 'border-gray-200'}`}>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-gray-800">v{v.version}</span>
+                  <span className="text-xs text-gray-500 truncate">{v.label}</span>
+                  {v.active && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">ACTIVE</span>}
+                </div>
+                <div className="text-[11px] text-gray-400">{(v.graph?.nodes || []).length} nodes · {fmtLocal(v.created_at)}</div>
+              </div>
+              {v.active ? (
+                <span className="flex items-center gap-1 text-xs text-green-600 font-medium"><Check size={13} /> Running</span>
+              ) : (
+                <button onClick={async () => { setBusy(true); await onActivate(v.version); setBusy(false); refresh() }} disabled={busy}
+                  className="px-3 py-1.5 text-xs font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                  Make active
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -504,11 +1118,33 @@ function WorkflowDocs({ onClose }) {
           <Section title="Using data from previous nodes">
             <p>In the node detail view, the <b>Input</b> pane (left) lists every upstream node's output. <b>Drag a field</b> into a parameter box, or click it, to insert a reference like <Code>{'{{HTTP Request.body.id}}'}</Code>. Tokens resolve at run time and work by node name.</p>
           </Section>
+          <Section title="Built-in variables">
+            <p>These are always available in any <Code>{'{{token}}'}</Code> field — no upstream node needed (great for filenames, timestamps, etc.):</p>
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[12px]">
+              {[
+                ['{{today}}', 'Date — 2026-06-28'],
+                ['{{now}}', 'Date & time (ISO)'],
+                ['{{time}}', 'Time — 08:00:00'],
+                ['{{timestamp}}', 'Unix seconds'],
+                ['{{year}} {{month}} {{day}}', 'Date parts'],
+                ['{{weekday}}', 'e.g. Monday'],
+                ['{{workflow.name}}', "This workflow's name"],
+                ['{{workflow.id}}', "This workflow's id"],
+                ['{{run.id}}', 'Current execution id'],
+                ['{{run.mode}}', 'test or live'],
+              ].map(([t, d]) => (
+                <div key={t} className="flex items-baseline gap-2">
+                  <Code>{t}</Code><span className="text-gray-400">{d}</span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-2 text-gray-400">Tip: <Code>tech_news_{'{{today}}'}.txt</Code> → <Code>tech_news_2026-06-28.txt</Code>. (They're also reachable as <Code>{'{{$vars.today}}'}</Code>.)</p>
+          </Section>
           <Section title="Code node">
             <p>Choose <b>Python</b> or <b>JavaScript</b>. <Code>input</Code> is the incoming data, <Code>context</Code> holds every node's output. Produce a result with <Code>return {'{...}'}</Code> (or set <Code>output</Code>). Dragged <Code>{'{{tokens}}'}</Code> are replaced with literal values before running. Use <b>Format</b> to tidy the code.</p>
           </Section>
           <Section title="AI / Agent node & compliance">
-            <p>The AI node runs a prompt through an org agent — optionally overriding the provider & model. If <b>Require compliance review</b> is on, the org's Risk & Compliance agent assesses the output; with no such agent the step is flagged <b>unchecked</b> but still runs.</p>
+            <p>The AI node is a <b>self-contained agent</b>: give it a provider, model, system prompt and task. It has every tool (web search, browser, files, shell, MCP), loops to gather accurate data, and self-evaluates before answering. If <b>Compliance review</b> is on (the chip on the canvas), the org's Risk & Compliance agent must clear the output before it flows on — a block, <i>or having no compliance agent set up</i>, fails the step.</p>
           </Section>
           <Section title="Error handling">
             <p>Add an <b>Error Trigger</b> node (Add Trigger group). It sits outside the normal flow and runs only when any node fails, receiving <Code>{'{{Error Trigger.error}}'}</Code> so you can notify, log, or recover.</p>
@@ -573,6 +1209,12 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
   // Show steps in the order they actually executed (graph/flow order), not node-array order.
   const orderIds = matched?.order?.length ? matched.order : nodes.map(n => n.id)
   const ordered = orderIds.map(id => ({ node: byId[id], step: steps[id] })).filter(x => x.node && x.step)
+  // Total AI tokens for this run (only LLM nodes contribute; 0 when none involved).
+  const runTokens = ordered.reduce((t, { step }) => t + (step.input_tokens || 0) + (step.output_tokens || 0), 0)
+  // Compliance review cards — LLM steps that were actually assessed (not 'off'/'skipped').
+  const complianceItems = ordered
+    .filter(({ step }) => step.compliance && !['skipped'].includes(step.compliance.status))
+    .map(({ node, step }) => ({ node, c: step.compliance }))
   return (
     <div className="flex-1 flex min-h-0">
       <aside className="w-72 border-r border-gray-100 overflow-y-auto shrink-0">
@@ -604,6 +1246,12 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
       <main className="flex-1 overflow-y-auto p-5">
         {!selId ? <p className="text-sm text-gray-400">Select an execution to see its steps.</p> : (
           <div className="space-y-2 max-w-3xl">
+            {runTokens > 0 && (
+              <div className="flex items-center gap-1.5 text-xs text-gray-500 mb-1">
+                <Sparkles size={13} className="text-violet-500" />
+                <span className="font-medium text-gray-700">{runTokens.toLocaleString()}</span> AI tokens used this run
+              </div>
+            )}
             {ordered.length === 0 && <p className="text-sm text-gray-400">Loading steps…</p>}
             {ordered.map(({ node, step }) => (
               <div key={node.id} className="bg-white border border-gray-200 rounded-xl px-4 py-3">
@@ -612,6 +1260,11 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
                   <span className="text-sm font-medium text-gray-800">{node.data.label}</span>
                   <span className="text-[10px] text-gray-400">{NODE_META[node.data.kind]?.label}</span>
                   {step.compliance && <ComplianceBadge c={step.compliance} />}
+                  {(step.input_tokens || step.output_tokens) ? (
+                    <span className="ml-auto text-[10px] font-medium text-violet-600 bg-violet-50 rounded-full px-1.5 py-0.5">
+                      {((step.input_tokens || 0) + (step.output_tokens || 0)).toLocaleString()} tok
+                    </span>
+                  ) : null}
                 </div>
                 {step.error
                   ? <p className="text-xs text-red-500 mt-1 break-words">{step.error}</p>
@@ -621,7 +1274,101 @@ function ExecutionsView({ runs, nodes, wfRun, getRun, onRefresh, workflowId }) {
           </div>
         )}
       </main>
+      {selId && complianceItems.length > 0 && <ComplianceReviewPanel items={complianceItems} />}
     </div>
+  )
+}
+
+// ── Compliance review panel (Executions tab) ──────────────────────────────────
+const RISK_LEVEL_STYLE = {
+  low:      { dot: 'bg-green-500',  text: 'text-green-700',  bg: 'bg-green-50 border-green-200' },
+  medium:   { dot: 'bg-amber-500',  text: 'text-amber-700',  bg: 'bg-amber-50 border-amber-200' },
+  high:     { dot: 'bg-orange-500', text: 'text-orange-700', bg: 'bg-orange-50 border-orange-200' },
+  critical: { dot: 'bg-red-500',    text: 'text-red-700',    bg: 'bg-red-50 border-red-200' },
+}
+
+function ComplianceReviewPanel({ items }) {
+  return (
+    <aside className="w-[380px] border-l border-gray-100 overflow-y-auto shrink-0 bg-gray-50/50">
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 bg-white">
+        <ShieldCheck size={15} className="text-indigo-600" />
+        <div>
+          <div className="text-sm font-semibold text-gray-800">Compliance review</div>
+          <div className="text-[11px] text-gray-400">How Risk &amp; Compliance scored each AI output</div>
+        </div>
+      </div>
+
+      <div className="p-3 space-y-3">
+        {items.map(({ node, c }) => {
+          const lvl = (c.level || '').toLowerCase()
+          const st = RISK_LEVEL_STYLE[lvl] || RISK_LEVEL_STYLE.medium
+          const blocked = c.status === 'blocked'
+          const cats = Object.entries(c.categories || {}).filter(([, v]) => v && (v.score || v.note))
+          return (
+            <div key={node.id} className={`rounded-xl border ${st.bg} p-3 space-y-2.5`}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[13px] font-semibold text-gray-800 truncate">{node.data.label}</span>
+                <span className={`shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold ${st.text}`}>
+                  <span className={`w-2 h-2 rounded-full ${st.dot}`} /> {(c.level || 'n/a').toUpperCase()}
+                </span>
+              </div>
+
+              {c.status === 'unchecked' ? (
+                <p className="text-xs text-amber-700">No Risk &amp; Compliance agent is set up, so this output
+                  could not be reviewed. Add one in Risk &amp; Compliance.</p>
+              ) : c.status === 'error' ? (
+                <p className="text-xs text-gray-500">Review error: {c.reason}</p>
+              ) : (
+                <>
+                  <div className="flex items-center gap-3 text-xs">
+                    <span className={`font-semibold px-2 py-0.5 rounded-full ${blocked ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+                      {blocked ? 'Blocked' : 'Cleared'}
+                    </span>
+                    <span className="text-gray-600">
+                      Risk score <b className="text-gray-800">{c.score ?? '—'}</b>
+                      {c.threshold != null && <span className="text-gray-400"> / block at {c.threshold}</span>}
+                    </span>
+                  </div>
+
+                  {c.rationale && (
+                    <div>
+                      <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-0.5">Why</div>
+                      <p className="text-xs text-gray-700 leading-relaxed">{c.rationale}</p>
+                    </div>
+                  )}
+
+                  {cats.length > 0 && (
+                    <div>
+                      <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Risk breakdown</div>
+                      <div className="space-y-1">
+                        {cats.map(([name, v]) => (
+                          <div key={name} className="flex items-start gap-2 text-[11px]">
+                            <span className="capitalize font-medium text-gray-700 w-20 shrink-0">{name}</span>
+                            <span className="text-gray-400 shrink-0">L{v.likelihood}×C{v.consequence}={v.score}</span>
+                            {v.note && <span className="text-gray-500 flex-1">{v.note}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {(c.findings || []).length > 0 && (
+                    <p className="text-[11px] text-red-600">⚠ {c.findings.length} sensitive value(s) detected in output.</p>
+                  )}
+
+                  {c.reviewer && <p className="text-[10px] text-gray-400">Reviewed by {c.reviewer}</p>}
+                </>
+              )}
+            </div>
+          )
+        })}
+
+        <p className="text-[10px] text-gray-400 leading-relaxed px-1 pt-1">
+          Coming soon: when an output exceeds the risk level, the compliance agent will hand it back to the
+          AI agent with its findings to revise — a self-improving review loop.
+        </p>
+      </div>
+    </aside>
   )
 }
 
@@ -745,7 +1492,7 @@ function Tree({ data, base, onInsert, onDragStart, onDragEnd }) {
   )
 }
 
-function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
+function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd, onExecute, stepping }) {
   const [open, setOpen] = useState(true)
   const ref = node.data.label || node.id
   const meta = NODE_META[node.data.kind] || {}
@@ -762,7 +1509,12 @@ function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
       {open && (
         <div className="pb-1.5">
           {output == null
-            ? <p className="text-[11px] text-gray-400 pl-7 pr-2 py-1">No data — run to view, or drag the whole node: <button onClick={() => onInsert(`{{${ref}}}`)} className="font-mono text-indigo-500 hover:underline">{`{{${ref}}}`}</button></p>
+            ? <div className="pl-7 pr-2 py-1 space-y-1.5">
+                <p className="text-[11px] text-gray-400">No data — run to view, or drag the whole node: <button onClick={() => onInsert(`{{${ref}}}`)} className="font-mono text-indigo-500 hover:underline">{`{{${ref}}}`}</button></p>
+                {onExecute && <button onClick={() => onExecute(node.id)} disabled={stepping}
+                  className="flex items-center gap-1 text-[11px] text-orange-600 border border-orange-300 hover:bg-orange-50 rounded-md px-2 py-1 disabled:opacity-50">
+                  <Play size={11} /> Execute step</button>}
+              </div>
             : <Tree data={output} base={ref} onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd} />}
         </div>
       )}
@@ -770,7 +1522,7 @@ function NodeAccordion({ node, output, onInsert, onDragStart, onDragEnd }) {
   )
 }
 
-function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, onDragEnd }) {
+function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, onDragEnd, onExecute, stepping }) {
   const [view, setView] = useState('schema')
   const input = step?.input
   return (
@@ -793,7 +1545,8 @@ function InputPanel({ ancestors, steps, step, isEntry, onInsert, onDragStart, on
         ) : (
           ancestors.map(a => (
             <NodeAccordion key={a.id} node={a} output={steps[a.id]?.output}
-              onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd} />
+              onInsert={onInsert} onDragStart={onDragStart} onDragEnd={onDragEnd}
+              onExecute={onExecute} stepping={stepping} />
           ))
         )}
       </div>
@@ -825,6 +1578,7 @@ function RunStatus({ status, small }) {
   if (status === 'running') return <Loader2 size={sz} className="text-blue-500 animate-spin shrink-0" />
   if (status === 'success') return <CheckCircle2 size={sz} className="text-green-500 shrink-0" />
   if (status === 'failed')  return <AlertCircle size={sz} className="text-red-500 shrink-0" />
+  if (status === 'cancelled') return <Ban size={sz} className="text-slate-400 shrink-0" title="Cancelled" />
   return <span className="text-gray-400">{status}</span>
 }
 
@@ -836,6 +1590,13 @@ function SwitchConfig({ config, onChange, onFocusField }) {
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
   return (
     <div className="space-y-2">
+      <div>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Expression language</label>
+        <select value={config.lang || 'python'} onChange={e => onChange('lang', e.target.value)} className={`${base} text-xs`}>
+          <option value="python">Python</option>
+          <option value="javascript">JavaScript</option>
+        </select>
+      </div>
       <label className="block text-[11px] font-medium text-gray-500">Rules — first match wins; otherwise the <b>default</b> output</label>
       {rules.map((r, i) => (
         <div key={i} className="border border-gray-200 rounded-lg p-2 space-y-1.5">
@@ -845,7 +1606,7 @@ function SwitchConfig({ config, onChange, onFocusField }) {
           </div>
           <input value={r.label || ''} onChange={e => update(i, { label: e.target.value })} placeholder="Output label (optional)" className={`${base} text-xs`} />
           <input value={r.condition || ''} onFocus={() => onFocusField && onFocusField('rules')} onChange={e => update(i, { condition: e.target.value })}
-            placeholder="Condition, e.g. input['type'] == 'mint'" className={`${base} font-mono text-xs`} />
+            placeholder="Condition, e.g. {{Code.output}} > 1 && {{Code.output}} < 3" className={`${base} font-mono text-xs`} />
         </div>
       ))}
       <button onClick={add} className="flex items-center gap-1 text-xs text-indigo-600 hover:underline"><Plus size={12} /> Add rule</button>
@@ -900,28 +1661,28 @@ function LlmConfig({ config, agents, onChange, onFocusField, dragActive, dropTok
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
   return (
     <>
-      <div>
-        <label className="block text-[11px] font-medium text-gray-500 mb-1">Agent (identity & compliance)</label>
-        <select value={config.agent_id || ''} onChange={e => onChange('agent_id', e.target.value)} className={base}>
-          <option value="">Auto (first non-manager)</option>
-          {(agents || []).map(a => <option key={a.config.id} value={a.config.id}>{a.config.name}</option>)}
-        </select>
+      <div className="flex items-start gap-2 p-2.5 rounded-lg bg-indigo-50/60 border border-indigo-100">
+        <Sparkles size={14} className="text-indigo-500 shrink-0 mt-0.5" />
+        <p className="text-[11px] text-indigo-700/90 leading-relaxed">
+          This is a self-contained AI agent: it has <b>every tool</b> (web search, browser, files, shell, MCP) and
+          loops to gather accurate data before answering. Just give it a provider, model, and the task.
+        </p>
       </div>
       <div>
-        <label className="block text-[11px] font-medium text-gray-500 mb-1">Provider (override)</label>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Provider</label>
         <select value={config.api_provider_id || ''} onChange={e => { onChange('api_provider_id', e.target.value); onChange('model', '') }} className={base}>
-          <option value="">Use the agent's provider</option>
+          <option value="">Default provider</option>
           {(providers || []).map(p => <option key={p.id} value={p.id}>{p.name} ({p.provider})</option>)}
         </select>
       </div>
       <div>
         <label className="block text-[11px] font-medium text-gray-500 mb-1">Model</label>
         <ModelSelect value={config.model || ''} models={models} onChange={v => onChange('model', v)}
-          placeholder={config.api_provider_id ? 'Select or type a model' : "Agent's default model"} />
+          placeholder={config.api_provider_id ? 'Select or type a model' : 'Default model'} />
       </div>
-      <Field label="System prompt" type="textarea" value={config.system || ''} placeholder="You are a helpful assistant…" onChange={v => onChange('system', v)} onFocus={() => onFocusField && onFocusField('system')} dragActive={dragActive} onDropToken={dropToken && dropToken('system')} />
-      <Field label="Prompt (templates: {{nodeId.field}})" type="textarea" value={config.prompt || ''} onChange={v => onChange('prompt', v)} onFocus={() => onFocusField && onFocusField('prompt')} dragActive={dragActive} onDropToken={dropToken && dropToken('prompt')} />
-      <Field label="Max tokens" type="number" value={config.max_tokens ?? ''} onChange={v => onChange('max_tokens', v)} />
+      <Field label="System prompt (the agent's role & rules)" type="textarea" value={config.system || ''} placeholder="You are a financial news research analyst…" onChange={v => onChange('system', v)} onFocus={() => onFocusField && onFocusField('system')} dragActive={dragActive} onDropToken={dropToken && dropToken('system')} />
+      <Field label="Prompt — the task (templates: {{nodeId.field}})" type="textarea" value={config.prompt || ''} onChange={v => onChange('prompt', v)} onFocus={() => onFocusField && onFocusField('prompt')} dragActive={dragActive} onDropToken={dropToken && dropToken('prompt')} />
+      <Field label="Max tool-call rounds" type="number" value={config.max_iterations ?? ''} placeholder="12" onChange={v => onChange('max_iterations', v)} />
     </>
   )
 }
@@ -984,8 +1745,8 @@ function NavNodes({ nodes, side, onNavigate }) {
 }
 
 function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookUrl, stepping,
-                      onClose, onRename, onConfig, onFocusField, onInsert, onDelete, onStep, onStop,
-                      prevNodes, nextNodes, onNavigate }) {
+                      onClose, onRename, onConfig, onFocusField, onInsert, onDelete, onStep, onStepOnly, hasInput, onStop,
+                      onExecuteNode, prevNodes, nextNodes, onNavigate }) {
   const meta = NODE_META[node.data.kind] || {}
   const Icon = meta.icon || CircleSlash
   const config = node.data.config || {}
@@ -1017,10 +1778,18 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             <X size={14} /> Stop
           </button>
         ) : (
-          <button onClick={onStep}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-orange-500 hover:bg-orange-600 rounded-lg">
-            <Play size={14} /> Execute step
-          </button>
+          <>
+            {hasInput && !isEntry && (
+              <button onClick={onStepOnly} title="Re-run only this node with the input captured from the last run — no upstream re-run"
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-orange-600 border border-orange-300 hover:bg-orange-50 rounded-lg">
+                <Play size={14} /> This step only
+              </button>
+            )}
+            <button onClick={onStep}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-orange-500 hover:bg-orange-600 rounded-lg">
+              <Play size={14} /> Execute step
+            </button>
+          </>
         )}
         <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-700"><X size={18} /></button>
       </div>
@@ -1037,7 +1806,8 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             </div>
           ) : (
             <InputPanel ancestors={ancestors} steps={steps} step={step} isEntry={isEntry}
-              onInsert={onInsert} onDragStart={() => setDragActive(true)} onDragEnd={() => setDragActive(false)} />
+              onInsert={onInsert} onDragStart={() => setDragActive(true)} onDragEnd={() => setDragActive(false)}
+              onExecute={onExecuteNode} stepping={stepping} />
           )}
         </div>
 
@@ -1051,7 +1821,8 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
             {meta.custom === 'code' && <CodeConfig config={config} onChange={onConfig} onFocusField={onFocusField} dragActive={dragActive} dropToken={dropToken} />}
             {meta.custom === 'http' && <HttpConfig config={config} onChange={onConfig} onFocusField={onFocusField} dragActive={dragActive} dropToken={dropToken} />}
             {meta.custom === 'trigger' && <TriggerConfig config={config} onChange={onConfig} webhookUrl={webhookUrl} />}
-            {(meta.fields || []).map(({ key, ...f }) => (
+            {meta.custom === 'set' && <SetConfig config={config} onChange={onConfig} onFocusField={onFocusField} />}
+            {(meta.fields || []).filter(({ showIf }) => !showIf || showIf(config)).map(({ key, showIf, ...f }) => (
               <Field key={key} {...f} agents={agents} value={config[key] ?? ''}
                 dragActive={dragActive} onDropToken={dropToken(key)}
                 onFocus={() => onFocusField(key)} onChange={(v) => onConfig(key, v)} />
@@ -1096,14 +1867,117 @@ function NodeDetail({ node, agents, workflowId, ancestors, steps, step, webhookU
   )
 }
 
-function Field({ label, type, value, onChange, options, placeholder, agents, onFocus, dragActive, onDropToken }) {
-  // Text/textarea fields accept dragged {{tokens}} from the INPUT pane.
+// JSON config fields → CodeMirror JSON editor (highlighting, line numbers, live
+// validation, {{token}} pills, drop-at-caret). Local text state avoids reformat/
+// cursor-jump while typing; parse-up stores a dict when valid (set_node needs one),
+// else the raw string so the run still has something + the linter flags it.
+function JsonEditorField({ value, onChange, onFocus }) {
+  const [text, setText] = useState(() =>
+    typeof value === 'object' && value !== null ? JSON.stringify(value, null, 2) : (value ?? ''))
+  const [fmtErr, setFmtErr] = useState(false)
+  const push = v => { setText(v); let p = v; try { p = JSON.parse(v) } catch { /* keep raw string */ } onChange(p) }
+  const format = () => {
+    try { const pretty = JSON.stringify(JSON.parse(text), null, 2); setText(pretty); onChange(JSON.parse(text)); setFmtErr(false) }
+    catch { setFmtErr(true) }
+  }
+  return (
+    <div>
+      <div className="flex items-center justify-end mb-1">
+        {fmtErr && <span className="text-[10px] text-red-500 mr-auto">Invalid JSON — can’t format</span>}
+        <button type="button" onClick={format}
+          className="flex items-center gap-1 text-[11px] text-indigo-600 hover:bg-indigo-50 px-1.5 py-0.5 rounded">
+          <Sparkles size={11} /> Format
+        </button>
+      </div>
+      <CodeEditor value={text} language="json" onChange={v => { setFmtErr(false); push(v) }} onFocus={onFocus} />
+    </div>
+  )
+}
+
+// Path input with a "Browse" button that opens a server-side folder browser, so the
+// user can pick a file/location instead of knowing the absolute path.
+function FilePathField({ value, placeholder, onChange, onFocus, pick = 'read' }) {
+  const [open, setOpen] = useState(false)
+  const base = "flex-1 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400 font-mono text-xs"
+  return (
+    <div className="flex items-center gap-1.5">
+      <input type="text" value={value || ''} placeholder={placeholder} onFocus={onFocus}
+        onChange={e => onChange(e.target.value)} className={base} />
+      <button type="button" onClick={() => setOpen(true)}
+        className="shrink-0 flex items-center gap-1 text-xs px-2.5 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50">
+        <FolderOpen size={13} /> Browse
+      </button>
+      {open && <FileBrowser mode={pick} initial={value} onClose={() => setOpen(false)}
+        onPick={p => { onChange(p); setOpen(false) }} />}
+    </div>
+  )
+}
+
+function FileBrowser({ mode, initial, onPick, onClose }) {
+  const listDir = useOrgStore(s => s.listDir)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState('')
+  const [fname, setFname] = useState('')
+  const load = async (path) => {
+    setLoading(true); setErr('')
+    const d = await listDir(path || '')
+    if (d) setData(d); else setErr('Cannot open this folder')
+    setLoading(false)
+  }
+  useEffect(() => { load(initial || '') }, [])   // initial path → backend resolves to its dir
+  const join = (dir, name) => `${dir.replace(/\/$/, '')}/${name}`
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="w-[640px] max-w-[92vw] h-[70vh] bg-white rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
+          <FolderOpen size={16} className="text-indigo-600" />
+          <span className="text-sm font-semibold text-gray-800">{mode === 'write' ? 'Choose where to save' : 'Choose a file'}</span>
+          <div className="flex-1" />
+          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-700"><X size={18} /></button>
+        </div>
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-100 bg-gray-50">
+          <button disabled={!data?.parent} onClick={() => load(data.parent)}
+            className="text-xs px-2 py-1 border border-gray-200 rounded-lg hover:bg-white disabled:opacity-40">↑ Up</button>
+          <code className="flex-1 text-[11px] text-gray-600 truncate">{data?.path || '…'}</code>
+          {data?.home && <button onClick={() => load(data.home)} className="text-xs px-2 py-1 border border-gray-200 rounded-lg hover:bg-white">Home</button>}
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {loading ? <div className="flex items-center justify-center h-full text-gray-400 gap-2"><Loader2 size={18} className="animate-spin" /></div>
+            : err ? <p className="p-4 text-xs text-red-500">{err}</p>
+            : (data?.entries || []).length === 0 ? <p className="p-4 text-xs text-gray-400">Empty folder.</p>
+            : data.entries.map(en => (
+              <button key={en.name} onClick={() => en.type === 'dir' ? load(join(data.path, en.name))
+                : mode === 'write' ? setFname(en.name) : onPick(join(data.path, en.name))}
+                className="w-full flex items-center gap-2 px-4 py-1.5 text-left text-sm hover:bg-indigo-50">
+                {en.type === 'dir' ? <Folder size={14} className="text-indigo-500 shrink-0" /> : <FileText size={14} className="text-gray-400 shrink-0" />}
+                <span className="flex-1 truncate text-gray-700">{en.name}</span>
+                {en.type === 'file' && <span className="text-[10px] text-gray-400">{en.size} B</span>}
+              </button>
+            ))}
+        </div>
+        {mode === 'write' && (
+          <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-100">
+            <input value={fname} onChange={e => setFname(e.target.value)} placeholder="filename.json"
+              className="flex-1 text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400 font-mono text-xs" />
+            <button disabled={!fname.trim() || !data} onClick={() => onPick(join(data.path, fname.trim()))}
+              className="text-sm px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg disabled:opacity-40">Use this path</button>
+          </div>
+        )}
+        {mode !== 'write' && <div className="px-4 py-2.5 border-t border-gray-100 text-[11px] text-gray-400">Click a file to select it, or a folder to open it.</div>}
+      </div>
+    </div>
+  )
+}
+
+function Field({ label, type, value, onChange, options, placeholder, agents, onFocus, dragActive, onDropToken, error, pickMode }) {
+  // Text/textarea fields accept dragged {{tokens}} from the INPUT pane. We DON'T
+  // intercept the drop — textareas/inputs natively insert dropped text/plain at the
+  // drop caret and fire onChange. Intercepting (preventDefault) would force it to
+  // the start. We only add the highlight ring while a drag is active.
   const droppable = !!onDropToken && (type === 'textarea' || type === 'json' || type === undefined || type === 'text')
-  const ring = dragActive && droppable ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : ''
-  const dropProps = droppable ? {
-    onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' },
-    onDrop: e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t) onDropToken(t) },
-  } : {}
+  const ring = dragActive && droppable ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : (error ? ' border-red-400 ring-1 ring-red-300' : '')
+  const dropProps = {}
   const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400" + ring
   let input
   if (type === 'select') {
@@ -1120,27 +1994,38 @@ function Field({ label, type, value, onChange, options, placeholder, agents, onF
       <option value="">Auto (first non-manager)</option>
       {(agents || []).map(a => <option key={a.config.id} value={a.config.id}>{a.config.name}</option>)}
     </select>
-  } else if (type === 'textarea' || type === 'json') {
+  } else if (type === 'json') {
+    input = <JsonEditorField value={value} onChange={onChange} onFocus={onFocus} />
+  } else if (type === 'textarea') {
     const val = typeof value === 'object' ? JSON.stringify(value, null, 2) : (value ?? '')
-    input = <textarea value={val} placeholder={placeholder} rows={type === 'json' ? 4 : 5} onFocus={onFocus} {...dropProps}
-      onChange={e => {
-        if (type === 'json') { try { onChange(JSON.parse(e.target.value)) } catch { onChange(e.target.value) } }
-        else onChange(e.target.value)
-      }}
+    input = <textarea value={val} placeholder={placeholder} rows={5} onFocus={onFocus} {...dropProps}
+      onChange={e => onChange(e.target.value)}
       className={`${base} font-mono text-xs resize-y`} />
   } else if (type === 'number') {
     input = <input type="number" value={value} placeholder={placeholder} onFocus={onFocus}
       onChange={e => onChange(e.target.value === '' ? '' : Number(e.target.value))} className={base} />
+  } else if (type === 'filepath') {
+    input = <FilePathField value={value} placeholder={placeholder} onChange={onChange}
+      pick={pickMode} onFocus={onFocus} {...dropProps} />
   } else {
     input = <input type="text" value={value} placeholder={placeholder} onFocus={onFocus} {...dropProps} onChange={e => onChange(e.target.value)} className={base} />
   }
-  return <div>{label && <label className="block text-[11px] font-medium text-gray-500 mb-1">{label}</label>}{input}</div>
+  return <div>{label && <label className="block text-[11px] font-medium text-gray-500 mb-1">{label}</label>}{input}
+    {error && <p className="text-[11px] text-red-500 mt-1 break-words">{error}</p>}</div>
 }
 
 function CodeConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
   const formatCode = useOrgStore(s => s.formatCode)
   const [busy, setBusy] = useState(false)
   const lang = config.language || 'python'
+  // Flag JS syntax errors as you type. Tokens resolve to literals at runtime,
+  // so replace {{...}} with `null` before parsing. Python has no browser parser —
+  // it stays flagged on actual run (shown in OUTPUT).
+  const codeErr = useMemo(() => {
+    if (lang !== 'javascript' || !config.code) return null
+    try { new Function(config.code.replace(/\{\{[^}]+\}\}/g, 'null')); return null }
+    catch (e) { return e.message }
+  }, [config.code, lang])
   async function fmt() {
     setBusy(true)
     const r = await formatCode(config.code || '', lang)
@@ -1158,12 +2043,91 @@ function CodeConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
             {busy ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />} Format
           </button>
         </div>
-        <Field type="textarea" value={config.code ?? ''}
-          placeholder={lang === 'python' ? "return {'doubled': input['n'] * 2}" : 'return { doubled: input.n * 2 }'}
-          dragActive={dragActive} onDropToken={dropToken && dropToken('code')}
-          onFocus={() => onFocusField && onFocusField('code')} onChange={v => onChange('code', v)} />
+        <CodeEditor value={config.code ?? ''} language={lang} error={codeErr}
+          onChange={v => onChange('code', v)} onFocus={() => onFocusField && onFocusField('code')} />
+        {codeErr && <p className="text-[11px] text-red-500 mt-1 break-words">{codeErr}</p>}
       </div>
     </>
+  )
+}
+
+// Language config for the editor: the CodeMirror extension + the Lezer parser
+// used for linting. JSON, JS and Python all supported.
+function langExt(language) {
+  if (language === 'json') return json()
+  if (language === 'javascript') return javascript()
+  return python()
+}
+function langParser(language) {
+  if (language === 'json') return jsonLanguage.parser
+  if (language === 'javascript') return javascriptLanguage.parser
+  return pythonLanguage.parser
+}
+
+// Live syntax linter. We parse a TOKEN-MASKED copy so runtime {{tokens}} aren't
+// flagged: in JSON a token becomes a same-length string literal ("___"), elsewhere
+// a same-length `_` identifier — positions stay aligned. Lezer error nodes → red.
+function maskTokens(s, language) {
+  return s.replace(/\{\{[^}]*\}\}/g, m =>
+    language === 'json' ? '"' + '_'.repeat(Math.max(0, m.length - 2)) + '"' : '_'.repeat(m.length))
+}
+function syntaxLinter(language) {
+  const parser = langParser(language)
+  return linter(view => {
+    const doc = view.state.doc
+    const text = maskTokens(doc.toString(), language)
+    if (!text.trim()) return []
+    const diags = []
+    parser.parse(text).iterate({
+      enter: node => {
+        if (node.type.isError) {
+          const from = Math.min(node.from, doc.length)
+          const to = Math.min(Math.max(node.to, from + 1), doc.length)
+          diags.push({ from, to, severity: 'error', message: 'Syntax error' })
+        }
+      },
+    })
+    return diags
+  }, { delay: 400 })
+}
+
+// Render each {{token}} as a single highlighted pill so the code highlighter
+// doesn't colour its insides like real code (which looked "broken"). Purely visual.
+const WF_TOKEN_RE = /\{\{[^}]*\}\}/g
+const tokenMark = Decoration.mark({ class: 'cm-wf-token' })
+const tokenHighlighter = ViewPlugin.fromClass(class {
+  constructor(view) { this.decorations = this.build(view) }
+  update(u) { if (u.docChanged || u.viewportChanged) this.decorations = this.build(u.view) }
+  build(view) {
+    const b = new RangeSetBuilder()
+    for (const { from, to } of view.visibleRanges) {
+      const text = view.state.doc.sliceString(from, to)
+      let m
+      WF_TOKEN_RE.lastIndex = 0
+      while ((m = WF_TOKEN_RE.exec(text))) b.add(from + m.index, from + m.index + m[0].length, tokenMark)
+    }
+    return b.finish()
+  }
+}, { decorations: v => v.decorations })
+const tokenTheme = EditorView.theme({
+  '.cm-wf-token': { backgroundColor: 'rgba(99,102,241,0.12)', borderRadius: '3px' },
+  '.cm-wf-token, .cm-wf-token span': { color: '#4f46e5' },
+})
+
+// CodeMirror editor — syntax highlighting, line numbers, live error linting, {{token}}
+// pills, and native drag-drop that inserts the dragged token at the drop caret.
+function CodeEditor({ value, language, error, onChange, onFocus }) {
+  const ext = useMemo(() => [
+    langExt(language), syntaxLinter(language), lintGutter(), tokenHighlighter, tokenTheme,
+  ], [language])
+  return (
+    <div className={`rounded-lg overflow-hidden border ${error ? 'border-red-400' : 'border-gray-200'}`}>
+      <CodeMirror
+        value={value || ''} extensions={ext} onChange={onChange} onFocus={onFocus}
+        minHeight="120px" maxHeight="340px"
+        basicSetup={{ lineNumbers: true, foldGutter: false, highlightActiveLine: false, autocompletion: false }}
+        className="text-xs" />
+    </div>
   )
 }
 
@@ -1258,6 +2222,18 @@ function TriggerConfig({ config, onChange, webhookUrl }) {
             </div>
           ) : <p className="text-[11px] text-amber-600">Save the workflow to generate its webhook URL.</p>}
           <p className="text-[11px] text-gray-400">POST to this URL to trigger the workflow. During a Test it captures the next real call.</p>
+          <div className="pt-1">
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">Respond</label>
+            <select value={config.responseMode || 'auto'} onChange={e => onChange('responseMode', e.target.value)} className={base}>
+              <option value="auto">Automatically (final node output)</option>
+              <option value="respond">Using "Respond to Webhook" node</option>
+            </select>
+            <p className="text-[10px] text-gray-400 mt-1">
+              {(config.responseMode || 'auto') === 'respond'
+                ? 'The caller receives the payload from your Respond to Webhook node (only on live calls — a Test returns an ack).'
+                : 'The caller receives the last node’s output. Add a Respond to Webhook node + pick the option above to control the response.'}
+            </p>
+          </div>
         </div>
       )}
 
@@ -1332,9 +2308,7 @@ function TriggerConfig({ config, onChange, webhookUrl }) {
       {/* Sample/test input — available for every type */}
       <div className="border-t border-gray-100 pt-3">
         <label className="block text-[11px] font-medium text-gray-500 mb-1">Test input (JSON, optional)</label>
-        <textarea value={typeof config.sample === 'string' ? config.sample : (config.sample ? JSON.stringify(config.sample, null, 2) : '')}
-          onChange={e => onChange('sample', e.target.value)} rows={3}
-          placeholder='{ "example": "value" }' className={`${base} font-mono text-xs`} />
+        <JsonEditorField value={config.sample} onChange={v => onChange('sample', v)} />
         <p className="text-[10px] text-gray-400 mt-1">Used as the trigger payload when you Test the workflow.</p>
       </div>
     </div>
@@ -1387,10 +2361,8 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
   const opts = config.options || {}
   const setOpt = (k, v) => onChange('options', { ...opts, [k]: v })
   const ring = dragActive ? ' ring-2 ring-indigo-300 bg-indigo-50/40' : ''
-  const dropProps = (key) => ({
-    onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy' },
-    onDrop: e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t && dropToken) dropToken(key)(t) },
-  })
+  // Native drop inserts at the caret (see Field) — don't intercept.
+  const dropProps = () => ({})
   return (
     <div className="space-y-3">
       <div>
@@ -1420,10 +2392,12 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
             <option value="json">JSON</option>
             <option value="raw">Raw / text</option>
           </select>
-          <textarea value={config.body ?? ''} onFocus={() => onFocusField && onFocusField('body')}
-            onChange={e => onChange('body', e.target.value)} {...dropProps('body')} rows={4}
-            placeholder={config.bodyType === 'raw' ? 'raw body…' : '{ "key": "{{Trigger.value}}" }'}
-            className={`${base} font-mono text-xs${ring}`} />
+          {config.bodyType === 'raw'
+            ? <textarea value={config.body ?? ''} onFocus={() => onFocusField && onFocusField('body')}
+                onChange={e => onChange('body', e.target.value)} {...dropProps('body')} rows={4}
+                placeholder="raw body…" className={`${base} font-mono text-xs${ring}`} />
+            : <CodeEditor value={config.body ?? ''} language="json"
+                onChange={v => onChange('body', v)} onFocus={() => onFocusField && onFocusField('body')} />}
         </div>
       </HttpSection>
 
@@ -1453,6 +2427,68 @@ function HttpConfig({ config, onChange, onFocusField, dragActive, dropToken }) {
           <option value="continue">Continue (ignore 4xx/5xx)</option>
         </select>
         <p className="text-[11px] text-gray-400 mt-1.5">A 4xx/5xx response fails the node so an <b>Error Trigger</b> can catch the message — unless set to Continue.</p>
+      </div>
+    </div>
+  )
+}
+
+// Edit Fields (Set) — n8n-style: Manual Mapping (typed Name/Type/Value rows, drag
+// input fields in or Add Field) or JSON (one object). Manual rows → `fields`, JSON → `assignments`.
+const SET_TYPES = ['String', 'Number', 'Boolean', 'Array', 'Object']
+function tokenToName(t) {
+  const m = t.match(/\{\{\s*([^}]+?)\s*\}\}/)
+  return ((m ? m[1] : t).split('.').pop() || '').trim()
+}
+function SetConfig({ config, onChange }) {
+  const base = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-1.5 outline-none focus:border-indigo-400"
+  const mode = config.mode || (config.assignments ? 'json' : 'manual')
+  const fields = config.fields || []
+  const setFields = f => onChange('fields', f)
+  const updateField = (i, patch) => setFields(fields.map((r, j) => j === i ? { ...r, ...patch } : r))
+  const addField = (preset = {}) => setFields([...fields, { name: '', type: 'string', value: '', ...preset }])
+  const onDropZone = e => { e.preventDefault(); const t = e.dataTransfer.getData('text/plain'); if (t) addField({ name: tokenToName(t), value: t }) }
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className="block text-[11px] font-medium text-gray-500 mb-1">Mode</label>
+        <select value={mode} onChange={e => onChange('mode', e.target.value)} className={base}>
+          <option value="manual">Manual Mapping</option>
+          <option value="json">JSON</option>
+        </select>
+      </div>
+
+      {mode === 'json' ? (
+        <div>
+          <label className="block text-[11px] font-medium text-gray-500 mb-1">Fields to set (JSON: name → value/template)</label>
+          <JsonEditorField value={config.assignments} onChange={v => onChange('assignments', v)} />
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <label className="block text-[11px] font-medium text-gray-500">Fields to Set</label>
+          {fields.map((f, i) => (
+            <div key={i} className="border border-gray-200 rounded-lg p-2 space-y-1.5 bg-gray-50/50">
+              <div className="flex items-center gap-1.5">
+                <input value={f.name || ''} onChange={e => updateField(i, { name: e.target.value })} placeholder="Field name" className={base} />
+                <button onClick={() => setFields(fields.filter((_, j) => j !== i))} className="text-gray-300 hover:text-red-500 shrink-0" title="Remove"><Trash2 size={13} /></button>
+              </div>
+              <select value={f.type || 'string'} onChange={e => updateField(i, { type: e.target.value })} className={`${base} text-xs`}>
+                {SET_TYPES.map(t => <option key={t} value={t.toLowerCase()}>{t}</option>)}
+              </select>
+              <input value={f.value || ''} onChange={e => updateField(i, { value: e.target.value })}
+                placeholder="Value (drag a field or type; supports {{tokens}})" className={`${base} font-mono text-xs`} />
+            </div>
+          ))}
+          <div onDragOver={e => e.preventDefault()} onDrop={onDropZone}
+            className="border border-dashed border-gray-300 rounded-lg px-3 py-3 text-center text-[11px] text-gray-400">
+            Drag input fields here&nbsp;·&nbsp;
+            <button onClick={() => addField()} className="text-indigo-600 hover:underline font-medium">Add Field</button>
+          </div>
+        </div>
+      )}
+
+      <div className="border-t border-gray-100 pt-3 flex items-center justify-between">
+        <label className="text-xs text-gray-600">Include other input fields</label>
+        <Toggle on={!config.keep_only} onClick={() => onChange('keep_only', !config.keep_only)} />
       </div>
     </div>
   )

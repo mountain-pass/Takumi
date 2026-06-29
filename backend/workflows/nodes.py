@@ -32,6 +32,7 @@ class NodeContext:
         self.orchestrator = orchestrator
         self.workflow = workflow
         self.context: dict[str, Any] = {}   # node_id → output
+        self.step_tokens: dict[str, tuple] = {}   # node_id → (input_tokens, output_tokens), LLM nodes only
 
 
 # ── templating ────────────────────────────────────────────────────────────────
@@ -39,14 +40,43 @@ class NodeContext:
 _TPL = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
+def _builtins(ctx: NodeContext) -> dict:
+    """Built-in variables available in any {{token}} — current date/time plus
+    workflow/run metadata. Usable bare ({{today}}) or namespaced ({{$vars.today}})."""
+    from datetime import datetime
+    now = datetime.now()
+    wf = ctx.workflow or {}
+    return {
+        "now": now.isoformat(timespec="seconds"),       # 2026-06-28T08:00:00
+        "datetime": now.isoformat(timespec="seconds"),
+        "today": now.strftime("%Y-%m-%d"),              # 2026-06-28
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),               # 08:00:00
+        "timestamp": int(now.timestamp()),              # unix seconds
+        "year": now.strftime("%Y"), "month": now.strftime("%m"), "day": now.strftime("%d"),
+        "weekday": now.strftime("%A"),
+        "workflow": {"id": wf.get("id", ""), "name": wf.get("name", "")},
+        "run": {"id": ctx.run_id, "mode": getattr(ctx, "mode", "")},
+    }
+
+
 def _resolve_path(path: str, ctx: NodeContext, inputs: dict) -> Any:
-    """Resolve a dotted path like 'nodeId.body.title' or '$.field' (current input)."""
+    """Resolve a dotted path like 'nodeId.body.title', '$.field' (current input),
+    or a built-in like 'today' / '$vars.now' / 'workflow.name'."""
     parts = path.split(".")
-    if parts[0] in ("$", "input", "json"):
+    head = parts[0]
+    bi = _builtins(ctx)
+    if head in ("$", "input", "json"):
         cur: Any = inputs
         parts = parts[1:]
-    elif parts[0] in ctx.context:
-        cur = ctx.context[parts[0]]
+    elif head in ctx.context:                 # a node's output (id/label) wins over built-ins
+        cur = ctx.context[head]
+        parts = parts[1:]
+    elif head in ("$vars", "vars"):
+        cur = bi
+        parts = parts[1:]
+    elif head in bi:
+        cur = bi[head]
         parts = parts[1:]
     else:
         cur = ctx.context
@@ -83,6 +113,20 @@ def render(value: Any, ctx: NodeContext, inputs: dict) -> Any:
 
 def _cfg(node: dict) -> dict:
     return (node.get("data") or {}).get("config") or {}
+
+
+_JS_LITERALS = re.compile(r"\b(true|false|null)\b")
+
+
+def _pyify(expr: str) -> str:
+    """Translate the JS-style operators/literals users naturally write (n8n-style)
+    into Python so conditions like `a > 1 && a < 3` evaluate — the engine uses
+    Python's eval, where `&&`/`||`/`true` are syntax errors. `!=` is left intact."""
+    if not isinstance(expr, str):
+        return expr
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    expr = _JS_LITERALS.sub(lambda m: {"true": "True", "false": "False", "null": "None"}[m.group(1)], expr)
+    return expr
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -157,20 +201,60 @@ async def http_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     return result
 
 
-# A deliberately small, safe environment for the code node. No imports, no
-# builtins beyond a curated map. This is NOT a hardened sandbox — see plan.
+# A deliberately small, safe environment for the code node. This is NOT a hardened
+# sandbox — see plan. Imports are limited to a stdlib whitelist (no os/sys/subprocess).
+import datetime as _dt, math as _math, random as _random, statistics as _stats, textwrap as _textwrap
+import collections as _collections, itertools as _itertools, functools as _functools
+import time as _time, string as _string, decimal as _decimal, uuid as _uuid
+import base64 as _base64, hashlib as _hashlib
+
+# Modules a code node may `import` (or use directly — they're pre-injected into scope).
+# `time` is required because the C datetime module imports it internally. Deliberately
+# excludes os/sys/subprocess/socket/importlib etc.
+_SAFE_MODULES = {
+    "datetime": _dt, "math": _math, "re": re, "random": _random, "statistics": _stats,
+    "textwrap": _textwrap, "json": json, "collections": _collections,
+    "itertools": _itertools, "functools": _functools, "time": _time, "string": _string,
+    "decimal": _decimal, "uuid": _uuid, "base64": _base64, "hashlib": _hashlib,
+}
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """Restricted __import__ for code nodes — only the stdlib whitelist above."""
+    base = name.split(".")[0]
+    if base in _SAFE_MODULES:
+        return _SAFE_MODULES[base]
+    raise ImportError(f"import of '{name}' is not allowed in code nodes "
+                      f"(allowed: {', '.join(sorted(_SAFE_MODULES))})")
+
+
 _SAFE_BUILTINS = {
     "len": len, "range": range, "min": min, "max": max, "sum": sum, "sorted": sorted,
     "abs": abs, "round": round, "str": str, "int": int, "float": float, "bool": bool,
     "list": list, "dict": dict, "set": set, "tuple": tuple, "enumerate": enumerate,
     "zip": zip, "map": map, "filter": filter, "any": any, "all": all, "json": json,
+    "reversed": reversed, "repr": repr, "print": print, "isinstance": isinstance,
+    "__import__": _safe_import,
 }
+
+# Common modules + helpers pre-injected into the code node's globals so simple scripts
+# work even without an import line (e.g. `date.today()`, `re.findall(...)`).
+_SAFE_GLOBALS_EXTRA = {**_SAFE_MODULES, "date": _dt.date, "time": _dt.time,
+                       "timedelta": _dt.timedelta}
+
+
+# Models (and users) often wrap a token in their own quotes, e.g. `x = """{{a.b}}"""`.
+# Since the token is substituted as a COMPLETE literal, those wrapping quotes produce
+# invalid code when the value contains quotes/newlines ("unterminated string literal").
+# Strip quotes that directly enclose a lone token before substituting.
+_QUOTED_TOKEN = re.compile(r'("""|\'\'\'|"|\')\s*(\{\{[^}]+\}\})\s*\1')
 
 
 def _render_code_tokens(code: str, ctx: NodeContext, inputs: dict, lang: str) -> str:
     """Resolve {{Node.field}} tokens dragged into code to LITERAL values so the
     code stays valid: JSON literals for JS, Python literals for Python."""
     is_js = lang in ("javascript", "js", "node")
+    code = _QUOTED_TOKEN.sub(r"\2", code)   # unwrap model-added quotes around a lone token
 
     def sub(m):
         val = _resolve_path(m.group(1).strip(), ctx, inputs)
@@ -192,7 +276,7 @@ async def code_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
 
     import re as _re
     import textwrap as _tw
-    env = {"__builtins__": _SAFE_BUILTINS}
+    env = {"__builtins__": _SAFE_BUILTINS, **_SAFE_GLOBALS_EXTRA}
     local = {"input": inputs, "context": ctx.context, "output": None}
     has_return = bool(_re.search(r"(^|\n)[ \t]*return\b", code))
     if has_return:
@@ -208,22 +292,18 @@ async def code_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
         except SyntaxError:
             exec(compile(code, "<code-node>", "exec"), env, local)
             out = local.get("output")
-    return out if isinstance(out, dict) else {"result": out}
+    return _wrap_code_output(out)
 
 
-async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
-    """Execute JS via a `node` subprocess. `input`/`context` are injected as JSON;
-    the script should assign `output`. Requires Node.js on PATH.
-
-    The script is piped via stdin and the (potentially large) input/context are
-    passed through temp files — never argv/env — so big upstream outputs don't
-    blow past the OS ARG_MAX limit ('[Errno 7] Argument list too long')."""
+async def _node_exec(body: str, inputs: dict, ctx: NodeContext):
+    """Run a JS `body` (which must assign `output`) in a `node` subprocess and return
+    the parsed JSON `output`. `input`/`context` are exposed as vars. The script is
+    piped via stdin and input/context go through temp files — never argv/env — so big
+    upstream outputs don't blow past ARG_MAX ('[Errno 7] Argument list too long')."""
     import shutil, os, tempfile
     node_bin = shutil.which("node")
     if not node_bin:
-        raise RuntimeError("JavaScript code node requires Node.js on PATH (not found)")
-    import re as _re
-
+        raise RuntimeError("JavaScript requires Node.js on PATH (not found)")
     in_path = ctx_path = None
     try:
         fd_i, in_path = tempfile.mkstemp(suffix=".json", prefix="wf_in_")
@@ -232,18 +312,10 @@ async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
         fd_c, ctx_path = tempfile.mkstemp(suffix=".json", prefix="wf_ctx_")
         with os.fdopen(fd_c, "w") as f:
             json.dump(ctx.context, f)
-
         head = ("const __fs = require('fs');\n"
                 "const input = JSON.parse(__fs.readFileSync(process.env.WF_INPUT_FILE, 'utf8') || '{}');\n"
                 "const context = JSON.parse(__fs.readFileSync(process.env.WF_CONTEXT_FILE, 'utf8') || '{}');\n")
-        if _re.search(r"(^|\n)\s*return\b", code):
-            # Wrap so a top-level `return ...` works (like Python / n8n).
-            body = "const __wf_main = () => {\n" + code + "\n};\nconst output = __wf_main();\n"
-        else:
-            body = "let output;\n" + code + "\n"
-        harness = head + body + "process.stdout.write(JSON.stringify(output === undefined ? null : output));\n"
-
-        # Pipe the script via stdin (node reads from stdin when given no file).
+        harness = head + body + "\nprocess.stdout.write(JSON.stringify(output === undefined ? null : output));\n"
         proc = await asyncio.create_subprocess_exec(
             node_bin, "-",   # read the script from stdin (avoids argv size limits)
             stdin=asyncio.subprocess.PIPE,
@@ -255,10 +327,9 @@ async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
         if proc.returncode != 0:
             raise RuntimeError(f"JS error: {(err or b'').decode()[:300]}")
         try:
-            parsed = json.loads((out or b"").decode() or "null")
+            return json.loads((out or b"").decode() or "null")
         except Exception:
-            parsed = (out or b"").decode()
-        return parsed if isinstance(parsed, dict) else {"result": parsed}
+            return (out or b"").decode()
     finally:
         for p in (in_path, ctx_path):
             if p:
@@ -268,41 +339,85 @@ async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
                     pass
 
 
+def _wrap_code_output(out):
+    """Node outputs must be dicts. Pass dicts through; expose a list as `items` (so a
+    Loop node can iterate it); wrap a scalar as `result`."""
+    if isinstance(out, dict):
+        return out
+    if isinstance(out, list):
+        return {"items": out}
+    return {"result": out}
+
+
+async def _run_js(code: str, inputs: dict, ctx: NodeContext) -> dict:
+    """Execute a JS code node. Supports `return ...`, assigning `output`, or a bare
+    expression (e.g. an array/object literal) — like the Python code node."""
+    if re.search(r"(^|\n)\s*return\b", code):
+        body = "const __wf_main = () => {\n" + code + "\n};\nconst output = __wf_main();\n"
+    elif re.search(r"\boutput\b\s*=", code):
+        body = "let output;\n" + code + "\n"
+    else:
+        # No return and no `output =` → treat the whole body as a single expression.
+        body = "const output = (\n" + code + "\n);\n"
+    parsed = await _node_exec(body, inputs, ctx)
+    return _wrap_code_output(parsed)
+
+
+async def _run_js_bools(exprs: list[str], inputs: dict, ctx: NodeContext) -> list[bool]:
+    """Evaluate a list of JS boolean expressions in ONE node process (so a Switch's
+    N rules cost a single subprocess). Each expr can use `input`/`context`. A failing
+    expr yields False. ponytail: one subprocess per condition-node execution — fine
+    outside hot paths; a Loop body with a JS If pays it per item."""
+    body = ("const __exprs = " + json.dumps(exprs) + ";\n"
+            "const output = __exprs.map(e => { try { return Boolean(eval(e)); } catch (_) { return false; } });\n")
+    res = await _node_exec(body, inputs, ctx)
+    return [bool(x) for x in res] if isinstance(res, list) else [False] * len(exprs)
+
+
+async def _eval_conditions(exprs: list, lang: str, inputs: dict, ctx: NodeContext) -> list[bool]:
+    """Evaluate condition expressions in the chosen language. {{tokens}} are rendered
+    to literals first (same in both languages); only the eval semantics differ —
+    Python (with _pyify so &&/|| still work) or JavaScript (via Node)."""
+    rendered = [str(render(str(e or ""), ctx, inputs)) for e in exprs]
+    if lang == "javascript":
+        try:
+            return await _run_js_bools(rendered, inputs, ctx)
+        except Exception as e:
+            logger.warning("[workflow] JS condition eval failed: %s", e)
+            return [False] * len(rendered)
+    out = []
+    for r in rendered:
+        try:
+            out.append(bool(eval(compile(_pyify(r), "<cond>", "eval"),
+                                 {"__builtins__": _SAFE_BUILTINS},
+                                 {"input": inputs, "context": ctx.context})))
+        except Exception as e:
+            logger.debug("[workflow] python condition failed: %s", e)
+            out.append(False)
+    return out
+
+
 async def if_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Evaluate a boolean condition; route to the 'true' or 'false' handle."""
     cfg = _cfg(node)
     expr = cfg.get("condition") or "True"
-    rendered = render(expr, ctx, inputs)
-    try:
-        if isinstance(rendered, str):
-            result = bool(eval(compile(rendered, "<if-node>", "eval"),
-                              {"__builtins__": _SAFE_BUILTINS},
-                              {"input": inputs, "context": ctx.context}))
-        else:
-            result = bool(rendered)
-    except Exception as e:
-        logger.warning("[workflow] if-node eval failed: %s", e)
-        result = False
+    result = (await _eval_conditions([expr], cfg.get("lang") or "python", inputs, ctx))[0]
     return {"result": result, "_branch": "true" if result else "false"}
 
 
 async def switch_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Route to one of several outputs by evaluating ordered rules. Each rule is a
-    Python expression; the first true rule's index becomes the taken handle. Falls
+    """Route to one of several outputs by evaluating ordered rules (in cfg['lang'] =
+    python|javascript). The first true rule's index becomes the taken handle; falls
     through to the 'default' handle when none match."""
     cfg = _cfg(node)
     rules = cfg.get("rules") or []
-    env = {"__builtins__": _SAFE_BUILTINS}
-    scope = {"input": inputs, "context": ctx.context}
+    exprs = [(r.get("condition") if isinstance(r, dict) else r) for r in rules]
+    bools = await _eval_conditions(exprs, cfg.get("lang") or "python", inputs, ctx)
     matched = "default"
-    for i, rule in enumerate(rules):
-        expr = rule.get("condition") if isinstance(rule, dict) else rule
-        try:
-            if expr and bool(eval(compile(render(str(expr), ctx, inputs), "<switch>", "eval"), env, dict(scope))):
-                matched = str(i)
-                break
-        except Exception as e:
-            logger.debug("[workflow] switch rule %d failed: %s", i, e)
+    for i, ok in enumerate(bools):
+        if exprs[i] and ok:
+            matched = str(i)
+            break
     return {"_branch": matched, "matched": matched,
             "value": inputs if isinstance(inputs, dict) else {"value": inputs}}
 
@@ -311,14 +426,7 @@ async def filter_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Pass input through if the condition holds; otherwise stop this branch."""
     cfg = _cfg(node)
     expr = cfg.get("condition") or "True"
-    try:
-        rendered = render(expr, ctx, inputs)
-        keep = bool(eval(compile(str(rendered), "<filter>", "eval"),
-                         {"__builtins__": _SAFE_BUILTINS},
-                         {"input": inputs, "context": ctx.context})) if isinstance(rendered, str) else bool(rendered)
-    except Exception as e:
-        logger.warning("[workflow] filter eval failed: %s", e)
-        keep = False
+    keep = (await _eval_conditions([expr], cfg.get("lang") or "python", inputs, ctx))[0]
     if keep:
         out = inputs if isinstance(inputs, dict) else {"value": inputs}
         return {**out, "_kept": True}
@@ -333,12 +441,49 @@ async def stop_error_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     raise RuntimeError(str(msg))
 
 
+def _coerce(val, ftype):
+    """Coerce a templated value to the field's declared type (manual mapping)."""
+    if ftype in (None, "string"):
+        return val if isinstance(val, str) else json.dumps(val) if isinstance(val, (dict, list)) else "" if val is None else str(val)
+    if ftype == "number":
+        try:
+            f = float(val)
+            return int(f) if f.is_integer() else f
+        except (TypeError, ValueError):
+            return val
+    if ftype == "boolean":
+        if isinstance(val, str):
+            return val.strip().lower() in ("true", "1", "yes", "on")
+        return bool(val)
+    if ftype in ("array", "object"):
+        if isinstance(val, str):
+            try:
+                return json.loads(val)
+            except (TypeError, ValueError):
+                return val
+        return val
+    return val
+
+
 async def set_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Edit Fields (Set): add/override fields. `assignments` is an object of
-    name → value (values are templated). keep_only drops the original input."""
+    """Edit Fields (Set): add/override fields. Two modes:
+    - 'manual': `fields` is a list of {name, type, value}; values are templated then
+      coerced to the declared type.
+    - 'json': `assignments` is an object of name → value (values templated).
+    keep_only drops the original input. Default mode preserves legacy nodes (json if
+    `assignments` is present, else manual)."""
     cfg = _cfg(node)
-    assignments = cfg.get("assignments") or {}
-    rendered = render(assignments, ctx, inputs) if isinstance(assignments, dict) else {}
+    mode = cfg.get("mode") or ("json" if cfg.get("assignments") else "manual")
+    rendered: dict = {}
+    if mode == "json":
+        assignments = cfg.get("assignments") or {}
+        rendered = render(assignments, ctx, inputs) if isinstance(assignments, dict) else {}
+    else:
+        for f in cfg.get("fields") or []:
+            name = (f.get("name") or "").strip()
+            if not name:
+                continue
+            rendered[name] = _coerce(render(f.get("value"), ctx, inputs), f.get("type"))
     base = {} if cfg.get("keep_only") else (inputs if isinstance(inputs, dict) else {"value": inputs})
     return {**base, **rendered}
 
@@ -373,58 +518,257 @@ async def loop_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     Phase-1: returns the items list; the engine fans the downstream branch out."""
     cfg = _cfg(node)
     field = cfg.get("items_field") or "items"
-    items = _resolve_path(field, ctx, inputs)
-    if not isinstance(items, list):
-        items = inputs.get(field) if isinstance(inputs, dict) else None
+    # Accept a {{token}} (e.g. {{Code.items}}) — render it; a single whole-string token
+    # resolves to the list directly. Otherwise treat the field as a dotted path / key.
+    rendered = render(field, ctx, inputs)
+    if isinstance(rendered, list):
+        items = rendered
+    else:
+        path = rendered if isinstance(rendered, str) else field
+        items = _resolve_path(path, ctx, inputs)
+        if not isinstance(items, list) and isinstance(inputs, dict):
+            items = inputs.get(path)
     items = items if isinstance(items, list) else []
     return {"items": items, "count": len(items), "_loop": True}
 
 
+def _as_items(out: Any) -> list:
+    """Normalise a node's output into a list of items (n8n's per-input item array)."""
+    if isinstance(out, list):
+        return out
+    if isinstance(out, dict) and isinstance(out.get("items"), list):
+        return out["items"]
+    if out is None:
+        return []
+    return [out]
+
+
+def _merge_two(a: Any, b: Any, prio2: bool) -> dict:
+    """Shallow-merge two items. prio2 → Input 2 wins on clashing keys (n8n default)."""
+    a = a if isinstance(a, dict) else {"value": a}
+    b = b if isinstance(b, dict) else {"value": b}
+    return {**a, **b} if prio2 else {**b, **a}
+
+
 async def merge_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Combine all upstream outputs into one object (engine passes them via inputs._merged)."""
-    merged = inputs.get("_merged") if isinstance(inputs, dict) else None
-    if merged is None:
-        return inputs or {}
-    return {"merged": merged}
+    """Combine multiple upstream inputs, n8n-style. The engine passes the ordered
+    list of upstream outputs (connection order = Input 1, 2, 3…) via inputs._merged.
+
+    Modes: append | combine | chooseBranch. Combine sub-modes: matchingFields |
+    position | allCombinations. ponytail: shallow merge only (no deep-merge / dot
+    notation); matching is top-level field equality. Add deep merge if a real
+    nested-clash case shows up.
+    """
+    cfg = _cfg(node)
+    ups = inputs.get("_merged") if isinstance(inputs, dict) else None
+    if ups is None:  # single (or no) upstream — nothing to combine
+        ups = [inputs] if inputs else []
+    streams = [_as_items(u) for u in ups]
+    mode = cfg.get("mode") or "append"
+
+    if mode == "chooseBranch":
+        idx = int(cfg.get("branch") or 1) - 1
+        items = streams[idx] if 0 <= idx < len(streams) else []
+        return {"items": items, "count": len(items)}
+
+    if mode == "append":
+        items = [it for s in streams for it in s]
+        return {"items": items, "count": len(items)}
+
+    # combine — operates on the first two inputs (like n8n).
+    a = streams[0] if len(streams) > 0 else []
+    b = streams[1] if len(streams) > 1 else []
+    prio2 = (cfg.get("clash") or "input2") != "input1"
+    sub = cfg.get("combine_by") or "matchingFields"
+
+    if sub == "position":
+        n = min(len(a), len(b))
+        items = [_merge_two(a[i], b[i], prio2) for i in range(n)]
+        return {"items": items, "count": len(items)}
+
+    if sub == "allCombinations":
+        items = [_merge_two(x, y, prio2) for x in a for y in b]
+        return {"items": items, "count": len(items)}
+
+    # matchingFields — join a and b on equal field values.
+    fuzzy = bool(cfg.get("fuzzy"))
+    fields = [f.strip() for f in str(cfg.get("fields_to_match") or "").replace(",", " ").split() if f.strip()]
+    out_type = cfg.get("output_type") or "keepMatches"
+
+    def key(it):
+        norm = (lambda v: str(v)) if fuzzy else (lambda v: repr(v))
+        return tuple(norm(it.get(f) if isinstance(it, dict) else None) for f in fields)
+
+    idx_b: dict = {}
+    for it in b:
+        idx_b.setdefault(key(it), []).append(it)
+
+    matched, unmatched_a, used_b = [], [], set()
+    for it in a:
+        hits = idx_b.get(key(it), []) if fields else []
+        if hits:
+            for m in hits:
+                matched.append(_merge_two(it, m, prio2))
+                used_b.add(id(m))
+        else:
+            unmatched_a.append(it)
+    unmatched_b = [it for it in b if id(it) not in used_b]
+
+    if out_type == "keepNonMatches":
+        items = unmatched_a + unmatched_b
+    elif out_type == "keepEverything":
+        items = matched + unmatched_a + unmatched_b
+    elif out_type == "enrichInput1":          # left join
+        items = matched + unmatched_a
+    elif out_type == "enrichInput2":          # right join
+        items = matched + unmatched_b
+    else:                                      # keepMatches (inner join)
+        items = matched
+    return {"items": items, "count": len(items)}
+
+
+# Operating instructions for the standalone workflow agent — websearch-first,
+# loop, take notes / use memory, and self-evaluate before answering.
+_WF_AGENT_PREAMBLE = """\
+You are an autonomous task agent running inside an automated workflow. You have FULL access to \
+every tool in this system — web search, web fetch, a real browser, file read/write, shell, risk \
+checks, and any connected MCP servers. Use whatever the task needs.
+
+Work rigorously:
+- PLAN: briefly decide what information and steps the task actually requires.
+- GATHER (websearch-first): your training data is out of date. For ANY real-world fact — prices, \
+news, dates, who/what is current — you MUST use web_search (or the browser) to get up-to-date \
+information. Never answer real-world questions from memory alone.
+- USE MEMORY: as you work, keep track of key findings. For larger tasks, persist intermediate \
+notes with write_file and read them back so you don't lose context across steps.
+- LOOP: keep calling tools, one at a time, until you genuinely have what you need.
+- SELF-EVALUATE: before your final answer, check that it fully satisfies the task and is grounded \
+in the data you gathered. If it falls short, do another round of gathering.
+Then write your final answer as plain text (no tool-call block)."""
+
+
+async def _build_workflow_agent(node: dict, cfg: dict, ctx: NodeContext):
+    """Build an ephemeral, self-contained agent for an LLM node: its own provider/
+    model/system prompt, and EVERY available skill + MCP server granted. Separate
+    from the organisation's agents — the node defines its own role and task."""
+    from ..models import AgentConfig, LLMProvider
+    from ..skills.registry import SKILL_REGISTRY
+    from .. import database, runtime_settings
+
+    orch = ctx.orchestrator
+    if orch is None:
+        raise ValueError("No runtime available to run the LLM node")
+
+    # Grant all built-in skills + every enabled MCP server.
+    skills = list(SKILL_REGISTRY.keys())
+    try:
+        for s in await database.get_all_mcp_servers():
+            if s.get("enabled", 1):
+                skills.append(f"mcp:{s['id']}")
+    except Exception:
+        pass
+
+    rt = runtime_settings.get()
+    node_system = render(cfg.get("system") or "", ctx, {})
+    system_prompt = (node_system + "\n\n" + _WF_AGENT_PREAMBLE).strip() if node_system else _WF_AGENT_PREAMBLE
+    prov_str = rt.get("llm_provider") or "ollama"
+    try:
+        provider = LLMProvider(prov_str)
+    except ValueError:
+        provider = LLMProvider.OLLAMA
+
+    config = AgentConfig(
+        name=(node.get("data") or {}).get("label") or "Workflow Agent",
+        role="Autonomous workflow task agent",
+        description="Runs a single workflow task with full tool access.",
+        system_prompt=system_prompt,
+        llm_provider=provider,
+        llm_model=cfg.get("model") or rt.get("llm_model") or "",
+        skills=skills,
+        api_provider_id=cfg.get("api_provider_id") or None,
+        max_iterations=int(cfg.get("max_iterations") or 12),
+        # Hard ceiling so a looping research task can't burn unbounded tokens; the
+        # agent forces a final answer once it's hit. Override per-node if needed.
+        token_budget=int(cfg.get("token_budget") or 1_000_000),
+    )
+    from ..agents.base_agent import BaseAgent
+    agent = BaseAgent(config, orch.bus, orch.settings)
+    agent.set_orchestrator(orch)
+    if config.api_provider_id:
+        await orch._resolve_agent_adapter(agent, config.api_provider_id)
+    else:
+        from ..llm_adapters import get_adapter
+        agent._adapter = get_adapter(provider, orch.settings, rt)
+    return agent
+
+
+# Models love to wrap a whole answer in a ```html / ```json fence even when asked for
+# raw output. If the ENTIRE response is one fenced block, unwrap it so files/HTTP bodies
+# get the real artefact — but leave inline code blocks inside prose untouched.
+_OUTER_FENCE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\n(.*)\n```\s*$", re.S)
+
+
+def _strip_outer_fence(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    m = _OUTER_FENCE.match(text.strip())
+    return m.group(1) if m and "```" not in m.group(1) else text
 
 
 async def llm_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
-    """Run a prompt against a chosen agent, optionally overriding which provider
-    and model run the task (like n8n's agent node). The compliance gate is applied
-    by the engine AFTER this returns (it needs the run/step context)."""
+    """Run the node's task on a STANDALONE agent (its own provider/model/system/prompt,
+    independent of the organisation's agents). The agent has every skill + MCP server,
+    runs a full tool-calling loop (websearch-first, browser, files, memory) and
+    self-evaluates before answering. The engine applies the compliance gate after."""
     cfg = _cfg(node)
     prompt = render(cfg.get("prompt") or "", ctx, inputs)
-    system = cfg.get("system") or "You are a helpful assistant inside an automated workflow."
-    agent_id = cfg.get("agent_id") or ""
-    orch = ctx.orchestrator
-
-    agent = None
-    if orch is not None:
-        agents = orch.get_agents()
-        if agent_id:
-            agent = next((a for a in agents if a.config.id == agent_id), None)
-        if agent is None:
-            agent = next((a for a in agents if not a.config.is_ceo), None) or (agents[0] if agents else None)
-    if agent is None:
-        raise ValueError("No agent available to run the LLM node")
-
-    # Provider/model override: build a fresh adapter for the chosen provider.
-    adapter = agent._adapter
-    model = cfg.get("model") or agent.config.llm_model
-    provider_id = cfg.get("api_provider_id")
-    if provider_id:
-        from ..llm_adapters.factory import get_adapter_for_provider
-        adapter = get_adapter_for_provider(provider_id, agent.settings)
-
     if not prompt:
         prompt = json.dumps(inputs)[:4000] if inputs else "Proceed."
-    resp = await adapter.complete(
-        system_prompt=system,
-        messages=[{"role": "user", "content": str(prompt)}],
-        model=model,
-        max_tokens=int(cfg.get("max_tokens") or 1024),
-    )
-    return {"text": resp.content, "agent": agent.config.name, "agent_id": agent.config.id, "model": model}
+
+    agent = await _build_workflow_agent(node, cfg, ctx)
+    resp = await agent._do_work_with_tools(str(prompt), messages=[{"role": "user", "content": str(prompt)}])
+
+    # Record token usage on the step (engine reads ctx.step_tokens after the call).
+    ctx.step_tokens[node["id"]] = (resp.input_tokens or 0, resp.output_tokens or 0)
+    return {"text": _strip_outer_fence(resp.content), "agent": agent.config.name, "model": agent.config.llm_model}
+
+
+async def websearch_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Search the web in REAL TIME (independent of any LLM's training data) and return
+    fresh results. Use upstream of an LLM/Set node so the flow always works on live data.
+
+    For higher confidence, `fetch_content` (default on) also pulls the actual page text
+    of the top results — so a downstream LLM reasons over real current content instead of
+    a possibly-stale search snippet."""
+    from ..skills.web_search import web_search, web_fetch, UNAVAILABLE_PREFIX
+    cfg = _cfg(node)
+    query = render(str(cfg.get("query") or ""), ctx, inputs)
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Web Search: a query is required")
+    query = query.strip()
+    try:
+        n = max(1, min(int(cfg.get("max_results") or 5), 20))
+    except Exception:
+        n = 5
+    results = await web_search(query, n)
+    ok = not str(results).startswith(UNAVAILABLE_PREFIX)
+
+    pages: list[dict] = []
+    if ok and cfg.get("fetch_content", True):
+        # Fetch the top few result pages in parallel so the flow has real content, not
+        # just snippets. Bounded (≤3, capped chars) to stay fast and within token budgets.
+        urls = re.findall(r"https?://[^\s]+", results)
+        seen, picked = set(), []
+        for u in urls:
+            if u not in seen:
+                seen.add(u); picked.append(u)
+            if len(picked) >= min(3, n):
+                break
+        fetched = await asyncio.gather(*[web_fetch(u, 4000) for u in picked], return_exceptions=True)
+        pages = [{"url": u, "content": f if isinstance(f, str) else f"Failed: {f}"}
+                 for u, f in zip(picked, fetched)]
+
+    return {"query": query, "results": results, "pages": pages, "ok": ok}
 
 
 async def wait_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -450,12 +794,109 @@ async def error_trigger_node(node: dict, inputs: dict, ctx: NodeContext) -> dict
     return inputs if isinstance(inputs, dict) else {"error": str(inputs)}
 
 
+async def variable_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Assign a named, overwritable workflow variable. The (templated) value is stored
+    in the run context under its name, so downstream nodes read it as {{name}} — and a
+    later Variable node with the same name overwrites it."""
+    cfg = _cfg(node)
+    name = str(cfg.get("name") or "var").strip() or "var"
+    value = render(cfg.get("value"), ctx, inputs) if cfg.get("value") not in (None, "") else inputs
+    ctx.context[name] = value          # overwritable; resolvable as {{name}}
+    return {"name": name, "value": value}
+
+
+# File nodes mirror the agent file skills' posture (any path the backend can reach;
+# parent dirs auto-created; reads capped). Paths/content are templated.
+_FILE_READ_CAP = 100_000
+
+# Common keys that carry the human-readable payload of a node output. When content
+# resolves to a node's whole output dict (mis-wiring, or a default fallthrough), write
+# the readable text instead of dumping raw JSON — only genuinely structured data
+# becomes pretty JSON. ponytail: heuristic key list, extend if a node uses another key.
+_TEXT_KEYS = ("text", "content", "output", "body", "result", "value", "message")
+
+
+def _coerce_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for k in _TEXT_KEYS:
+            v = content.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    return json.dumps(content, indent=2, default=str)
+
+
+def _demo():
+    assert _coerce_text({"text": "# Report\nhi", "agent": "x"}) == "# Report\nhi"
+    assert _coerce_text("plain") == "plain"
+    assert _coerce_text({"a": 1}) == json.dumps({"a": 1}, indent=2)
+    assert _strip_outer_fence("```html\n<h1>hi</h1>\n```") == "<h1>hi</h1>"
+    assert _strip_outer_fence("plain text") == "plain text"
+    # Don't unwrap markdown that legitimately contains a code block.
+    assert _strip_outer_fence("# Doc\n```js\nx()\n```") == "# Doc\n```js\nx()\n```"
+
+
+if __name__ == "__main__":
+    _demo()
+    print("ok")
+
+
+async def write_file_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Write (templated) content to a file. mode='overwrite' (default) or 'append'."""
+    import os
+    cfg = _cfg(node)
+    path = render(str(cfg.get("path") or ""), ctx, inputs)
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("Write File: a file path is required")
+    path = os.path.expanduser(path.strip())
+    content = render(cfg.get("content"), ctx, inputs)
+    if content is None:
+        content = inputs
+    text = _coerce_text(content)
+    file_mode = "a" if str(cfg.get("mode") or "overwrite").lower().startswith("a") else "w"
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, file_mode, encoding="utf-8") as f:
+        f.write(text)
+    return {"path": path, "bytes": len(text.encode("utf-8")), "mode": file_mode, "ok": True}
+
+
+async def read_file_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
+    """Read a text file. Output {path, content, bytes}; content capped. Optionally
+    parse JSON content into `json` when the file looks like JSON."""
+    import os
+    cfg = _cfg(node)
+    path = render(str(cfg.get("path") or ""), ctx, inputs)
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("Read File: a file path is required")
+    path = os.path.expanduser(path.strip())
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"'{path}' is a directory")
+    size = os.path.getsize(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read(_FILE_READ_CAP)
+    out = {"path": path, "content": content, "bytes": size,
+           "truncated": size > len(content.encode("utf-8"))}
+    if cfg.get("parse_json"):
+        try:
+            out["json"] = json.loads(content)
+        except (ValueError, TypeError):
+            out["json"] = None
+    return out
+
+
 async def respond_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     """Mark the payload to return to a webhook caller. The webhook route returns
     the output of the (first) respond node in the run."""
     cfg = _cfg(node)
     body = render(cfg.get("body"), ctx, inputs) if cfg.get("body") not in (None, "") else inputs
-    return {"response": body}
+    # The body IS the node output (no {"response": ...} wrapper) so the OUTPUT pane and
+    # the webhook reply show exactly what the caller receives. Engine wraps non-dicts.
+    return body if isinstance(body, dict) else {"value": body}
 
 
 async def subworkflow_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
@@ -507,4 +948,8 @@ NODE_HANDLERS = {
     "set": set_node,
     "datetime": datetime_node,
     "error_trigger": error_trigger_node,
+    "variable": variable_node,
+    "write_file": write_file_node,
+    "read_file": read_file_node,
+    "websearch": websearch_node,
 }
