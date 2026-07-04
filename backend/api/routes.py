@@ -1914,6 +1914,19 @@ Available node `type` values:
 - respond (config.body), wait (config.seconds), datetime, variable (config.name, config.value),
 - read_file (config.path), write_file (config.path, config.content), stop_error, noop, subworkflow.
 
+=== TRIGGER NODE — CONFIGURE IT, don't leave it manual ===
+The entry node (id "trigger") has `config.triggerType`: "manual" | "schedule" | "webhook" | "agent".
+Choose the one the objective implies — do NOT leave it "manual" when the user described WHEN it runs.
+- "every day at 7am", "daily", "each morning", "weekly", "on a schedule" → triggerType:"schedule" with a
+  `config.schedule` object: {"interval":"minutes|hours|days|weeks|months","every":N,"atHour":0-23,
+  "atMinute":0-59,"weekdays":[0-6 (0=Sun)],"dayOfMonth":1-31}. Map the time literally:
+    "daily at 7am"        → {"triggerType":"schedule","schedule":{"interval":"days","every":1,"atHour":7,"atMinute":0}}
+    "every 15 minutes"    → {"triggerType":"schedule","schedule":{"interval":"minutes","every":15}}
+    "every Monday 9:30am" → {"triggerType":"schedule","schedule":{"interval":"weeks","every":1,"weekdays":[1],"atHour":9,"atMinute":30}}
+  (Schedule times run in the server's local timezone; if the user names a different tz, say so in `reply`.)
+- Triggered by an incoming HTTP call/webhook → triggerType:"webhook".
+- Kicked off by an agent/another workflow → triggerType:"agent". Only truly on-demand runs stay "manual".
+
 Graph JSON shape (return the FULL graph every time, never a diff):
 {"nodes":[{"id":"<unique>","type":"<type>","position":{"x":N,"y":N},"data":{"label":"Human label","kind":"<type>","config":{...}}}],
  "edges":[{"id":"e-a-b","source":"<id>","target":"<id>","sourceHandle":"true|false|0|loop|done"(optional)}]}
@@ -2090,10 +2103,13 @@ async def _verify_run(wf_id: str, graph: dict, objective: str, adapter, model) -
     from ..workflows import run_workflow
     problems = _validate_graph(graph)
     result = {"connected": not problems, "problems": problems[:6], "ran_ok": False,
-              "run_id": None, "error": "", "meets_objective": "unknown", "note": ""}
+              "run_id": None, "error": "", "meets_objective": "unknown", "note": "", "runnable": True}
     wf = await database.get_workflow(wf_id) if wf_id else None
     if wf is None:
-        result["error"] = "workflow not found to run"
+        # No persisted workflow to execute — this is an infrastructure gap, not a graph the
+        # model can fix. Flag it so the fix loop doesn't churn trying to "repair" it.
+        result["runnable"] = False
+        result["error"] = "no saved workflow to dry-run (save the flow first)"
         return result
     run_wf = {**wf, "id": wf_id, "graph": graph}
     try:
@@ -2113,26 +2129,48 @@ async def _verify_run(wf_id: str, graph: dict, objective: str, adapter, model) -
                 break
         result["error"] = result["error"] or (run.get("error") or "run did not complete")
         return result
-    # Judge meets-objective from the real outputs.
+    # Judge meets-objective from the real outputs — this is a required part of verification.
     digest, _ = _runs_digest([run])
     result["digest"] = digest[:2000]
-    try:
-        j = await adapter.complete(
-            system_prompt="You verify whether a workflow run achieved its business objective. "
-                          "Return ONLY JSON: {\"meets_objective\":\"yes|partly|no\",\"note\":\"one sentence\"}.",
-            messages=[{"role": "user", "content": f"Objective: {objective}\n\nRun outputs:\n{digest}"}],
-            model=model, max_tokens=200)
-        jd = _extract_json(j.content)
-        result["meets_objective"] = jd.get("meets_objective", "unknown")
-        result["note"] = str(jd.get("note", ""))[:300]
-    except Exception:
-        result["meets_objective"] = "unknown"
+    mo, note = await _judge_objective(adapter, model, objective, digest)
+    result["meets_objective"] = mo
+    result["note"] = note
     return result
 
 
-def _verify_failed(v: dict) -> bool:
-    """A verification result the agent must go back and fix."""
-    return (not v.get("connected")) or (not v.get("ran_ok")) or v.get("meets_objective") in ("no", "partly")
+async def _judge_objective(adapter, model, objective: str, digest: str) -> tuple[str, str]:
+    """Rate whether the run's real outputs achieve the objective: yes | partly | no.
+    Retries once with a firmer JSON-only nudge so a chatty model doesn't leave it 'unknown'."""
+    sys = ("You are a strict QA reviewer. Decide whether the workflow run's outputs ACHIEVE the stated "
+           "business objective. 'yes' = fully achieves it; 'partly' = runs but misses/So-so on part of it; "
+           "'no' = does not achieve it. Base it ONLY on the actual outputs shown. "
+           "Return ONLY JSON: {\"meets_objective\":\"yes|partly|no\",\"note\":\"one sentence why\"}.")
+    user = f"Business objective:\n{objective}\n\nActual run outputs:\n{digest or '(no outputs produced)'}"
+    for attempt in range(2):
+        msgs = [{"role": "user", "content": user}]
+        if attempt == 1:
+            msgs.append({"role": "user", "content": "Return ONLY the JSON object with a yes/partly/no "
+                         "verdict — no prose."})
+        try:
+            j = await adapter.complete(system_prompt=sys, messages=msgs, model=model, max_tokens=250)
+            jd = _extract_json(j.content)
+            mo = str(jd.get("meets_objective", "")).lower().strip()
+            if mo in ("yes", "partly", "no"):
+                return mo, str(jd.get("note", ""))[:300]
+        except Exception:
+            pass
+    return "unknown", ""
+
+
+def _verify_failed(v: dict, strict_objective: bool = True) -> bool:
+    """A verification result the agent must go back and fix. Connectivity + a clean run are
+    ALWAYS required. `strict_objective` (finalise only) also requires it to meet the objective;
+    mid-build we don't fail just because the (still-incomplete) flow doesn't fully meet it yet."""
+    if (not v.get("connected")) or (not v.get("ran_ok")):
+        return True
+    # At finalise the run must FULLY meet the objective — anything short of a clear 'yes'
+    # (partly / no / couldn't-confirm) means the agent should keep improving it.
+    return strict_objective and v.get("meets_objective") != "yes"
 
 
 _VERIFY_FIX_SYSTEM = """You are a senior workflow engineer. A workflow was built and then DRY-RUN to verify it, \
@@ -2145,13 +2183,17 @@ Return ONLY a JSON object (no markdown fences):
 {"summary":"<what you changed>","ops":[ ...same op shapes as before... ]}"""
 
 
-async def _verify_fix_loop(adapter, model, wf_id: str, graph: dict, objective: str, max_attempts: int = 3):
-    """Build→verify→fix: dry-run the flow; while it fails to connect, errors, or misses the
-    objective, ask the model to fix the SPECIFIC failure against the latest graph, re-apply,
-    and re-verify. Bounded so it can't burn tokens. Returns (graph, verification, attempts)."""
+async def _verify_fix_loop(adapter, model, wf_id: str, graph: dict, objective: str,
+                           max_attempts: int = 3, strict_objective: bool = True):
+    """Build→verify→fix: dry-run the flow; while it fails to connect, errors, or (when
+    strict_objective) misses the objective, ask the model to fix the SPECIFIC failure against
+    the latest graph, re-apply, and re-verify. Bounded so it can't burn tokens.
+    Returns (graph, verification, attempts)."""
     verification = await _verify_run(wf_id, graph, objective, adapter, model)
     attempts = 0
-    while _verify_failed(verification) and attempts < max_attempts:
+    # Don't loop on an infrastructure failure (no saved workflow) — ops can't fix that.
+    while (verification.get("runnable", True) and _verify_failed(verification, strict_objective)
+           and attempts < max_attempts):
         if not verification.get("connected"):
             fail = ("The flow is NOT fully connected: " + "; ".join(verification.get("problems") or [])
                     + ". Wire every node so execution flows from 'trigger' to the final output.")
@@ -2235,10 +2277,12 @@ async def workflow_ai_build_route(req: WorkflowAIBuildReq):
     needs_confirmation = False
     verification = None
 
-    # Verify+fix wiring whenever there's a real graph.
+    # Verify+fix wiring whenever there's a real graph (cheap static pass before the dry-run).
     if _is_buildable(g):
         g, problems, _ = await _verify_and_fix_graph(adapter, model, objective or "(not set)", g)
-        if problems:
+        # Only surface leftover wiring problems here when NOT changed this turn (no dry-run to
+        # follow); otherwise the mandatory dry-run below is the authoritative report.
+        if problems and not changed:
             reply += (f"\n\n⚠ Heads up: {len(problems)} wiring issue(s) remain (e.g. {problems[0]}).")
 
     # Compliance PRE-CHECK — at the interview→build handover (first real graph) or on finalise.
@@ -2254,29 +2298,45 @@ async def workflow_ai_build_route(req: WorkflowAIBuildReq):
                      "avoid sending data externally, or redact/aggregate sensitive fields)? Tell me an "
                      "alternative and I'll redesign it — or confirm you want to proceed as-is.")
 
-    # FINALISE — dry-run the flow, and if it doesn't connect / errors / misses the objective,
-    # the agent goes back and fixes it, then re-verifies (bounded loop). This is the critical
-    # "prove it actually works" gate.
-    if done and not needs_confirmation and _is_buildable(g):
-        g, verification, fix_attempts = await _verify_fix_loop(adapter, model, req.wf_id, g, objective)
-        if not verification["connected"]:
+    # MANDATORY VERIFICATION — EVERY time the graph changes it is dry-run and, if it doesn't
+    # connect or errors, the agent fixes it and re-verifies (bounded loop). This step cannot be
+    # skipped: no graph edit is returned to the user without proving it actually connects and
+    # runs. Objective satisfaction is only *required* at finalise (done) — mid-build the flow
+    # may still be incomplete — but connectivity + a clean run are enforced on every change.
+    if changed and not needs_confirmation and _is_buildable(g):
+        g, verification, fix_attempts = await _verify_fix_loop(
+            adapter, model, req.wf_id, g, objective, strict_objective=done)
+        fixed = f" (auto-fixed over {fix_attempts} pass(es))" if fix_attempts else ""
+        if not verification.get("runnable", True):
+            # Couldn't dry-run because there's no saved workflow yet — report connectivity only.
+            reply += ("\n\n(Static check passed — the flow is connected. Save the workflow to enable "
+                      "the full dry-run verification.)" if verification["connected"] else
+                      "\n\n⚠ The flow isn't fully connected yet — I'll keep working on it.")
+            if not verification["connected"]:
+                done = False
+        elif not verification["connected"]:
             done = False
-            reply += "\n\n⚠ The flow still isn't fully connected after fixes — I couldn't verify it end-to-end."
+            reply += ("\n\n⚠ The flow still isn't fully connected after fixes — I couldn't verify it "
+                      "end-to-end. I'll keep working on it.")
         elif not verification["ran_ok"]:
             done = False
-            reply += (f"\n\n⚠ Verification run still fails after {fix_attempts} fix attempt(s) — "
-                      f"{verification['error']}. Let's sort this out together.")
-        else:
+            reply += (f"\n\n⚠ Dry-run still fails after {fix_attempts} fix attempt(s) — "
+                      f"{verification['error']}. I'll keep fixing it.")
+        elif done and verification["meets_objective"] != "yes":
+            done = False
             mo = verification["meets_objective"]
-            fixed = f" (auto-fixed over {fix_attempts} pass(es))" if fix_attempts else ""
-            if mo == "no":
-                done = False
-                reply += (f"\n\n⚠ The flow runs, but after {fix_attempts} fix attempt(s) it still doesn't "
-                          f"fully meet the objective.{(' ' + verification['note']) if verification.get('note') else ''}")
-            else:
-                reply += (f"\n\n✓ Verified{fixed}: the flow connects, runs clean (no external sends, test "
-                          f"files cleaned up), and meets the objective: {mo}."
-                          f"{(' ' + verification['note']) if verification.get('note') else ''}")
+            gap = ("I couldn't confirm it meets the objective" if mo == "unknown"
+                   else f"it still doesn't fully meet the objective ({mo})")
+            reply += (f"\n\n⚠ The flow runs cleanly but after {fix_attempts} fix attempt(s) {gap}."
+                      f"{(' ' + verification['note']) if verification.get('note') else ''} "
+                      "Tell me what's missing and I'll adjust.")
+        elif done:
+            reply += (f"\n\n✓ Verified{fixed}: the flow connects, runs clean (no external sends, test "
+                      f"files cleaned up), and meets the objective."
+                      f"{(' ' + verification['note']) if verification.get('note') else ''}")
+        else:
+            # Mid-build change that passed the dry-run — confirm it works so far.
+            reply += f"\n\n✓ Dry-run passed{fixed}: the flow connects and runs without errors."
 
     return {"reply": reply, "objective": objective, "graph": g, "done": done,
             "phase": phase, "risk": risk, "needs_confirmation": needs_confirmation,
