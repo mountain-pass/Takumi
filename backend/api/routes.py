@@ -1847,25 +1847,55 @@ class WorkflowAIBuildReq(BaseModel):
     messages: list[dict] = []        # [{role:'user'|'assistant', content:str}] conversation so far
     graph: dict | None = None        # the current workflow graph
     objective: str | None = None     # captured business objective (if any)
+    wf_id: str | None = None          # workflow being edited (needed for the verification run)
+    risk_confirmed: bool = False      # user explicitly OK'd proceeding despite a HIGH risk pre-check
 
 
-_AI_BUILD_SYSTEM = """You are an automation **workflow builder** (like n8n's AI assistant). \
-You BUILD and UPDATE the actual workflow as you talk — you are not just an interviewer. Every turn \
-you return the full, updated workflow graph that reflects the conversation so far.
+_AI_BUILD_SYSTEM = """You are an automation **workflow builder** (like n8n's AI assistant). You run a \
+two-phase process — INTERVIEW first, then BUILD — and you return a `phase` field saying which you are in.
 
-How to work:
-- The user's first message is the business objective + why it matters. Capture it as `objective` and \
-understand the WHY. If they gave only a technical spec with no reason, ask once for the outcome.
-- As SOON as you have the objective, BUILD a complete first-draft workflow that achieves it — don't \
-wait for lots of clarification. Add every node the outcome needs (trigger → steps → output) and \
-**fully configure each node** (e.g. http needs method+url; write_file needs path+content; llm needs \
-system+prompt; if/filter need a condition). Use sensible defaults and {{tokens}} to wire data between \
-nodes ({{Node Label.field}}); state any assumptions in `reply`.
-- Each following turn, actually CHANGE the graph to match what the user asks — add/remove/rewire/reconfigure \
-nodes. Never reply with only a question when you could also improve the graph. Ask a question ONLY when \
-you genuinely cannot proceed, and even then build your best guess first.
-- Keep `reply` short (1-3 sentences) describing what you just built/changed and what they can tweak. \
-Never put JSON in `reply`. Always keep the node with id "trigger" as the entry point.
+=== PHASE 1: INTERVIEW (phase:"interview") ===
+Your first job is to understand the BUSINESS OBJECTIVE — the outcome the user wants and WHY it matters — \
+NOT a technical solution. If the user describes steps/tools ("call this API then write a file"), steer back: \
+ask what business outcome those steps are meant to achieve.
+- Ask focused, high-signal questions (1-2 at a time) to remove uncertainty BEFORE you build: what triggers \
+this, what data/inputs exist, what the finished output must contain and its exact format, who consumes it, \
+how often, what "done well" looks like, and any constraints. Prefer concrete examples over abstractions.
+- MUST-ASK details you may NOT assume (guessing these makes the flow ambiguous and fail): \
+(1) WHERE outputs are saved — the exact folder/path or filename for any file the flow writes; \
+(2) any external destination/recipient (email address, channel, webhook URL) and whether sending is even wanted; \
+(3) credentials/endpoints/API URLs the flow needs; (4) schedule specifics (what time, timezone, frequency); \
+(5) the EXACT output format; (6) any thresholds/filters (e.g. "only price drops over 5%"). \
+Do NOT invent a save path like "/reports/..." or a placeholder email — ASK. It's fine to offer a sensible \
+DEFAULT and let the user confirm ("I'll save to a 'reports' folder in your workspace unless you'd prefer \
+elsewhere?"), but never silently assume a value that changes the outcome.
+- Distinguish decisions from trivia: fill trivial mechanics (node layout, internal ids, retry counts) yourself; \
+only ASK about the must-decide items above and anything genuinely ambiguous about the OUTCOME.
+- Keep going until you could hand this to an engineer with NO open questions. Capture the refined outcome \
+in `objective`. Do NOT build the graph yet — return an empty/unchanged graph while phase is "interview".
+- When (and only when) the objective is clear and the major uncertainties are resolved, set \
+phase:"build" on that turn and produce the first full graph. Say in `reply` that you're now building.
+- If told the plan is HIGH RISK and asked for a lower-risk alternative: propose a genuinely safer way to \
+hit the same objective (e.g. add a human-approval step, avoid sending externally, redact/aggregate data). \
+Stay in phase:"interview" while you and the user explore that.
+
+=== PHASE 2: BUILD (phase:"build") ===
+Return the full, updated workflow graph reflecting the conversation so far.
+- Build a COMPLETE workflow (trigger → steps → output) and **fully configure every node**. Use {{tokens}} \
+to wire data between nodes. State any assumptions in `reply`.
+- PRIORITISE AI Agent / LLM nodes. Whenever a step involves reasoning, drafting, summarising, extracting, \
+classifying, deciding, formatting, or anything a smart assistant could do, use an `llm` node rather than \
+brittle `code`/`set`/`if` chains — an LLM node is a full agent (it can web-search, browse, use files) and \
+makes the flow far more adaptable. Reserve `code` for pure deterministic transforms (parsing, maths, \
+reshaping) that don't need judgement. A good flow is mostly LLM nodes with light plumbing around them.
+- CONTINUING AN EXISTING FLOW: the current graph JSON and the full chat history are provided. Before you \
+change anything, READ the current graph — its nodes, their configs, and how they're wired — and re-read \
+the conversation so you understand what already exists and what the user now wants. Then make ONLY the \
+targeted change they asked for (via `ops`), preserving everything else. Reference the user's own node \
+labels/ids from the current graph; never rebuild from scratch or drop nodes they didn't ask to remove.
+- Each following turn, actually CHANGE the graph to match what the user asks — add/remove/rewire/reconfigure.
+- Set `done:true` only when the flow is complete and the user is happy — that triggers a verification run.
+- Keep `reply` short (1-3 sentences). Never put JSON in `reply`. Always keep node id "trigger" as the entry.
 """
 
 
@@ -1923,6 +1953,10 @@ CODE NODES — how to read upstream data (this is where flows break most):
   shallow-merges them and same-named fields collide.
 - Every {{id}} you write in code must be a real upstream node id. If you add two websearch nodes, give them
   clear distinct ids and reference those exact ids — do not invent web1/web2 unless those are the real ids.
+- Inside a code node, `{{id.field}}` is reserved for reading UPSTREAM node data. For the code's OWN string \
+templating (e.g. building an HTML page), do NOT use `{{ }}` placeholders — use normal Python (f-strings, \
+.replace(), % or str.format with data you already read). Build HTML by concatenating/inserting the JSON \
+values you parsed, not with a `{{placeholder}}` template.
 - Code runs in a RESTRICTED sandbox. Python may only use these stdlib modules (import them or use directly):
   datetime, math, re, json, random, statistics, textwrap, collections, itertools, functools, time, string,
   decimal, uuid, base64, hashlib. NO os / sys / subprocess / network / file access in a code node. For the
@@ -1949,6 +1983,10 @@ NEVER map the whole node ({{nodeId}}) and NEVER invent fields like `.output`/`.r
 its only output field is `.text`. Reference nodes by their `id`, not their label, in tokens.
 - write_file producing a human document: `config.content` must be `{{<llmNodeId>.text}}` (or other plain \
 text), never the raw upstream object — the file must be the finished, formatted document, not JSON.
+- write_file PATH: use the location the USER specified. If they didn't specify one, use a RELATIVE path \
+(e.g. "reports/market_{{today}}.html") — it is saved under the workspace outputs folder automatically. \
+NEVER hard-code an absolute system path like "/reports/..." or "/tmp/..." — those are read-only and the \
+node will fail. If the destination matters and the user hasn't said, that's a MUST-ASK (see interview).
 - Give every node a clear human `data.label`; keep ids short and stable (don't rename a node's id between \
 turns or you break existing wiring).
 - Self-check before responding: would a careful engineer ship this? Is every config field filled with \
@@ -1958,8 +1996,28 @@ reaches a file/message a finished artefact rather than a data dump? Fix it befor
 
 
 _AI_BUILD_SYSTEM = _AI_BUILD_SYSTEM + _GRAPH_SPEC + """
-Respond with ONLY a JSON object (no markdown fences, no prose outside it):
-{"reply":"<chat message>","objective":"<captured objective or empty>","graph":<full graph>,"done":<true when complete & user is happy>}
+=== HOW TO RETURN THE GRAPH (read carefully — this is where updates get lost) ===
+There are TWO ways to return the workflow; pick ONE per turn:
+- `graph`: the FULL graph. Use this ONLY for the very first draft (when the current graph is empty) or a \
+total rebuild from scratch.
+- `ops`: a list of EDIT OPERATIONS applied to the CURRENT graph. Use this for EVERY change to an existing \
+graph — adding/removing/rewiring/reconfiguring nodes. This is far more reliable (a full graph often gets \
+truncated and the change is silently lost). When the user asks you to uplift/modify the existing flow, you \
+MUST return `ops`, not a full `graph`. Only emit ops for what actually changes; untouched nodes are kept \
+byte-for-byte. Op shapes:
+   {"op":"add_node","node":{"id":"<new id>","type":"<type>","position":{"x":N,"y":N},"data":{"label":"...","kind":"<type>","config":{...}}}}
+   {"op":"update_node","id":"<existing id>","config":{<keys to set/merge>},"label":"<optional new label>"}
+   {"op":"remove_node","id":"<id>"}
+   {"op":"add_edge","source":"<id>","target":"<id>","sourceHandle":"<optional>"}
+   {"op":"remove_edge","source":"<id>","target":"<id>"}
+When you add/remove a node, also add/remove its edges so the flow stays connected. Keep ops SMALL — never \
+inline large HTML/CSS/templates; describe intent in a node's prompt/config instead and finish the JSON.
+
+Respond with ONLY a JSON object (no markdown fences, no prose outside it). For the first draft:
+{"reply":"...","phase":"interview|build","objective":"...","graph":<full graph>,"done":false}
+For a change to an existing graph (PREFERRED once a graph exists):
+{"reply":"...","phase":"build","objective":"...","ops":[ ...edit ops... ],"done":<true only when complete, verified & user happy>}
+While still interviewing, return neither graph nor ops (empty is fine).
 """
 
 
@@ -2000,13 +2058,131 @@ def _salvage_improve(raw: str) -> dict:
     return {"analysis": analysis, "meets_objective": mo.group(1) if mo else "unknown", "suggestions": sugg}
 
 
+def _is_buildable(graph: dict) -> bool:
+    """A graph with real work in it (more than just the trigger)."""
+    nodes = (graph or {}).get("nodes") or []
+    return len([n for n in nodes if n.get("id") != "trigger"]) >= 1
+
+
+async def _compliance_precheck(objective: str, graph: dict) -> dict | None:
+    """Have the Risk & Compliance officer score the PLANNED work before we build/finalise.
+    Returns a compact risk dict, or None if no compliance agent is set up."""
+    from .. import compliance
+    rc = compliance.find_rc_agent(orchestrator)
+    if rc is None:
+        return None
+    labels = [((n.get("data") or {}).get("label") or n.get("type"))
+              for n in (graph.get("nodes") or []) if n.get("id") != "trigger"]
+    plan = "Planned workflow steps: " + (", ".join(labels) if labels else "(not yet designed)")
+    content = f"Business objective: {objective}\n\n{plan}"
+    try:
+        rec = await compliance.assess(rc, subject=f"Workflow plan: {objective[:80]}", content=content)
+    except Exception as e:
+        return {"level": "unknown", "score": None, "error": str(e)[:200], "reviewer": rc.config.name}
+    return {"level": rec.get("level"), "score": rec.get("score"), "threshold": rec.get("threshold"),
+            "rationale": rec.get("rationale"), "reviewer": rc.config.name,
+            "high": (rec.get("level") or "").lower() in ("high", "critical")}
+
+
+async def _verify_run(wf_id: str, graph: dict, objective: str, adapter, model) -> dict:
+    """Finalisation check: run the flow as a safe dry-run (no external sends, writes cleaned
+    up), confirm it connects + completes without error, and judge whether it met the objective."""
+    from ..workflows import run_workflow
+    problems = _validate_graph(graph)
+    result = {"connected": not problems, "problems": problems[:6], "ran_ok": False,
+              "run_id": None, "error": "", "meets_objective": "unknown", "note": ""}
+    wf = await database.get_workflow(wf_id) if wf_id else None
+    if wf is None:
+        result["error"] = "workflow not found to run"
+        return result
+    run_wf = {**wf, "id": wf_id, "graph": graph}
+    try:
+        run_id = await run_workflow(run_wf, {}, mode="verify", trigger_source="ai-verify",
+                                    orchestrator=orchestrator, verify=True)
+    except Exception as e:
+        result["error"] = str(e)[:300]
+        return result
+    result["run_id"] = run_id
+    run = await database.get_run(run_id) or {}
+    result["ran_ok"] = run.get("status") == "success"
+    if not result["ran_ok"]:
+        # Surface the first failed step's error.
+        for s in run.get("steps", []):
+            if s.get("status") == "failed":
+                result["error"] = f"{s.get('node_label') or s.get('node_type')}: {s.get('error') or 'failed'}"
+                break
+        result["error"] = result["error"] or (run.get("error") or "run did not complete")
+        return result
+    # Judge meets-objective from the real outputs.
+    digest, _ = _runs_digest([run])
+    result["digest"] = digest[:2000]
+    try:
+        j = await adapter.complete(
+            system_prompt="You verify whether a workflow run achieved its business objective. "
+                          "Return ONLY JSON: {\"meets_objective\":\"yes|partly|no\",\"note\":\"one sentence\"}.",
+            messages=[{"role": "user", "content": f"Objective: {objective}\n\nRun outputs:\n{digest}"}],
+            model=model, max_tokens=200)
+        jd = _extract_json(j.content)
+        result["meets_objective"] = jd.get("meets_objective", "unknown")
+        result["note"] = str(jd.get("note", ""))[:300]
+    except Exception:
+        result["meets_objective"] = "unknown"
+    return result
+
+
+def _verify_failed(v: dict) -> bool:
+    """A verification result the agent must go back and fix."""
+    return (not v.get("connected")) or (not v.get("ran_ok")) or v.get("meets_objective") in ("no", "partly")
+
+
+_VERIFY_FIX_SYSTEM = """You are a senior workflow engineer. A workflow was built and then DRY-RUN to verify it, \
+and the run revealed a problem. Fix the graph so it connects end-to-end, runs without error, AND fully \
+achieves the business objective. You are given the exact failure and the real run outputs — fix the actual \
+cause, don't guess. Prefer AI Agent / LLM nodes for any step needing judgement. Return ONLY edit operations \
+(do not rewrite the whole graph); return an empty ops list only if truly nothing can be improved.
+""" + _GRAPH_SPEC + """
+Return ONLY a JSON object (no markdown fences):
+{"summary":"<what you changed>","ops":[ ...same op shapes as before... ]}"""
+
+
+async def _verify_fix_loop(adapter, model, wf_id: str, graph: dict, objective: str, max_attempts: int = 3):
+    """Build→verify→fix: dry-run the flow; while it fails to connect, errors, or misses the
+    objective, ask the model to fix the SPECIFIC failure against the latest graph, re-apply,
+    and re-verify. Bounded so it can't burn tokens. Returns (graph, verification, attempts)."""
+    verification = await _verify_run(wf_id, graph, objective, adapter, model)
+    attempts = 0
+    while _verify_failed(verification) and attempts < max_attempts:
+        if not verification.get("connected"):
+            fail = ("The flow is NOT fully connected: " + "; ".join(verification.get("problems") or [])
+                    + ". Wire every node so execution flows from 'trigger' to the final output.")
+        elif not verification.get("ran_ok"):
+            fail = (f"The dry-run FAILED at: {verification.get('error')}. Fix the node/config that caused "
+                    "this (bad token, missing field, wrong config) so the run completes.")
+        else:
+            fail = (f"The run completed but did NOT satisfy the objective "
+                    f"(meets_objective={verification.get('meets_objective')}). Reviewer note: "
+                    f"{verification.get('note') or '(none)'}. Change/add nodes so the final output fully "
+                    "achieves the objective.")
+        um = (f"Business objective: {objective}\n\nFAILURE:\n{fail}\n\n"
+              f"Real run outputs:\n{verification.get('digest') or '(run did not produce outputs)'}\n\n"
+              f"Latest graph JSON:\n{_json.dumps(graph)}")
+        ops = await _request_ops(adapter, model, _VERIFY_FIX_SYSTEM, um)
+        if not ops:
+            break
+        graph, _ = _apply_ops(graph, ops)
+        # Repair any wiring the edit introduced, then re-run the verification.
+        graph, _, _ = await _verify_and_fix_graph(adapter, model, objective, graph)
+        verification = await _verify_run(wf_id, graph, objective, adapter, model)
+        attempts += 1
+    return graph, verification, attempts
+
+
 @router.post("/workflows/ai-build")
 async def workflow_ai_build_route(req: WorkflowAIBuildReq):
-    """Conversational workflow builder. Given the chat so far + current graph,
-    returns the assistant's reply, the captured objective, and the updated graph."""
-    from ..llm_adapters.factory import get_adapter
-    from ..config import get_settings
-
+    """Conversational workflow builder with a real process:
+    INTERVIEW (gather the business objective) → compliance pre-check (warn/confirm if HIGH) →
+    BUILD (LLM-node-first) → on finalise, a safe verification run that proves the flow connects,
+    runs without error, and meets the objective."""
     graph = req.graph or {"nodes": [], "edges": []}
     system = (_AI_BUILD_SYSTEM
               + f"\n\nCurrent objective: {req.objective or '(none yet)'}"
@@ -2025,26 +2201,91 @@ async def workflow_ai_build_route(req: WorkflowAIBuildReq):
 
     try:
         data = _extract_json(resp.content)
-        objective = (data.get("objective") or req.objective or "").strip()
-        g = data.get("graph") if isinstance(data.get("graph"), dict) else graph
-        reply = str(data.get("reply", "")).strip()
-        # Physically verify the freshly-built graph and auto-fix bad wiring (orphans,
-        # broken {{token}} ids) before returning it to the canvas.
-        g, problems, fixes = await _verify_and_fix_graph(adapter, model, objective or "(not set)", g)
+    except Exception as _e:
+        # Malformed/truncated JSON (big graphs can get cut off). First try to recover edit
+        # OPS from the partial output and apply them — that's how an update still lands even
+        # when the JSON didn't fully close. Only if there are no ops do we fall back to
+        # salvaging just the readable reply (keeping the last good graph).
+        logger.warning("[ai-build] JSON parse failed (%s); raw head=%r tail=%r",
+                       _e, (resp.content or "")[:200], (resp.content or "")[-120:])
+        salv_ops = _salvage_ops(resp.content)
+        if salv_ops and _is_buildable(graph):
+            data = {"reply": _salvage_ai_build(resp.content, graph, req.objective or "")["reply"],
+                    "objective": req.objective or "", "phase": "build", "ops": salv_ops, "done": False}
+        else:
+            return _salvage_ai_build(resp.content, graph, req.objective or "")
+
+    objective = (data.get("objective") or req.objective or "").strip()
+    reply = str(data.get("reply", "")).strip()
+    done = bool(data.get("done"))
+    # Apply the change. For an existing graph the model should return edit `ops` (reliable,
+    # truncation-tolerant) rather than a whole `graph`; honour whichever it sent.
+    ops = data.get("ops")
+    if isinstance(ops, list) and ops and _is_buildable(graph):
+        g, applied = _apply_ops(graph, ops)
+        if not applied:
+            reply += "\n\n⚠ I couldn't apply that change cleanly — tell me again and I'll retry."
+    elif isinstance(data.get("graph"), dict):
+        g = data["graph"]
+    else:
+        g = graph  # nothing new this turn (still interviewing)
+    changed = (isinstance(ops, list) and bool(ops)) or isinstance(data.get("graph"), dict)
+    phase = data.get("phase") or ("build" if (changed or _is_buildable(g)) else "interview")
+    risk = None
+    needs_confirmation = False
+    verification = None
+
+    # Verify+fix wiring whenever there's a real graph.
+    if _is_buildable(g):
+        g, problems, _ = await _verify_and_fix_graph(adapter, model, objective or "(not set)", g)
         if problems:
-            reply += (f"\n\n⚠ Heads up: {len(problems)} wiring issue(s) remain (e.g. {problems[0]}). "
-                      "Worth a look before running.")
-        return {"reply": reply, "objective": objective, "graph": g, "done": bool(data.get("done"))}
-    except Exception:
-        # Malformed/truncated JSON (big graphs can get cut off): salvage just the
-        # readable reply so raw JSON never leaks into the chat, and keep the last
-        # good graph since the new one can't be trusted.
-        return _salvage_ai_build(resp.content, graph, req.objective or "")
+            reply += (f"\n\n⚠ Heads up: {len(problems)} wiring issue(s) remain (e.g. {problems[0]}).")
+
+    # Compliance PRE-CHECK — at the interview→build handover (first real graph) or on finalise.
+    first_build = phase == "build" and not _is_buildable(graph) and _is_buildable(g)
+    if objective and (first_build or done):
+        risk = await _compliance_precheck(objective, g)
+        if risk and risk.get("high") and not req.risk_confirmed:
+            needs_confirmation = True
+            done = False  # hold the finalise/verification until the user decides
+            reply = (f"⚠ Compliance flagged this as **{(risk.get('level') or '').upper()}** risk "
+                     f"(score {risk.get('score')}/{risk.get('threshold')}). {risk.get('rationale') or ''}\n\n"
+                     "Can we achieve the same objective a lower-risk way (e.g. add a human approval step, "
+                     "avoid sending data externally, or redact/aggregate sensitive fields)? Tell me an "
+                     "alternative and I'll redesign it — or confirm you want to proceed as-is.")
+
+    # FINALISE — dry-run the flow, and if it doesn't connect / errors / misses the objective,
+    # the agent goes back and fixes it, then re-verifies (bounded loop). This is the critical
+    # "prove it actually works" gate.
+    if done and not needs_confirmation and _is_buildable(g):
+        g, verification, fix_attempts = await _verify_fix_loop(adapter, model, req.wf_id, g, objective)
+        if not verification["connected"]:
+            done = False
+            reply += "\n\n⚠ The flow still isn't fully connected after fixes — I couldn't verify it end-to-end."
+        elif not verification["ran_ok"]:
+            done = False
+            reply += (f"\n\n⚠ Verification run still fails after {fix_attempts} fix attempt(s) — "
+                      f"{verification['error']}. Let's sort this out together.")
+        else:
+            mo = verification["meets_objective"]
+            fixed = f" (auto-fixed over {fix_attempts} pass(es))" if fix_attempts else ""
+            if mo == "no":
+                done = False
+                reply += (f"\n\n⚠ The flow runs, but after {fix_attempts} fix attempt(s) it still doesn't "
+                          f"fully meet the objective.{(' ' + verification['note']) if verification.get('note') else ''}")
+            else:
+                reply += (f"\n\n✓ Verified{fixed}: the flow connects, runs clean (no external sends, test "
+                          f"files cleaned up), and meets the objective: {mo}."
+                          f"{(' ' + verification['note']) if verification.get('note') else ''}")
+
+    return {"reply": reply, "objective": objective, "graph": g, "done": done,
+            "phase": phase, "risk": risk, "needs_confirmation": needs_confirmation,
+            "verification": verification}
 
 
 def _salvage_ai_build(raw: str, graph: dict, objective: str) -> dict:
     s = _clean_fences(raw)
-    rm = re.search(r'"reply"\s*:\s*"(.*?)("\s*,\s*"(?:objective|graph|done)"|"\s*\}|$)', s, re.S)
+    rm = re.search(r'"reply"\s*:\s*"(.*?)("\s*,\s*"(?:phase|objective|graph|ops|done)"|"\s*\}|$)', s, re.S)
     reply = (rm.group(1) if rm else s).replace('\\"', '"').replace('\\n', '\n').strip()
     # If we still couldn't isolate a reply (no "reply" key at all), don't echo raw JSON.
     if not rm and (reply.startswith("{") or '"graph"' in reply):
@@ -2293,14 +2534,21 @@ def _validate_graph(graph: dict) -> list[str]:
         nid = n.get("id")
         if nid and nid != "trigger" and nid not in seen:
             problems.append(f"node '{nid}' ({n.get('type')}) is not connected from trigger")
-    # Token references → must point at a real node id (or a built-in)
+    # Token references → must point at a real node id (or a built-in). Only flag heads that
+    # LOOK like a token reference (a clean identifier). This skips f-string escaped braces
+    # and CSS/JS template syntax inside code nodes (e.g. {{font-family:...}}), which are not
+    # workflow tokens and are left untouched by the engine.
     tok = re.compile(r"\{\{\s*([^}|.\s]+)")
+    id_like = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
     for n in nodes:
+        # Code nodes legitimately contain {{ }} for their own templating — don't lint those.
+        if (n.get("type") or (n.get("data") or {}).get("type")) == "code":
+            continue
         cfg = (n.get("data") or {}).get("config") or {}
         for v in cfg.values():
             if isinstance(v, str):
                 for head in tok.findall(v):
-                    if head not in ids and head not in _TOKEN_BUILTINS:
+                    if id_like.match(head) and head not in ids and head not in _TOKEN_BUILTINS:
                         problems.append(f"node '{n.get('id')}' references unknown id '{head}' in a {{{{token}}}}")
     # De-dup while preserving order
     return list(dict.fromkeys(problems))

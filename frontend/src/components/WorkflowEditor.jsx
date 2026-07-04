@@ -259,7 +259,35 @@ function cleanReply(reply) {
   return s
 }
 
-function AIAssistPanel({ objective, getGraph, onApply, onClose, history, onHistory }) {
+// Deterministic left→right layered layout so an AI-generated graph is always tidy,
+// regardless of the (often rough) x/y coordinates the model guessed. Columns = longest
+// path depth from the roots; nodes in a column are stacked and vertically centred.
+function layoutGraph(nodes, edges) {
+  if (!nodes || !nodes.length) return nodes || []
+  const fwd = (edges || []).filter(e => !String(e.id || '').startsWith('wfback') && e.source && e.target)
+  const preds = new Map(nodes.map(n => [n.id, []]))
+  fwd.forEach(e => { if (preds.has(e.target)) preds.get(e.target).push(e.source) })
+  const depth = new Map(); const visiting = new Set()
+  const calc = (id) => {
+    if (depth.has(id)) return depth.get(id)
+    if (visiting.has(id)) return 0            // cycle guard — treat back-edge as no depth
+    visiting.add(id)
+    const ps = preds.get(id) || []
+    const d = ps.length ? Math.max(...ps.map(p => calc(p) + 1)) : 0
+    visiting.delete(id); depth.set(id, d); return d
+  }
+  nodes.forEach(n => calc(n.id))
+  const cols = new Map()
+  nodes.forEach(n => { const d = depth.get(n.id) || 0; if (!cols.has(d)) cols.set(d, []); cols.get(d).push(n.id) })
+  const COL_W = 280, ROW_H = 130, X0 = 80, YC = 260, pos = new Map()
+  ;[...cols.keys()].sort((a, b) => a - b).forEach(d => {
+    const ids = cols.get(d)
+    ids.forEach((id, i) => pos.set(id, { x: X0 + d * COL_W, y: YC + (i - (ids.length - 1) / 2) * ROW_H }))
+  })
+  return nodes.map(n => ({ ...n, position: pos.get(n.id) || n.position || { x: X0, y: YC } }))
+}
+
+function AIAssistPanel({ objective, wfId, getGraph, onApply, onClose, history, onHistory }) {
   const [messages, setMessages] = useState(
     (history && history.length) ? history : [
       { role: 'assistant', content: objective
@@ -270,32 +298,36 @@ function AIAssistPanel({ objective, getGraph, onApply, onClose, history, onHisto
   const [busy, setBusy] = useState(false)
   const [obj, setObj] = useState(objective || '')
   const [error, setError] = useState('')
+  const [awaitConfirm, setAwaitConfirm] = useState(false)  // last turn flagged HIGH risk
   const scrollRef = useRef(null)
   const inputRef = useRef(null)
   useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight) }, [messages, busy])
 
-  async function send() {
-    const text = input.trim()
+  async function send(text, { riskConfirmed = false } = {}) {
+    text = (typeof text === 'string' ? text : input).trim()
     if (!text || busy) return
     // The opener always asks for the objective, so the first user message IS the
     // objective — capture it deterministically rather than relying on the model.
     const isFirstUser = messages.every(m => m.role !== 'user')
     const nextObj = obj || (isFirstUser ? text : '')
     const convo = [...messages, { role: 'user', content: text }]
-    setMessages(convo); setInput(''); setBusy(true); setError(''); setObj(nextObj)
+    setMessages(convo); setInput(''); setBusy(true); setError(''); setObj(nextObj); setAwaitConfirm(false)
     if (inputRef.current) inputRef.current.style.height = 'auto'
     try {
       const res = await fetch('/api/workflows/ai-build', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: convo, graph: getGraph(), objective: nextObj }),
+        body: JSON.stringify({ messages: convo, graph: getGraph(), objective: nextObj,
+          wf_id: wfId, risk_confirmed: riskConfirmed }),
       })
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'AI build failed')
       const data = await res.json()
       const finalObj = data.objective || nextObj
       setObj(finalObj)
       onApply(data.graph || getGraph(), finalObj)
-      const next = [...convo, { role: 'assistant', content: cleanReply(data.reply) }]
+      const next = [...convo, { role: 'assistant', content: cleanReply(data.reply),
+        risk: data.risk, verification: data.verification }]
       setMessages(next)
+      setAwaitConfirm(!!data.needs_confirmation)
       onHistory && onHistory(next)
     } catch (e) { setError(String(e.message || e)) } finally { setBusy(false) }
   }
@@ -317,14 +349,43 @@ function AIAssistPanel({ objective, getGraph, onApply, onClose, history, onHisto
       )}
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.map((m, i) => (
-          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`max-w-[85%] px-3 py-2 rounded-2xl text-[13px] whitespace-pre-wrap ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
+          <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+            <div className={`max-w-[85%] px-3 py-2 rounded-2xl text-[13px] whitespace-pre-wrap select-text cursor-text ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'}`}>{m.content}</div>
+            {m.risk && m.risk.level && (
+              <div className={`mt-1 max-w-[85%] text-[11px] px-2 py-1 rounded-lg border flex items-center gap-1.5 ${RISK_LEVEL_STYLE[(m.risk.level || '').toLowerCase()]?.bg || 'bg-gray-50 border-gray-200'}`}>
+                <ShieldCheck size={12} className={RISK_LEVEL_STYLE[(m.risk.level || '').toLowerCase()]?.text || 'text-gray-500'} />
+                <span className={RISK_LEVEL_STYLE[(m.risk.level || '').toLowerCase()]?.text || 'text-gray-600'}>
+                  Compliance: <b>{(m.risk.level || 'n/a').toUpperCase()}</b>
+                  {m.risk.score != null && <> · score {m.risk.score}/{m.risk.threshold}</>}
+                  {m.risk.reviewer && <> · {m.risk.reviewer}</>}
+                </span>
+              </div>
+            )}
+            {m.verification && (
+              <div className={`mt-1 max-w-[85%] text-[11px] px-2 py-1 rounded-lg border flex items-center gap-1.5 ${m.verification.ran_ok && m.verification.meets_objective !== 'no' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-red-50 border-red-200 text-red-700'}`}>
+                {m.verification.ran_ok && m.verification.meets_objective !== 'no'
+                  ? <><CheckCircle2 size={12} /> Verified run · meets objective: {m.verification.meets_objective}</>
+                  : <><AlertCircle size={12} /> Verification: {m.verification.error || `meets objective: ${m.verification.meets_objective}`}</>}
+              </div>
+            )}
           </div>
         ))}
         {busy && <div className="flex justify-start"><div className="px-3 py-2 rounded-2xl bg-gray-100 text-gray-400 text-[13px] flex items-center gap-2"><Loader2 size={13} className="animate-spin" /> Thinking…</div></div>}
         {error && <div className="text-[11px] text-red-500 bg-red-50 border border-red-100 rounded-lg px-2 py-1.5">{error}</div>}
       </div>
       <div className="p-3 border-t border-gray-100">
+        {awaitConfirm && (
+          <div className="mb-2 flex items-center gap-2">
+            <button onClick={() => send('Proceed as-is — I confirm the risk.', { riskConfirmed: true })}
+              className="flex-1 text-[12px] font-medium px-2 py-1.5 rounded-lg bg-amber-100 text-amber-800 hover:bg-amber-200">
+              Proceed anyway
+            </button>
+            <button onClick={() => inputRef.current?.focus()}
+              className="flex-1 text-[12px] font-medium px-2 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50">
+              Suggest a safer way
+            </button>
+          </div>
+        )}
         <div className="flex items-end gap-2">
           <textarea ref={inputRef} rows={1} value={input}
             onChange={e => { setInput(e.target.value); const t = e.target; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 160) + 'px' }}
@@ -477,10 +538,17 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
   const clipboardRef = useRef(null)   // { node, pastes }
   useEffect(() => {
     const editable = el => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+    const hasTextSelection = () => {
+      const s = window.getSelection && window.getSelection()
+      return !!(s && s.toString().trim())
+    }
     const onKey = (e) => {
       if (!(e.metaKey || e.ctrlKey) || editable(document.activeElement)) return
       const k = e.key.toLowerCase()
       if (k === 'c') {
+        // Don't hijack Cmd+C when the user has actually selected text (e.g. in a chat
+        // bubble) — let the browser copy the text. Only copy the node when nothing is selected.
+        if (hasTextSelection()) return
         const n = nodes.find(x => x.id === selectedId)
         if (n) { clipboardRef.current = { node: n, pastes: 0 }; e.preventDefault() }
       } else if (k === 'v' && clipboardRef.current) {
@@ -537,19 +605,27 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
     // default for new ones) so edges keep rendering. RF v12 hides an edge whenever an
     // endpoint lacks `measured` — and rapid successive applyGraph calls during streaming
     // would otherwise rebuild nodes bare and make every edge vanish.
+    const laidOut = layoutGraph(graph?.nodes || [], graph?.edges || [])
     setNodes(prev => {
       const byId = new Map(prev.map(n => [n.id, n]))
-      return (graph?.nodes || []).map(n => {
+      return laidOut.map(n => {
         const ex = byId.get(n.id)
         const base = { ...n, type: n.type, data: { ...n.data, kind: n.type } }
-        const measured = ex?.measured || { width: 220, height: 80 }
-        return ex ? { ...ex, ...base, position: n.position || ex.position, measured }
-                  : { ...base, width: 220, height: 80, measured }
+        // Seed dims matching the real node (w-[190px], ~56px tall) so edge endpoints
+        // anchor correctly before RF re-measures — a wrong guess floats the handles.
+        const measured = ex?.measured || { width: 190, height: 56 }
+        // Use the freshly computed tidy position (overrides the model's guessed x/y).
+        return ex ? { ...ex, ...base, position: n.position, measured }
+                  : { ...base, width: 190, height: 56, measured }
       })
     })
-    setEdges((graph?.edges || []).map(e => ({
-      ...e, id: e.id || `${e.source}-${e.sourceHandle || ''}-${e.target}`, animated: true,
-    })))
+    setEdges((graph?.edges || []).map(e => {
+      // The default output handle renders with id=undefined, so an AI-emitted
+      // sourceHandle:"source" (or a blank one) won't match and the edge floats.
+      const sh = (e.sourceHandle && e.sourceHandle !== 'source') ? e.sourceHandle : undefined
+      return { ...e, sourceHandle: sh,
+        id: e.id || `${e.source}-${sh || ''}-${e.target}`, animated: true }
+    }))
   }
 
   async function handleSave() {
@@ -858,6 +934,7 @@ function EditorInner({ workflowId, onBack, aiAssist }) {
         {assistOpen && (
           <AIAssistPanel
             objective={objective}
+            wfId={workflowId}
             getGraph={buildGraph}
             history={aiChat}
             onHistory={(msgs) => { setAiChat(msgs); if (workflowId) saveWorkflow(workflowId, { ai_chat: msgs }) }}
@@ -1303,13 +1380,15 @@ function ComplianceReviewPanel({ items }) {
           const lvl = (c.level || '').toLowerCase()
           const st = RISK_LEVEL_STYLE[lvl] || RISK_LEVEL_STYLE.medium
           const blocked = c.status === 'blocked'
+          const notReviewed = c.status === 'error' || c.status === 'unchecked'
           const cats = Object.entries(c.categories || {}).filter(([, v]) => v && (v.score || v.note))
           return (
             <div key={node.id} className={`rounded-xl border ${st.bg} p-3 space-y-2.5`}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[13px] font-semibold text-gray-800 truncate">{node.data.label}</span>
-                <span className={`shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold ${st.text}`}>
-                  <span className={`w-2 h-2 rounded-full ${st.dot}`} /> {(c.level || 'n/a').toUpperCase()}
+                <span className={`shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold ${notReviewed ? 'text-gray-500' : st.text}`}>
+                  <span className={`w-2 h-2 rounded-full ${notReviewed ? 'bg-gray-400' : st.dot}`} />
+                  {notReviewed ? 'NOT REVIEWED' : (c.level || 'n/a').toUpperCase()}
                 </span>
               </div>
 
@@ -1317,7 +1396,8 @@ function ComplianceReviewPanel({ items }) {
                 <p className="text-xs text-amber-700">No Risk &amp; Compliance agent is set up, so this output
                   could not be reviewed. Add one in Risk &amp; Compliance.</p>
               ) : c.status === 'error' ? (
-                <p className="text-xs text-gray-500">Review error: {c.reason}</p>
+                <p className="text-xs text-gray-600">This output could not be reviewed, so it was not allowed
+                  to proceed. {c.reason}{c.reviewer && <span className="text-gray-400"> (reviewer: {c.reviewer})</span>}</p>
               ) : (
                 <>
                   <div className="flex items-center gap-3 text-xs">

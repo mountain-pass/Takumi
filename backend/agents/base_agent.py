@@ -545,7 +545,12 @@ class BaseAgent:
 
     async def _build_system_prompt(self) -> str:
         """Build the full system prompt with SOP, tools, and connections."""
-        system = self.config.system_prompt + self._temporal_preamble()
+        # Let authors drop {{today}}/{{date}} into their prompt to pin the live date
+        # exactly where they want it (in addition to the temporal preamble below).
+        from datetime import datetime, timezone
+        _today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+        base = (self.config.system_prompt or "").replace("{{today}}", _today).replace("{{date}}", _today)
+        system = base + self._temporal_preamble()
 
         # Soul (personality) + persistent memory from the agent's folder files,
         # so the agent stays in character and recalls learned context each run.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections import defaultdict, deque
 
@@ -67,6 +68,11 @@ async def _run_compliance(node: dict, output: dict, workflow: dict, run_id: str,
     try:
         record = await compliance.assess(rc, subject=f"Workflow LLM node: {label}",
                                          content=content, task_id=run_id)
+        if record.get("incomplete"):
+            # The assessor couldn't actually score (e.g. its LLM key is invalid).
+            # Don't pass it off as a clean review — surface the failure instead.
+            return {"status": "error", "reviewer": rc.config.name,
+                    "reason": f"Review could not be completed: {record.get('error')}"}
         return {
             "status": "blocked" if record.get("verdict") == "block" else "reviewed",
             "level": record.get("level"),
@@ -86,13 +92,18 @@ async def _run_compliance(node: dict, output: dict, workflow: dict, run_id: str,
 async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                        mode: str = "test", trigger_source: str = "manual",
                        orchestrator=None, _depth: int = 0, until_node: str | None = None,
-                       only_node: str | None = None, seed_context: dict | None = None) -> str:
+                       only_node: str | None = None, seed_context: dict | None = None,
+                       verify: bool = False) -> str:
     """Execute a workflow graph. Returns the run_id. Steps stream over WS.
     `until_node` stops after that node executes (used by 'Execute step').
     `only_node` runs JUST that node with the given `trigger_payload` as its input
     (used by 'This step only' — re-test one node without re-running upstream).
     `seed_context` pre-populates ctx.context (keyed by upstream node id/label) so
-    {{Upstream.field}} tokens still resolve in only_node mode."""
+    {{Upstream.field}} tokens still resolve in only_node mode.
+    `verify` = a safe dry-run used by the AI builder to prove the flow works without
+    real-world side effects: outbound mutating HTTP calls (POST/PUT/PATCH/DELETE — how
+    email/Telegram/WhatsApp/etc. are sent) are SIMULATED not sent, and any files written
+    are deleted after the run."""
     run_id = uuid.uuid4().hex
     graph = workflow.get("graph") or {}
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
@@ -108,6 +119,7 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
 
     ctx = NodeContext(run_id=run_id, mode=mode, orchestrator=orchestrator, workflow=workflow)
     ctx.depth = _depth
+    verify_writes: list[str] = []     # files written during a verify run → deleted at the end
     outputs: dict[str, dict] = {}
     executed: set[str] = set()
     consumed: set[str] = set()       # nodes already run inside a loop body
@@ -162,6 +174,22 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
                                      "input": inputs if isinstance(inputs, dict) else {"value": inputs}})
         await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                          {"run_id": run_id, "node_id": node_id, "status": "running", "label": label})
+        # Verify (dry-run): don't let an outbound mutating HTTP call actually fire — that's
+        # how messages/emails get sent out. Simulate a success so downstream nodes still run.
+        if verify and ntype == "http":
+            _m = str(((node.get("data") or {}).get("config") or {}).get("method") or "GET").upper()
+            if _m not in ("GET", "HEAD", "OPTIONS"):
+                output = {"status": 0, "ok": True, "skipped": True, "body": "",
+                          "note": f"[verify] outbound HTTP {_m} not sent (verification run)"}
+                ctx.context[node_id] = output
+                _lbl = (node.get("data") or {}).get("label")
+                if _lbl:
+                    ctx.context[_lbl] = output
+                await database.finish_run_step(step_id, status="success", output=output)
+                await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
+                                 {"run_id": run_id, "node_id": node_id, "status": "success",
+                                  "label": label, "output": output})
+                return output, None
         handler = NODE_HANDLERS.get(ntype)
         if handler is None:
             await database.finish_run_step(step_id, status="failed", error=f"Unknown node type '{ntype}'")
@@ -181,6 +209,10 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             await _broadcast(orchestrator, WSEventType.WORKFLOW_STEP,
                              {"run_id": run_id, "node_id": node_id, "status": "failed", "label": label, "error": str(e)[:300]})
             raise
+        # Verify run: the file write proves path+content are valid, then we remove it so
+        # a dry-run leaves nothing behind on disk.
+        if verify and ntype == "write_file" and isinstance(output, dict) and output.get("path"):
+            verify_writes.append(output["path"])
         comp = await _run_compliance(node, output, workflow, run_id, orchestrator) if ntype == "llm" else None
         ctx.context[node_id] = output
         # Also expose the output under the node's label so templates can read
@@ -194,11 +226,14 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
         # only returns 'blocked'/'unchecked' when require_compliance is on, so the
         # per-workflow flag is authoritative regardless of the org-wide mode.)
         tokens = ctx.step_tokens.get(node_id)
-        if comp and comp.get("status") in ("blocked", "unchecked"):
+        if comp and comp.get("status") in ("blocked", "unchecked", "error"):
             if comp.get("status") == "unchecked":
                 err = ("Compliance review is required for this workflow, but no Risk & Compliance "
                        "agent is set up. Add a compliance agent in Risk & Compliance so this workflow "
                        "can run according to the rules.")
+            elif comp.get("status") == "error":
+                err = (f"Compliance review could not be completed, so this output cannot proceed. "
+                       f"{comp.get('reason') or ''}").strip()
             else:
                 err = f"Blocked by compliance review ({comp.get('level')}, score {comp.get('score')})"
             await database.finish_run_step(step_id, status="failed", output=output, compliance=comp,
@@ -376,6 +411,13 @@ async def run_workflow(workflow: dict, trigger_payload: dict | None = None, *,
             await run_error_branch(failed_label, run_error, failed_id)
         except Exception as e:
             logger.warning("[workflow] error branch crashed: %s", e)
+
+    # Verify run cleanup: delete any files the dry-run wrote so it leaves no trace.
+    for _p in verify_writes:
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
 
     await database.finish_run(run_id, run_status, run_error)
     await _broadcast(orchestrator, WSEventType.WORKFLOW_RUN,
