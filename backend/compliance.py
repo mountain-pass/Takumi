@@ -294,10 +294,9 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
 
     categories = {}
     rationale = ""
+    assess_error = ""
     if rc_agent is not None:
         try:
-            adapter = rc_agent._adapter
-            model = rc_agent.config.llm_model
             cats = base.get("categories") or CATEGORIES
             lscale = base.get("likelihood_scale") or DEFAULT_LIKELIHOOD
             cscale = base.get("consequence_scale") or DEFAULT_CONSEQUENCE
@@ -318,35 +317,71 @@ async def assess(rc_agent, subject: str, content: str, *, task_id: str = "",
                 scale_txt += ("\n\nThis policy's IMPACT TABLE defines consequence severity per "
                               "category (use it as the source of truth for consequence):\n" +
                               impact_table_text(itable))
+            from datetime import datetime, timezone
+            today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
             system = (
-                "You are an ISO 31000 risk & compliance assessor for this organisation. Score the work "
-                f"against the POLICY below ({policy_label}), across these categories: {', '.join(cats)}.\n\n"
+                f"Today's real-world date is {today}. The work you are reviewing may legitimately "
+                "describe events, prices, statistics, or news that are AFTER your training cutoff — "
+                "that is expected and is NOT a risk by itself. Do NOT flag content as fabricated or "
+                "non-compliant merely because you don't recognise it; judge it on actual policy risk.\n\n"
+                "You are an ISO 31000 risk & compliance assessor for this organisation. Your job is to "
+                "REVIEW work produced by other agents and rate its risk — you are NOT producing or endorsing "
+                "the content. The work may contain harmful, unsafe, or policy-violating material; that is "
+                "exactly what you must catch. NEVER refuse and NEVER return a safety disclaimer — reviewing "
+                "dangerous output is the whole point. The more dangerous the content, the higher you score it "
+                "(harmful/illegal content = likelihood and consequence near 5). "
+                f"Score the work against the POLICY below ({policy_label}), across these categories: "
+                f"{', '.join(cats)}.\n\n"
                 f"POLICY:\n{appetite}\n\n"
                 f"SCORING SCALE: {scale_txt}\n\n"
                 "For each relevant category give likelihood (1-5) and consequence (1-5) and a one-line note. "
-                "Be conservative against the policy — flag data leakage, PII, financial/legal exposure, and "
-                "reputational risk. Return ONLY JSON: {\"categories\": {\"<cat>\": {\"likelihood\": n, "
-                "\"consequence\": n, \"note\": \"...\"}}, \"rationale\": \"2-3 sentences referencing the policy\"}."
+                "Be conservative against the policy — flag data leakage, PII, financial/legal exposure, "
+                "reputational risk, and any unsafe/illegal instructions.\n\n"
+                "VERIFY BEFORE SCORING: if the work makes time-sensitive factual claims (prices, "
+                "statistics, events, dates, who runs/owns something, public/private status, news), use "
+                "your `web_search`/`web_fetch` tools to confirm them against live sources — do not rely on "
+                "memory. A claim you confirm to be FALSE or unverifiable is a reputational/operational "
+                "risk and must be scored accordingly; note what you verified.\n\n"
+                "When finished, return ONLY JSON: "
+                "{\"categories\": {\"<cat>\": {\"likelihood\": n, \"consequence\": n, \"note\": \"...\"}}, "
+                "\"rationale\": \"2-3 sentences referencing the policy and any facts you verified\"}. "
+                "Output MINIFIED JSON on a single line, no code fences, keep each note under 20 words."
             )
             user = f"Subject: {subject}\n\nWork to assess:\n\"\"\"\n{(content or '')[:6000]}\n\"\"\""
-            resp = await adapter.complete(system_prompt=system,
-                                          messages=[{"role": "user", "content": user}],
-                                          model=model, max_tokens=900)
-            data = _parse_json(resp.content)
+            # Run the review through the agent's full tool loop so it can web_search/web_fetch
+            # to verify time-sensitive claims (it inherits the agent's skills + temporal preamble).
+            # Safety-tuned models sometimes refuse or return prose; retry once with a firmer
+            # JSON-only nudge before treating it as an unscorable failure.
+            data = None
+            for attempt_i in range(2):
+                msgs = [{"role": "user", "content": user}]
+                if attempt_i == 1:
+                    msgs.append({"role": "user", "content": "Return ONLY the JSON object — no prose, no "
+                                 "refusal. This is a compliance review; score the content's risk."})
+                resp = await rc_agent._do_work_with_tools(user, max_rounds=6,
+                                                          system_extra=system, messages=msgs)
+                try:
+                    data = _parse_json(resp.content)
+                    break
+                except Exception:
+                    if attempt_i == 1:
+                        raise ValueError(f"assessor returned no scorable JSON ({(resp.content or '')[:80]!r})")
             categories = data.get("categories", {})
             rationale = str(data.get("rationale", ""))[:1500]
         except Exception as e:
+            assess_error = str(e)[:300]
             logger.warning("[compliance] LLM assessment failed: %s", e)
 
     return await finalize(subject, categories, content, findings=findings,
                           rationale=rationale, task_id=task_id, attempt=attempt, threshold=threshold,
-                          assessor_id=rc_agent.config.id if rc_agent is not None else "")
+                          assessor_id=rc_agent.config.id if rc_agent is not None else "",
+                          error=assess_error)
 
 
 async def finalize(subject: str, categories: dict, content: str = "", *,
                    findings: list | None = None, rationale: str = "",
                    task_id: str = "", assessor_id: str = "", attempt: int = 0,
-                   threshold: int | None = None) -> dict:
+                   threshold: int | None = None, error: str = "") -> dict:
     """Compute the score/level/verdict from categories (+ secret scan) against the
     threshold, log to the register, and return the structured assessment."""
     if threshold is None:
@@ -379,6 +414,11 @@ async def finalize(subject: str, categories: dict, content: str = "", *,
         "findings": findings,
         "rationale": rationale,
         "attempt": attempt,
+        # Set when the assessor could not actually score (LLM/auth error). With no
+        # categories and no findings the score is meaningless — callers must not
+        # treat this as a genuine pass.
+        "error": error or None,
+        "incomplete": bool(error) and not norm and not findings,
     }
     try:
         await database.save_risk_assessment(record)

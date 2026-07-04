@@ -60,6 +60,15 @@ def _builtins(ctx: NodeContext) -> dict:
     }
 
 
+def _token_head_known(path: str, ctx: NodeContext, inputs: dict) -> bool:
+    """Is the head of a {{...}} a real token source (a node id/label or a built-in)?
+    If not, the braces are NOT a workflow token — e.g. a Python f-string's escaped `{{ }}`
+    or CSS inside a code node — and must be left untouched rather than blanked to empty."""
+    head = path.split(".")[0].split("|")[0].strip()
+    return (head in ("$", "input", "json", "$vars", "vars")
+            or head in ctx.context or head in _builtins(ctx))
+
+
 def _resolve_path(path: str, ctx: NodeContext, inputs: dict) -> Any:
     """Resolve a dotted path like 'nodeId.body.title', '$.field' (current input),
     or a built-in like 'today' / '$vars.now' / 'workflow.name'."""
@@ -97,11 +106,13 @@ def render(value: Any, ctx: NodeContext, inputs: dict) -> Any:
     """Render {{...}} templates in strings (and recursively in dicts/lists)."""
     if isinstance(value, str):
         def sub(m):
+            if not _token_head_known(m.group(1), ctx, inputs):
+                return m.group(0)          # not a workflow token → leave the braces as-is
             r = _resolve_path(m.group(1), ctx, inputs)
             return r if isinstance(r, str) else json.dumps(r) if r is not None else ""
         # Whole-string single template → return the raw value (keeps types).
         whole = _TPL.fullmatch(value.strip())
-        if whole:
+        if whole and _token_head_known(whole.group(1), ctx, inputs):
             return _resolve_path(whole.group(1), ctx, inputs)
         return _TPL.sub(sub, value)
     if isinstance(value, dict):
@@ -257,6 +268,8 @@ def _render_code_tokens(code: str, ctx: NodeContext, inputs: dict, lang: str) ->
     code = _QUOTED_TOKEN.sub(r"\2", code)   # unwrap model-added quotes around a lone token
 
     def sub(m):
+        if not _token_head_known(m.group(1), ctx, inputs):
+            return m.group(0)          # f-string `{{ }}`, CSS, JS template — not a token
         val = _resolve_path(m.group(1).strip(), ctx, inputs)
         return json.dumps(val) if is_js else repr(val)
 
@@ -850,6 +863,11 @@ async def write_file_node(node: dict, inputs: dict, ctx: NodeContext) -> dict:
     if not isinstance(path, str) or not path.strip():
         raise ValueError("Write File: a file path is required")
     path = os.path.expanduser(path.strip())
+    # Relative paths resolve under a writable workspace outputs folder, so a flow that
+    # says "reports/x.html" just works instead of hitting a read-only system root.
+    if not os.path.isabs(path):
+        data_dir = getattr(getattr(ctx.orchestrator, "settings", None), "data_dir", None) or "data"
+        path = os.path.join(data_dir, "workflow_outputs", path)
     content = render(cfg.get("content"), ctx, inputs)
     if content is None:
         content = inputs
