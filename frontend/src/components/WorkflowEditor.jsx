@@ -361,13 +361,21 @@ function AIAssistPanel({ objective, wfId, getGraph, onApply, onClose, history, o
                 </span>
               </div>
             )}
-            {m.verification && (
-              <div className={`mt-1 max-w-[85%] text-[11px] px-2 py-1 rounded-lg border flex items-center gap-1.5 ${m.verification.ran_ok && m.verification.meets_objective !== 'no' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-red-50 border-red-200 text-red-700'}`}>
-                {m.verification.ran_ok && m.verification.meets_objective !== 'no'
-                  ? <><CheckCircle2 size={12} /> Verified run · meets objective: {m.verification.meets_objective}</>
-                  : <><AlertCircle size={12} /> Verification: {m.verification.error || `meets objective: ${m.verification.meets_objective}`}</>}
-              </div>
-            )}
+            {m.verification && (() => {
+              const v = m.verification
+              const ok = v.ran_ok && v.meets_objective === 'yes'
+              const ranButUnmet = v.ran_ok && v.meets_objective !== 'yes'  // runs, objective not confirmed
+              const style = ok ? 'bg-green-50 border-green-200 text-green-700'
+                : ranButUnmet ? 'bg-amber-50 border-amber-200 text-amber-700'
+                : 'bg-red-50 border-red-200 text-red-700'
+              return (
+                <div className={`mt-1 max-w-[85%] text-[11px] px-2 py-1 rounded-lg border flex items-center gap-1.5 ${style}`}>
+                  {ok ? <><CheckCircle2 size={12} /> Verified · runs clean & meets objective</>
+                    : ranButUnmet ? <><AlertCircle size={12} /> Runs, but objective {v.meets_objective === 'unknown' ? 'unconfirmed' : v.meets_objective}{v.note ? ` — ${v.note}` : ''}</>
+                    : <><AlertCircle size={12} /> Verification: {v.error || `objective ${v.meets_objective}`}</>}
+                </div>
+              )
+            })()}
           </div>
         ))}
         {busy && <div className="flex justify-start"><div className="px-3 py-2 rounded-2xl bg-gray-100 text-gray-400 text-[13px] flex items-center gap-2"><Loader2 size={13} className="animate-spin" /> Thinking…</div></div>}
