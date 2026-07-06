@@ -3,7 +3,8 @@ REST API routes for agent & task management.
 """
 from __future__ import annotations
 import logging
-from fastapi import APIRouter, HTTPException, UploadFile, File
+import uuid
+from fastapi import APIRouter, HTTPException, UploadFile, File, Request
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -760,6 +761,133 @@ async def get_conversation_messages(conv_id: str, limit: int = 200):
 @router.delete("/conversations/{conv_id}")
 async def delete_conversation(conv_id: str):
     await database.delete_conversation(conv_id)
+    return {"ok": True}
+
+
+# ── Channels (Telegram/Slack/Discord/… → Manager) ────────────────────────────
+# Secrets in `config` (e.g. bot_token) are NEVER sent back to the client — only a
+# masked hint + a `configured` flag.
+_SECRET_KEYS = ("bot_token", "token", "app_token", "api_key", "access_token",
+                "verify_token", "secret", "password")
+
+
+def _redact_channel(ch: dict) -> dict:
+    cfg = dict(ch.get("config") or {})
+    configured = False
+    for k in list(cfg):
+        if k in _SECRET_KEYS and cfg[k]:
+            configured = True
+            v = str(cfg[k])
+            cfg[k] = f"••••{v[-4:]}" if len(v) > 4 else "••••"
+    return {**ch, "config": cfg, "configured": configured}
+
+
+class ChannelCreateReq(BaseModel):
+    type: str
+    name: str = ""
+    config: dict = {}
+    enabled: bool = False
+
+
+class ChannelUpdateReq(BaseModel):
+    name: str | None = None
+    config: dict | None = None      # omit or {} to keep existing secrets
+    enabled: bool | None = None
+
+
+@router.get("/channels")
+async def list_channels_route():
+    return [_redact_channel(c) for c in await database.list_channels()]
+
+
+@router.get("/channels/types")
+async def channel_types_route():
+    from ..channels.base import ADAPTERS
+    labels = {"telegram": "Telegram", "slack": "Slack", "discord": "Discord", "whatsapp": "WhatsApp"}
+    return [{"type": t, "label": labels.get(t, t.title()), "available": t in ADAPTERS}
+            for t in ("telegram", "slack", "discord", "whatsapp")]
+
+
+@router.post("/channels")
+async def create_channel_route(req: ChannelCreateReq):
+    from ..channels import channel_service
+    # Validate credentials before saving so the user gets immediate feedback.
+    ok, detail = await channel_service.verify_config(req.type, req.config)
+    if not ok:
+        raise HTTPException(400, f"Could not connect: {detail}")
+    ch = await database.create_channel({"id": uuid.uuid4().hex, "type": req.type,
+                                        "name": req.name or detail, "config": req.config,
+                                        "enabled": req.enabled})
+    if req.enabled:
+        await channel_service.start_channel(ch)
+        ch = await database.get_channel(ch["id"])
+    return _redact_channel(ch)
+
+
+@router.put("/channels/{ch_id}")
+async def update_channel_route(ch_id: str, req: ChannelUpdateReq):
+    from ..channels import channel_service
+    existing = await database.get_channel(ch_id)
+    if not existing:
+        raise HTTPException(404, "Channel not found")
+    updates: dict = {}
+    if req.name is not None:
+        updates["name"] = req.name
+    # Merge config so a client that doesn't resend the secret keeps the stored one.
+    if req.config:
+        merged = {**(existing.get("config") or {}), **{k: v for k, v in req.config.items() if v}}
+        ok, detail = await channel_service.verify_config(existing["type"], merged)
+        if not ok:
+            raise HTTPException(400, f"Could not connect: {detail}")
+        updates["config"] = merged
+    if req.enabled is not None:
+        updates["enabled"] = req.enabled
+    ch = await database.update_channel(ch_id, updates)
+    # Apply runtime state: (re)start if enabled, else stop.
+    if ch.get("enabled"):
+        await channel_service.start_channel(ch)
+    else:
+        await channel_service.stop_channel(ch_id)
+    return _redact_channel(await database.get_channel(ch_id))
+
+
+@router.post("/channels/{ch_id}/test")
+async def test_channel_route(ch_id: str):
+    from ..channels import channel_service
+    ch = await database.get_channel(ch_id)
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    ok, detail = await channel_service.verify_config(ch["type"], ch.get("config") or {})
+    return {"ok": ok, "detail": detail}
+
+
+@router.delete("/channels/{ch_id}")
+async def delete_channel_route(ch_id: str):
+    from ..channels import channel_service
+    await channel_service.stop_channel(ch_id)
+    await database.delete_channel(ch_id)
+    return {"ok": True}
+
+
+# WhatsApp inbound webhook (Meta Cloud API). Needs a PUBLIC URL — point the Meta app's
+# webhook at https://<public-host>/api/channels/whatsapp/webhook.
+@router.get("/channels/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    from ..channels import channel_service
+    from fastapi.responses import PlainTextResponse
+    q = request.query_params
+    if q.get("hub.mode") == "subscribe" and await channel_service.whatsapp_verify(q.get("hub.verify_token", "")):
+        return PlainTextResponse(q.get("hub.challenge", ""))
+    raise HTTPException(403, "verification failed")
+
+
+@router.post("/channels/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    import asyncio
+    from ..channels import channel_service
+    payload = await request.json()
+    # Ack Meta immediately (it retries on slow responses); process in the background.
+    asyncio.create_task(channel_service.handle_whatsapp_webhook(payload))
     return {"ok": True}
 
 

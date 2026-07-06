@@ -289,6 +289,21 @@ CREATE TABLE IF NOT EXISTS workflow_versions (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_wf_versions ON workflow_versions(workflow_id, version);
+
+-- Messaging channels (Telegram/Slack/Discord/WhatsApp/…). Inbound messages route
+-- to the Manager; replies go back out to the originating channel. `config` holds
+-- the provider secrets (e.g. bot token).
+CREATE TABLE IF NOT EXISTS channels (
+    id            TEXT PRIMARY KEY,
+    type          TEXT NOT NULL,                       -- telegram | slack | discord | whatsapp
+    name          TEXT NOT NULL DEFAULT '',
+    config        TEXT NOT NULL DEFAULT '{}',          -- {bot_token, ...}
+    enabled       INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'disconnected',-- connected | disconnected | error
+    status_detail TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1462,6 +1477,69 @@ async def delete_workflow(wf_id: str) -> None:
     await _conn().commit()
 
 
+# ── Channels ──────────────────────────────────────────────────────────────────
+
+def _channel_row(row) -> dict:
+    d = dict(row)
+    try:
+        d["config"] = json.loads(d.get("config") or "{}")
+    except Exception:
+        d["config"] = {}
+    d["enabled"] = bool(d.get("enabled"))
+    return d
+
+
+async def list_channels() -> list[dict]:
+    rows = await (await _conn().execute("SELECT * FROM channels ORDER BY created_at")).fetchall()
+    return [_channel_row(r) for r in rows]
+
+
+async def get_channel(ch_id: str) -> dict | None:
+    row = await (await _conn().execute("SELECT * FROM channels WHERE id = ?", (ch_id,))).fetchone()
+    return _channel_row(row) if row else None
+
+
+async def create_channel(ch: dict) -> dict:
+    await _conn().execute(
+        "INSERT INTO channels(id, type, name, config, enabled) VALUES(?, ?, ?, ?, ?)",
+        (ch["id"], ch["type"], ch.get("name", ""), json.dumps(ch.get("config", {})),
+         1 if ch.get("enabled") else 0),
+    )
+    await _conn().commit()
+    return await get_channel(ch["id"])
+
+
+async def update_channel(ch_id: str, updates: dict) -> dict | None:
+    row = await (await _conn().execute("SELECT * FROM channels WHERE id = ?", (ch_id,))).fetchone()
+    if not row:
+        return None
+    fields, values = [], []
+    for col in ("name", "type", "status", "status_detail"):
+        if col in updates and updates[col] is not None:
+            fields.append(f"{col} = ?"); values.append(updates[col])
+    if "config" in updates and updates["config"] is not None:
+        fields.append("config = ?"); values.append(json.dumps(updates["config"]))
+    if "enabled" in updates and updates["enabled"] is not None:
+        fields.append("enabled = ?"); values.append(1 if updates["enabled"] else 0)
+    fields.append("updated_at = datetime('now')")
+    values.append(ch_id)
+    await _conn().execute(f"UPDATE channels SET {', '.join(fields)} WHERE id = ?", values)
+    await _conn().commit()
+    return await get_channel(ch_id)
+
+
+async def set_channel_status(ch_id: str, status: str, detail: str = "") -> None:
+    await _conn().execute(
+        "UPDATE channels SET status = ?, status_detail = ?, updated_at = datetime('now') WHERE id = ?",
+        (status, detail[:300], ch_id))
+    await _conn().commit()
+
+
+async def delete_channel(ch_id: str) -> None:
+    await _conn().execute("DELETE FROM channels WHERE id = ?", (ch_id,))
+    await _conn().commit()
+
+
 # ── Workflow versions ─────────────────────────────────────────────────────────
 
 def _version_row(row) -> dict:
@@ -1549,6 +1627,16 @@ async def finish_run(run_id: str, status: str, error: str = "") -> None:
         (status, error, run_id),
     )
     await _conn().commit()
+
+
+async def recent_runs(limit: int = 8) -> list[dict]:
+    """Most recent workflow runs across ALL workflows, with the workflow name —
+    used for the omni-channel context digest."""
+    rows = await (await _conn().execute(
+        "SELECT r.id, r.status, r.mode, r.trigger_source, r.started_at, w.name AS workflow_name "
+        "FROM workflow_runs r JOIN workflows w ON w.id = r.workflow_id "
+        "ORDER BY r.started_at DESC LIMIT ?", (limit,))).fetchall()
+    return [dict(r) for r in rows]
 
 
 async def list_runs(workflow_id: str, limit: int = 20) -> list[dict]:

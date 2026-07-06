@@ -290,6 +290,16 @@ class CEOAgent(BaseAgent):
                     "metadata": {"artifacts": artifact_meta} if artifact_meta else {},
                 })
 
+            # If this conversation came from a messaging channel (Telegram/Slack/…),
+            # push the delegated result back out to it — otherwise the channel user
+            # only ever saw the Manager's immediate "on it" reply, never the answer.
+            if conv_id and conv_id.startswith("chan:"):
+                try:
+                    from ..channels import channel_service
+                    await channel_service.deliver_to_channel(conv_id, display_content)
+                except Exception as e:
+                    logger.warning("[CEO] channel delivery failed: %s", e)
+
             # Broadcast to WebSocket so frontend picks it up
             if self._orchestrator and self._orchestrator._ws_broadcast:
                 from ..models import WSEvent, WSEventType
