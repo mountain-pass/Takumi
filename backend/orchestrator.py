@@ -102,11 +102,18 @@ class Orchestrator:
 
         asyncio.create_task(self._heartbeat_loop(), name="orchestrator-heartbeat")
         await self._scheduler.start()
+        # Start enabled messaging channels (Telegram/etc.) in the background so a slow
+        # provider handshake never blocks startup.
+        import asyncio as _asyncio
+        from .channels import channel_service
+        _asyncio.create_task(channel_service.start_all(), name="channels-start")
         logger.info("Orchestrator started with %d agents", len(self._agents))
 
     async def stop(self) -> None:
         self._running = False
         await self._scheduler.stop()
+        from .channels import channel_service
+        await channel_service.stop_all()
         for agent in list(self._agents.values()):
             await agent.stop()
 
